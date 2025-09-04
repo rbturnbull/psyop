@@ -160,11 +160,13 @@ def make_pairplot(
     success_mask = ~pd.isna(df_raw[ds.attrs["target_column"]]).to_numpy()
     fail_mask = ~success_mask
 
-    def data_vals_for_feature(j: int) -> np.ndarray:
-        name = feature_names[j]
-        if name not in df_raw.columns:
-            raise KeyError(f"Column '{name}' not found in artifact.")
-        return df_raw[name].to_numpy().astype(float)
+    def data_vals_for_feature(index: int) -> np.ndarray:
+        name = feature_names[index]
+        # use raw column if available
+        if name in df_raw.columns:
+            return df_raw[name].to_numpy().astype(float)
+        # fallback: reconstruct from Xn_train + (mean, std, transform)
+        return _feature_raw_from_artifact_or_reconstruct(ds, index, name, transforms[index]).astype(float)
 
     # Off-diagonals
     for (i, j), PAY in off_payload.items():
@@ -333,7 +335,7 @@ def make_pairplot(
 
     fig.write_html(str(output), include_plotlyjs="cdn")
     if show:
-        fig.show()
+        fig.show("browser")
 
 
 def make_partial_dependence1D(
@@ -459,7 +461,12 @@ def make_partial_dependence1D(
         ), row=j + 1, col=1)
 
         # Experimental successes
-        x_data_all = df_raw[feature_names[j]].to_numpy().astype(float)
+        name_j = feature_names[j]
+        if name_j in df_raw.columns:
+            x_data_all = df_raw[name_j].to_numpy().astype(float)
+        else:
+            x_data_all = _feature_raw_from_artifact_or_reconstruct(ds, j, name_j, transforms[j]).astype(float)
+
         x_succ = x_data_all[success_mask]
         if x_succ.size:
             fig.add_trace(go.Scattergl(
@@ -522,7 +529,7 @@ def make_partial_dependence1D(
     fig.write_html(str(output), include_plotlyjs="cdn")
     pd.DataFrame(tidy_rows).to_csv(str(csv_out), index=False)
     if show_figure:
-        fig.show()
+        fig.show("browser")
 
 
 # =============================================================================
@@ -711,3 +718,33 @@ def _solve_chol(L: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def _solve_lower(L: np.ndarray, B: np.ndarray) -> np.ndarray:
     return np.linalg.solve(L, B)
+
+
+def _feature_raw_from_artifact_or_reconstruct(
+    ds: xr.Dataset,
+    j: int,
+    name: str,
+    transform: str,
+) -> np.ndarray:
+    """
+    Return the feature values in ORIGINAL units for each training row.
+    Prefer a stored raw column (ds[name]) if present; otherwise reconstruct
+    from Xn_train using feature_mean/std and the recorded transform.
+    """
+    # 1) Use stored raw per-row column if present
+    if name in ds.data_vars:
+        da = ds[name]
+        if "row" in da.dims and da.sizes.get("row", None) == ds.sizes.get("row", None):
+            vals = np.asarray(da.values, dtype=float)
+            return vals
+
+    # 2) Reconstruct from standardized training matrix
+    Xn = ds["Xn_train"].values.astype(float)            # (N, p)
+    mu = ds["feature_mean"].values.astype(float)[j]
+    sd = ds["feature_std"].values.astype(float)[j]
+    x_internal = Xn[:, j] * sd + mu                    # internal model space
+    if transform == "log10":
+        raw = 10.0 ** x_internal
+    else:
+        raw = x_internal
+    return raw
