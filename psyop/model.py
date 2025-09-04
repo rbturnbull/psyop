@@ -250,7 +250,8 @@ def run_model(
 
     # Save
     output_path = Path(output_path)
-    ds.to_netcdf(output_path, encoding=encoding)
+    engine, encoding = _select_netcdf_engine_and_encoding(ds, compress=compress)
+    ds.to_netcdf(output_path, engine=engine, encoding=encoding)
 
 
 def kernel_diag_m52(XA: np.ndarray, ls: np.ndarray, eta: float) -> np.ndarray:
@@ -364,3 +365,38 @@ def _np1d(x: np.ndarray, p: int) -> np.ndarray:
     if a.size != p:
         a = np.full((p,), float(a.item()) if a.size == 1 else np.nan, dtype=float)
     return a
+
+
+# ---- choose engine + encoding safely across backends ----
+def _select_netcdf_engine_and_encoding(ds: xr.Dataset, compress: bool):
+    # Prefer netcdf4
+    try:
+        import netCDF4  # noqa: F401
+        engine = "netcdf4"
+        if not compress:
+            return engine, None
+        enc = {}
+        for name, da in ds.data_vars.items():
+            if np.issubdtype(da.dtype, np.number):
+                enc[name] = {"zlib": True, "complevel": 4}
+        return engine, enc
+    except Exception:
+        pass
+
+    # Then h5netcdf
+    try:
+        import h5netcdf  # noqa: F401
+        engine = "h5netcdf"
+        if not compress:
+            return engine, None
+        enc = {}
+        for name, da in ds.data_vars.items():
+            if np.issubdtype(da.dtype, np.number):
+                enc[name] = {"compression": "gzip", "compression_opts": 4}
+        return engine, enc
+    except Exception:
+        pass
+
+    # Finally scipy (no compression supported)
+    engine = "scipy"
+    return engine, None
