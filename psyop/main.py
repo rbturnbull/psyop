@@ -77,7 +77,7 @@ def _default_out_for(model_path: Path, stem_suffix: str, ext: str) -> Path:
 @app.callback()
 def main(
     version: bool = typer.Option(
-        False, "--version", "-V", help="Show version and exit.", is_eager=True
+        False, "--version", "-v", help="Show version and exit.", is_eager=True
     )
 ):
     if version:
@@ -93,9 +93,7 @@ def model(
     input: Path = typer.Argument(..., help="Input CSV file."),
     output: Path = typer.Argument(..., help="Path to save model artifact (.nc)."),
     target: str = typer.Option("loss", "--target", "-t", help="Target column name."),
-    exclude: List[str] = typer.Option(
-        [], "--exclude", help="Feature columns to exclude (repeatable)."
-    ),
+    exclude: List[str] = typer.Option([], "--exclude", help="Feature columns to exclude."),
     direction: Direction = typer.Option(
         Direction.AUTO, "--direction", "-d",
         help="Optimization direction for the target."

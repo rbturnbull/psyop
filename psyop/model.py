@@ -17,7 +17,6 @@ for _env_var in (
 # ---------------------------------------------------------------------
 # Imports
 # ---------------------------------------------------------------------
-from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable, Tuple
@@ -150,7 +149,7 @@ def run_model(
         gp_s = pm.gp.Marginal(mean_func=m_s, cov_func=K_s)
 
         _ = gp_s.marginal_likelihood("y_obs_s", X=Xn, y=y_success, noise=sigma_s)
-        map_s = pm.find_MAP(random_seed=random_seed, progressbar=False)
+        map_s = pm.find_MAP()
 
     # Training preds for success (mean only used downstream)
     with model_s:
@@ -174,7 +173,7 @@ def run_model(
         gp_l = pm.gp.Marginal(mean_func=m_l, cov_func=K_l)
 
         _ = gp_l.marginal_likelihood("y_obs", X=Xn_success_only, y=y_loss_centered, noise=sigma_l)
-        map_l = pm.find_MAP(random_seed=random_seed, progressbar=False)
+        map_l = pm.find_MAP()
 
     with model_l:
         mu_l_c, var_l = gp_l.predict(Xn_success_only, point=map_l, diag=True, pred_noise=True)

@@ -259,21 +259,58 @@ def _build_predictors(ds: xr.Dataset) -> Tuple[
 # Search space, conditioning, and featurization
 # =============================================================================
 
+# --- add this helper somewhere above _infer_search_specs ---
+def _feature_raw_from_artifact_or_reconstruct(
+    ds: xr.Dataset,
+    j: int,
+    name: str,
+    transform: str,
+) -> np.ndarray:
+    """
+    Return the feature in ORIGINAL units for each training row.
+    Prefer a stored raw column (ds[name]) if present; otherwise reconstruct
+    from standardized Xn_train using feature_mean/std and the recorded transform.
+    """
+    # 1) Try stored raw column
+    if name in ds.data_vars:
+        da = ds[name]
+        if "row" in da.dims and da.sizes.get("row", None) == ds.sizes.get("row", None):
+            vals = np.asarray(da.values, dtype=float)
+            return vals[np.isfinite(vals)]
+
+    # 2) Reconstruct from standardized training matrix
+    Xn = ds["Xn_train"].values.astype(float)            # (N, p)
+    mu = ds["feature_mean"].values.astype(float)[j]
+    sd = ds["feature_std"].values.astype(float)[j]
+    x_internal = Xn[:, j] * sd + mu                     # internal model space
+    if transform == "log10":
+        raw = 10.0 ** x_internal
+    else:
+        raw = x_internal
+    return raw[np.isfinite(raw)]
+
+
 def _infer_search_specs(ds: xr.Dataset, feature_names: List[str], transforms: List[str]) -> List[Dict]:
+    """
+    Build per-feature sampling specs directly from the artifact.
+    If a raw per-feature column is missing, reconstruct original-unit values
+    from Xn_train + (mean, std, transform). This avoids KeyErrors like '__success__'.
+    """
     specs: List[Dict] = []
     for j, name in enumerate(feature_names):
         tr = str(transforms[j])
-        raw = ds[name].values
-        raw = raw[np.isfinite(raw)]
+
+        raw = _feature_raw_from_artifact_or_reconstruct(ds, j, name, tr)
         if raw.size == 0:
-            # conservative fallback
+            # ultra-conservative fallback
             if tr == "log10":
                 specs.append({"name": name, "transform": tr, "kind": "continuous", "bounds": (1e-6, 1.0)})
             else:
                 specs.append({"name": name, "transform": tr, "kind": "continuous", "bounds": (-2.0, 2.0)})
             continue
 
-        uniq = np.unique(raw[~np.isnan(raw)])
+        # Discrete detection (small integer-ish support)
+        uniq = np.unique(raw)
         is_int_like = np.all(np.isclose(uniq, np.round(uniq)))
         few_unique = uniq.size <= 20
 
@@ -281,14 +318,19 @@ def _infer_search_specs(ds: xr.Dataset, feature_names: List[str], transforms: Li
             specs.append({"name": name, "transform": tr, "kind": "discrete", "choices": uniq.astype(float)})
             continue
 
+        # Continuous/integer bounds from 1–99% + 10% padding
         p1, p99 = np.percentile(raw, [1, 99])
         span = p99 - p1
         lo, hi = p1 - 0.10 * span, p99 + 0.10 * span
+
+        # Ensure valid range for log10 variables (original units must be > 0)
         if tr == "log10":
             lo = max(lo, 1e-12)
             hi = max(hi, lo * 1.0001)
+
         kind = "integer" if is_int_like else "continuous"
         specs.append({"name": name, "transform": tr, "kind": kind, "bounds": (float(lo), float(hi))})
+
     return specs
 
 
