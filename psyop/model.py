@@ -1,29 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Two-head Gaussian Process modeling with PyMC:
-
-Head A (Success probability, fast):
-  - Treat success indicator (1=success, 0=failure inferred from NaN loss) as a noisy
-    continuous target in [0,1] and fit a Marginal GP (least-squares GP).
-  - Structure: Constant mean + Matern52(ARD) covariance + Gaussian noise.
-  - Fast MAP hyperparameter fitting via pm.find_MAP().
-
-Head B (Conditional loss given success):
-  - Fit a Marginal GP to the observed loss values on successful rows only.
-  - Structure mirrors Head A.
-
-Visualization (Plotly):
-  - 1D partial-dependence for E[loss | success] for each feature (vertical panels).
-  - Grey shading where P(success) < 0.8 (darker) and < 0.5 (lighter).
-  - learning_rate displayed on a log10 scale (x-axis is actual learning_rate, not log10).
-
-Outputs:
-  - gp_training_predictions.csv  (per-row success prob and conditional loss prediction)
-  - pd_loss_conditional.html     (interactive Plotly PD figure)
-  - gp_partial_dependence_loss_only.csv (tidy PD data)
-  - gp_hyperparameters.json      (saved MAP hyperparameters and scaling stats)
-"""
 
 # ---------------------------------------------------------------------
 # Make BLAS single-threaded to avoid oversubscription / macOS crashes
