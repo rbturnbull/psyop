@@ -1,668 +1,713 @@
-import re
+# viz.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
+import xarray as xr
+
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from plotly.colors import get_colorscale, sample_colorscale
 
 
-def percentiles_1_99(array_1d: np.ndarray):
-    return np.percentile(array_1d, [1, 99])
-
-def denormalize_feature_value(feature_index: int, value_in_standardized_space: np.ndarray) -> np.ndarray:
-    """Map standardized feature back to the model's original feature space (log10 for lr)."""
-    return value_in_standardized_space * feature_stds_array[feature_index] + feature_means_array[feature_index]
-
-def contiguous_spans(x_values_sorted: np.ndarray, boolean_mask: np.ndarray):
-    """Return [(x_start, x_end), ...] for contiguous True segments in boolean_mask over sorted x_values."""
-    spans = []
-    if len(x_values_sorted) == 0:
-        return spans
-    mask_int = boolean_mask.astype(int)
-    padded_diff = np.diff(np.concatenate([[0], mask_int, [0]]))
-    starts = np.where(padded_diff == 1)[0]
-    ends = np.where(padded_diff == -1)[0] - 1
-    for s, e in zip(starts, ends):
-        spans.append((x_values_sorted[s], x_values_sorted[e]))
-    return spans
-
-def add_low_success_shading(
-    figure: go.Figure, subplot_row_index: int,
-    x_axis_values_display: np.ndarray, success_probabilities: np.ndarray,
-    y_min: float, y_max: float
-):
-    """
-    Add shading rectangles:
-      - Light grey where P(success) < 0.5
-      - Darker grey where P(success) < 0.8
-    Note: The <0.8 shading draws on top (so all p<0.8 regions appear darker).
-    """
-    xref = "x" if subplot_row_index == 1 else f"x{subplot_row_index}"
-    yref = "y" if subplot_row_index == 1 else f"y{subplot_row_index}"
-
-    spans_lt_05 = contiguous_spans(x_axis_values_display, success_probabilities < 0.5)
-    for x0, x1 in spans_lt_05:
-        figure.add_shape(
-            type="rect", x0=x0, x1=x1, y0=y_min, y1=y_max,
-            xref=xref, yref=yref, line=dict(width=0),
-            fillcolor="rgba(128,128,128,0.25)", layer="below"
-        )
-
-    spans_lt_08 = contiguous_spans(x_axis_values_display, success_probabilities < 0.8)
-    for x0, x1 in spans_lt_08:
-        figure.add_shape(
-            type="rect", x0=x0, x1=x1, y0=y_min, y1=y_max,
-            xref=xref, yref=yref, line=dict(width=0),
-            fillcolor="rgba(128,128,128,0.40)", layer="below"
-        )
-
-
-def make_1d_partial_dependence_plots(
-    feature_matrix_standardized: np.ndarray,
-    feature_names_list: list[str],
-    predict_conditional_loss,           # fn: Xn -> (mu, sd)
-    predict_success_probability,        # fn: Xn -> p
-    feature_stds_array: np.ndarray,
-    feature_means_array: np.ndarray,
-    dataframe_input: pd.DataFrame,      # <-- needed for experimental points
-    outfile_html: str = "pd_loss_conditional.html",
-    outfile_csv: str = "gp_partial_dependence_loss_only.csv",
-    n_points_1d: int = 300,
-    line_color: str = "rgb(31,119,180)",     # same color for all variables
-    band_alpha: float = 0.25,                # fill alpha for ±2σ
-    figure_height_per_row_px: int = 320,
-    show_figure: bool = True,
-    use_log_scale_for_target_y: bool = False,
-    log_y_epsilon: float = 1e-9,             # clamp for log-y safety
-) -> tuple[go.Figure, pd.DataFrame]:
-    """
-    Vertical 1D PD plots (one per feature) of E[loss|success] vs feature value,
-    with low-success shading and experimental points overlaid.
-    - successful trials: black dots at (x=value, y=loss)
-    - failed trials (NaN loss): red dots with black outline at a thin band above the plot
-    - optional log scale on Y (target/loss)
-    """
-
-    num_features = feature_matrix_standardized.shape[1]
-
-    # ---- experimental data masks and columns ----
-    success_mask = ~dataframe_input["loss"].isna().to_numpy()
-    fail_mask = ~success_mask
-    loss_success = dataframe_input.loc[success_mask, "loss"].to_numpy().astype(float)
-    trial_ids_success = dataframe_input.loc[success_mask, "trial_id"].to_numpy()
-    trial_ids_fail = dataframe_input.loc[fail_mask, "trial_id"].to_numpy()
-
-    def data_vals_for_feature(j: int) -> np.ndarray:
-        name = feature_names_list[j]
-        if name not in dataframe_input.columns:
-            raise KeyError(f"Column '{name}' not found in dataframe_input.")
-        vals = dataframe_input[name].to_numpy().astype(float)
-        # learning_rate already in original units; others are raw
-        return vals
-
-    # ---- color helpers ----
-    def rgb_to_rgba(rgb: str, alpha: float) -> str:
-        m = re.match(r"\s*rgba?\s*\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)", rgb)
-        if not m:
-            return f"rgba(31,119,180,{alpha:.3f})"
-        r, g, b = map(float, m.groups())
-        return f"rgba({int(r)},{int(g)},{int(b)},{alpha:.3f})"
-
-    band_fill_color = rgb_to_rgba(line_color, band_alpha)
-
-    # ---- base point & sweeps ----
-    base_point_standardized = np.median(feature_matrix_standardized, axis=0)
-    standardized_sweep_values_per_feature = [
-        np.linspace(*percentiles_1_99(feature_matrix_standardized[:, j]), n_points_1d)
-        for j in range(num_features)
-    ]
-
-    # ---- figure ----
-    fig = make_subplots(
-        rows=num_features, cols=1, shared_xaxes=False, vertical_spacing=0.08,
-        subplot_titles=[f"E[loss|success] — {name}" for name in feature_names_list]
-    )
-
-    tidy_rows = []
-
-    for j in range(num_features):
-        sweep_std = standardized_sweep_values_per_feature[j]
-
-        # Design matrix: vary one feature at a time
-        Xn_grid = np.repeat(base_point_standardized[None, :], len(sweep_std), axis=0)
-        Xn_grid[:, j] = sweep_std
-
-        # Predictions
-        p_grid = predict_success_probability(Xn_grid)
-        mu_grid, sd_grid = predict_conditional_loss(Xn_grid)
-
-        # X display values (original units; log axis for learning_rate on X)
-        x_internal = denormalize_feature_value(j, sweep_std)
-        if j == 0:  # learning_rate
-            x_display = 10.0 ** x_internal
-            x_title = "learning_rate"
-            log_x = True
-        else:
-            x_display = x_internal
-            x_title = feature_names_list[j]
-            log_x = False
-
-        # Clamp for log-y if requested
-        if use_log_scale_for_target_y:
-            mu_plot = np.maximum(mu_grid, log_y_epsilon)
-            lo_plot = np.maximum(mu_grid - 2.0 * sd_grid, log_y_epsilon)
-            hi_plot = np.maximum(mu_grid + 2.0 * sd_grid, log_y_epsilon)
-            # Successful observed losses must also be >0
-            loss_success_plot = np.maximum(loss_success, log_y_epsilon) if loss_success.size else loss_success
-        else:
-            mu_plot = mu_grid
-            lo_plot = mu_grid - 2.0 * sd_grid
-            hi_plot = mu_grid + 2.0 * sd_grid
-            loss_success_plot = loss_success
-
-        # Y-range from PD bands and observed successful losses
-        y_parts = [lo_plot, hi_plot]
-        if loss_success_plot.size:
-            y_parts.append(loss_success_plot)
-        y_low = float(np.min([np.min(arr) for arr in y_parts]))
-        y_high = float(np.max([np.max(arr) for arr in y_parts]))
-        pad = 0.05 * (y_high - y_low + 1e-12)
-        y0_plot = y_low - pad if not use_log_scale_for_target_y else max(y_low / 1.5, log_y_epsilon)
-
-        # Temporary high bound to compute a band for failed points
-        y1_tmp = y_high + pad if not use_log_scale_for_target_y else y_high * 1.2
-        # Failed points band just above the main range
-        y_failed_band = y1_tmp + (y_high - y_low + 1e-12) * (0.08 if not use_log_scale_for_target_y else 0.3)
-        if use_log_scale_for_target_y and y_failed_band <= log_y_epsilon:
-            y_failed_band = max(10.0 * log_y_epsilon, y_high * 2.0)
-        y1_plot = y_failed_band + (0.02 if not use_log_scale_for_target_y else 0.05) * (y_high - y_low + 1e-12)
-
-        # --- low-success shading ---
-        add_low_success_shading(
-            fig, j + 1,
-            x_axis_values_display=x_display,
-            success_probabilities=p_grid,
-            y_min=y0_plot, y_max=y1_plot
-        )
-
-        # --- ±2σ band (one legend entry total) ---
-        show_leg = (j == 0)
-        fig.add_trace(go.Scatter(
-            x=x_display, y=lo_plot,
-            mode="lines", line=dict(width=0, color=line_color),
-            name="±2σ", legendgroup="pd1d_band", showlegend=False, hoverinfo="skip"
-        ), row=j + 1, col=1)
-        fig.add_trace(go.Scatter(
-            x=x_display, y=hi_plot,
-            mode="lines", fill="tonexty",
-            line=dict(width=0, color=line_color),
-            fillcolor=band_fill_color,
-            name="±2σ", legendgroup="pd1d_band", showlegend=show_leg,
-            hovertemplate="E[loss|success]: %{y:.3f}<extra>±2σ</extra>"
-        ), row=j + 1, col=1)
-
-        # --- mean curve (one legend entry total) ---
-        fig.add_trace(go.Scatter(
-            x=x_display, y=mu_plot, mode="lines",
-            line=dict(width=2, color=line_color),
-            name="E[loss|success]", legendgroup="pd1d_mean", showlegend=show_leg,
-            hovertemplate=f"{x_title}: %{{x:.6g}}<br>E[loss|success]: %{{y:.3f}}<extra></extra>"
-        ), row=j + 1, col=1)
-
-        # --- experimental points: success (black) ---
-        x_data_all = data_vals_for_feature(j)
-        x_data_success = x_data_all[success_mask]
-        if x_data_success.size:
-            fig.add_trace(go.Scattergl(
-                x=x_data_success, y=loss_success_plot,
-                mode="markers",
-                marker=dict(size=5, color="black", line=dict(width=0)),
-                name="data (success)", legendgroup="data_success",
-                showlegend=show_leg,
-                hovertemplate=(
-                    f"trial_id: %{{customdata[0]}}<br>"
-                    f"{x_title}: %{{x:.6g}}<br>"
-                    "loss: %{y:.4f}<extra></extra>"
-                ),
-                customdata=np.column_stack([trial_ids_success])
-            ), row=j + 1, col=1)
-
-        # --- experimental points: failed (red with black outline) ---
-        x_data_fail = x_data_all[fail_mask]
-        if x_data_fail.size:
-            y_fail_plot = np.full_like(x_data_fail, y_failed_band, dtype=float)
-            fig.add_trace(go.Scattergl(
-                x=x_data_fail, y=y_fail_plot,
-                mode="markers",
-                marker=dict(size=6, color="red", line=dict(color="black", width=0.8)),
-                name="data (failed)", legendgroup="data_failed",
-                showlegend=show_leg,
-                hovertemplate=(
-                    f"trial_id: %{{customdata}}<br>"
-                    f"{x_title}: %{{x:.6g}}<br>"
-                    "status: failed (NaN loss)<extra></extra>"
-                ),
-                customdata=trial_ids_fail
-            ), row=j + 1, col=1)
-
-        # Axes
-        if log_x:
-            fig.update_xaxes(type="log", row=j + 1, col=1)
-        fig.update_yaxes(
-            title_text="loss (E[loss|success])",
-            type="log" if use_log_scale_for_target_y else "-",
-            range=None,  # let Plotly compute in log/linear, we already padded
-            row=j + 1, col=1
-        )
-        fig.update_yaxes(range=[y0_plot, y1_plot], row=j + 1, col=1)
-        fig.update_xaxes(title_text=x_title, row=j + 1, col=1)
-
-        # tidy rows
-        for xd, xi, mu_i, sd_i, p_i in zip(x_display, x_internal, mu_grid, sd_grid, p_grid):
-            tidy_rows.append({
-                "feature": x_title,
-                "x_display": float(xd),
-                "x_internal": float(xi),
-                "loss_conditional_mean": float(mu_i),
-                "loss_conditional_sd": float(sd_i),
-                "success_probability": float(p_i),
-            })
-
-    # Layout & export
-    fig.update_layout(
-        height=figure_height_per_row_px * num_features,
-        template="simple_white",
-        title="1D Partial Dependence: E[loss | success] with experimental points & low-success shading",
-        legend_title_text=""
-    )
-
-    fig.write_html(outfile_html, include_plotlyjs="cdn")
-    pd.DataFrame(tidy_rows).to_csv(outfile_csv, index=False)
-    print(f"Wrote {Path(outfile_html).name}")
-    print(f"Wrote {Path(outfile_csv).name}")
-
-    if show_figure:
-        fig.show()
-
-    return fig, pd.DataFrame(tidy_rows)
-
-
+# =============================================================================
+# Public API
+# =============================================================================
 
 def make_pairplot(
-    feature_matrix_standardized: np.ndarray,
-    feature_means_array: np.ndarray,
-    feature_stds_array: np.ndarray,
-    feature_names_list: list[str],
-    predict_loss_given_success,          # fn: X -> (mu, sd)
-    predict_success_probability,         # fn: X -> p
-    dataframe_input: pd.DataFrame,       # to plot experimental points
-    outfile: str = "pairplot_pd.html",
+    model: Path,
+    output: Path,
     n_points_1d: int = 300,
     n_points_2d: int = 70,
-    use_log_scale_for_target: bool = False,
+    use_log_scale_for_target: bool = False,   # log10 colours for heatmaps
     log_shift_epsilon: float = 1e-9,
     colourscale: str = "RdBu",
-    show_figure: bool = False,
+    show: bool = False,
     n_contours: int = 12,
-):
+    fixed: Optional[Dict[str, float]] = None,  # <-- condition on variables in ORIGINAL units
+) -> None:
     """
-    Pairplot of E[loss|success]:
-      - diagonal: symmetric 2D heatmap built from 1D PD (Z = 0.5*(mu(x_i)+mu(x_j)))
-      - off-diagonal: true 2D heatmaps
-      - probability shading: grey for P(success)<0.8 (darker) and <0.5 (lighter)
-      - experimental points: success=black dots; failed=red dots with black outline
-      - contours: one trace per level with line grey = 1 - luminance(colour_at_level)
-    Colour mapping can be linear or log10 (shifted if needed).
+    Pairplot of E[target | success] under the two-head GP:
+      - diagonal: symmetric 2D heatmap from 1D PD (Z = 0.5*(mu(x_i)+mu(x_j)))
+      - off-diagonals: true 2D heatmaps over (x_j, x_i)
+      - shading: grey where P(success)<0.8 (darker) and <0.5 (lighter)
+      - contours: line colour is inverse greyscale of colourscale luminance at same level
+      - experimental points: successes (black), failures (red with black outline)
+
+    `fixed` lets you condition the slice: all other dims are set to their **fixed**
+    values (standardized internally), otherwise to the median in standardized space.
     """
-    import numpy as np
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-    from plotly.colors import get_colorscale, sample_colorscale
+    ds = xr.load_dataset(model)
+    pred_success, pred_loss = _build_predictors(ds)
 
-    num_features: int = feature_matrix_standardized.shape[1]
+    # Features & transforms
+    feature_names = [str(n) for n in ds["feature"].values.tolist()]
+    transforms = [str(t) for t in ds["feature_transform"].values.tolist()]
+    X_mean = ds["feature_mean"].values.astype(float)
+    X_std = ds["feature_std"].values.astype(float)
 
-    # ---------- helpers ----------
-    def _p01_p99(arr: np.ndarray) -> tuple[float, float]:
-        return np.percentile(arr, [1, 99])
+    # Raw dataframe for experimental points (columns are stored directly in ds)
+    df_raw = _raw_dataframe_from_dataset(ds)
 
-    def denormalize_feature(j: int, xnorm: np.ndarray) -> np.ndarray:
-        return xnorm * feature_stds_array[j] + feature_means_array[j]
+    # Standardized training X for ranges & medians
+    Xn_train = ds["Xn_train"].values.astype(float)
+    num_features = Xn_train.shape[1]
 
-    def maybe_set_log_x(fig_obj, row_idx: int, col_idx: int, feature_index: int):
-        if feature_names_list[feature_index] == "learning_rate":
-            fig_obj.update_xaxes(type="log", row=row_idx, col=col_idx)
+    # Base point in standardized space (median), conditioned by 'fixed'
+    base_std = np.median(Xn_train, axis=0)
+    if fixed:
+        base_std = _apply_fixed_to_base(base_std, fixed, feature_names, transforms, X_mean, X_std)
 
-    def maybe_set_log_y(fig_obj, row_idx: int, col_idx: int, feature_index: int):
-        if feature_names_list[feature_index] == "learning_rate":
-            fig_obj.update_yaxes(type="log", row=row_idx, col=col_idx)
-
-    def rgb_string_to_tuple(s: str) -> tuple[int, int, int]:
-        # expects "rgb(r,g,b)" or "rgba(r,g,b,a)"
-        vals = s[s.find("(")+1:s.find(")")].split(",")
-        r, g, b = [int(float(v)) for v in vals[:3]]
-        return r, g, b
-
-    def luminance_from_colorstring(s: str) -> float:
-        r, g, b = rgb_string_to_tuple(s)
-        # sRGB luma
-        return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
-
-    # Given a raw level value, find line grey by inverting colourscale luminance at that level
-    cs = get_colorscale(colourscale)
-
-    def contour_line_color_for_level(level_raw: float, cmin_t: float, cmax_t: float) -> str:
-        # map raw level -> transformed (for colour) -> normalize to [0,1] -> sample colourscale
-        zt = level_raw
-        if use_log_scale_for_target:
-            # apply same transform used for heatmap
-            shift = 0.0
-            # cmin_t/cmax_t are already on transformed scale, so we only need the transformed level
-            # we don't know the global shift used, but transform_for_colour below returns it when
-            # called on arrays; for scalars we re-run it locally for t.
-            # We'll inline a tiny version here:
-            # compute shift so that level is > 0 if needed (approx; very rare if data>0)
-            # but since normalization uses transformed bounds, we'd better compute
-            # transformed value via the same function outside. We approximate here:
-            # ensure positive
-            if level_raw <= 0:
-                shift = -level_raw + float(log_shift_epsilon)
-            zt = np.log10(max(level_raw + shift, log_shift_epsilon))
-        # normalize transformed level
-        t = 0.5 if cmax_t == cmin_t else (zt - cmin_t) / (cmax_t - cmin_t)
-        t = float(np.clip(t, 0.0, 1.0))
-        rgb = sample_colorscale(cs, [t])[0]          # "rgb(r,g,b)"
-        lum = luminance_from_colorstring(rgb)        # 0..1
-        inv = 1.0 - lum
-        g = int(round(inv * 255))
-        return f"rgba({g},{g},{g},0.85)"
-
-    # ---------- data points ----------
-    success_mask = ~dataframe_input["loss"].isna().to_numpy()
-    fail_mask = ~success_mask
-
-    data_feature_columns = {}
-    for name in feature_names_list:
-        if name not in dataframe_input.columns:
-            raise KeyError(f"Column '{name}' not found in dataframe_input.")
-        col = dataframe_input[name].to_numpy().astype(float)
-        data_feature_columns[name] = col  # learning_rate is already real LR
-
-    def data_vals_for_feature(index: int) -> np.ndarray:
-        return data_feature_columns[feature_names_list[index]]
-
-    # ---------- base point & ranges ----------
-    feature_medians_normalized: np.ndarray = np.median(feature_matrix_standardized, axis=0)
-    one_d_ranges_normalized = [
-        np.linspace(*_p01_p99(feature_matrix_standardized[:, j]), n_points_1d)
+    # 1D and 2D sweep ranges (in standardized space) from empirical 1–99% quantiles
+    ranges_1d_std = [
+        np.linspace(*np.percentile(Xn_train[:, j], [1, 99]), n_points_1d)
         for j in range(num_features)
     ]
-    two_d_ranges_normalized = [
-        np.linspace(*_p01_p99(feature_matrix_standardized[:, j]), n_points_2d)
+    ranges_2d_std = [
+        np.linspace(*np.percentile(Xn_train[:, j], [1, 99]), n_points_2d)
         for j in range(num_features)
     ]
 
     # ---------- diagonal (1D -> symmetric 2D) ----------
-    diagonal_payload: dict[int, dict] = {}
+    diag_payload: dict[int, dict] = {}
     for j in range(num_features):
-        grid_norm = one_d_ranges_normalized[j]
-        X_grid = np.repeat(feature_medians_normalized[None, :], len(grid_norm), axis=0)
-        X_grid[:, j] = grid_norm
+        grid = ranges_1d_std[j]
+        Xn_grid = np.repeat(base_std[None, :], len(grid), axis=0)
+        Xn_grid[:, j] = grid
 
-        p_1d = predict_success_probability(X_grid)
-        mu_1d, _ = predict_loss_given_success(X_grid)
+        # predictions
+        p_1d = pred_success(Xn_grid)
+        mu_1d, _ = pred_loss(Xn_grid, include_observation_noise=True)
 
-        x_original = denormalize_feature(j, grid_norm)
-        x_display = 10 ** x_original if feature_names_list[j] == "learning_rate" else x_original
-
+        # original display axis (inverse transform)
+        x_orig = _denormalize_then_inverse_transform(j, grid, transforms, X_mean, X_std)
+        x_display = x_orig  # original units
+        # store symmetric Z for diagonal
         Z_mu_diag = 0.5 * (mu_1d[:, None] + mu_1d[None, :])
         Z_p_diag = np.minimum(p_1d[:, None], p_1d[None, :])
-
-        diagonal_payload[j] = {"x_display": x_display, "Z_mu": Z_mu_diag, "Z_p": Z_p_diag}
+        diag_payload[j] = {"x": x_display, "Zmu": Z_mu_diag, "Zp": Z_p_diag}
 
     # ---------- off-diagonals (true 2D) ----------
-    offdiag_payload: dict[tuple[int, int], dict] = {}
+    off_payload: dict[Tuple[int, int], dict] = {}
     for i in range(num_features):
         for j in range(num_features):
             if i == j:
                 continue
-            xg = two_d_ranges_normalized[j]
-            yg = two_d_ranges_normalized[i]
-            XX, YY = np.meshgrid(xg, yg)
+            xg = ranges_2d_std[j]
+            yg = ranges_2d_std[i]
+            XX, YY = np.meshgrid(xg, yg)  # (Ny, Nx)
 
-            X_grid = np.repeat(feature_medians_normalized[None, :], XX.size, axis=0)
-            X_grid[:, j] = XX.ravel()
-            X_grid[:, i] = YY.ravel()
+            Xn_grid = np.repeat(base_std[None, :], XX.size, axis=0)
+            Xn_grid[:, j] = XX.ravel()
+            Xn_grid[:, i] = YY.ravel()
 
-            mu_flat, _ = predict_loss_given_success(X_grid)
-            p_flat = predict_success_probability(X_grid)
+            mu_flat, _ = pred_loss(Xn_grid, include_observation_noise=True)
+            p_flat = pred_success(Xn_grid)
 
-            Z_mu = mu_flat.reshape(YY.shape)
-            Z_p = p_flat.reshape(YY.shape)
+            Zmu = mu_flat.reshape(YY.shape)
+            Zp = p_flat.reshape(YY.shape)
 
-            x_original = denormalize_feature(j, xg)
-            y_original = denormalize_feature(i, yg)
-            x_display = 10 ** x_original if feature_names_list[j] == "learning_rate" else x_original
-            y_display = 10 ** y_original if feature_names_list[i] == "learning_rate" else y_original
+            x_orig = _denormalize_then_inverse_transform(j, xg, transforms, X_mean, X_std)
+            y_orig = _denormalize_then_inverse_transform(i, yg, transforms, X_mean, X_std)
+            off_payload[(i, j)] = {"x": x_orig, "y": y_orig, "Zmu": Zmu, "Zp": Zp}
 
-            offdiag_payload[(i, j)] = {"x_display": x_display, "y_display": y_display, "Z_mu": Z_mu, "Z_p": Z_p}
-
-    # ---------- colour transform & bounds ----------
-    def transform_for_colour(z_values: np.ndarray) -> tuple[np.ndarray, float, str]:
+    # ---------- colour transform globals ----------
+    def color_transform(z_raw: np.ndarray) -> Tuple[np.ndarray, float]:
+        """Return transformed Z and global shift used."""
         if not use_log_scale_for_target:
-            return z_values, 0.0, ""
-        z_min = float(np.nanmin(z_values))
+            return z_raw, 0.0
+        zmin = float(np.nanmin(z_raw))
         shift = 0.0
-        if z_min <= 0:
-            shift = -(z_min) + float(log_shift_epsilon)
-        z_shifted = np.maximum(z_values + shift, log_shift_epsilon)
-        z_log = np.log10(z_shifted)
-        suffix = " (log10)" if shift == 0.0 else f" (log10, shifted by Δ={shift:.3g})"
-        return z_log, shift, suffix
+        if zmin <= 0:
+            shift = -zmin + float(log_shift_epsilon)
+        return np.log10(np.maximum(z_raw + shift, log_shift_epsilon)), shift
 
-    all_mu_blocks = [d["Z_mu"].ravel() for d in diagonal_payload.values()] + \
-                    [d["Z_mu"].ravel() for d in offdiag_payload.values()]
-    if len(all_mu_blocks):
-        all_mu_concat = np.concatenate(all_mu_blocks)
-        Z_all_for_colour, _global_shift, colorbar_suffix = transform_for_colour(all_mu_concat)
-        cmin_t = float(np.nanmin(Z_all_for_colour))
-        cmax_t = float(np.nanmax(Z_all_for_colour))
+    all_blocks = [d["Zmu"].ravel() for d in diag_payload.values()] + [d["Zmu"].ravel() for d in off_payload.values()]
+    if len(all_blocks) == 0:
+        z_all = np.array([0.0, 1.0])
     else:
-        cmin_t, cmax_t, colorbar_suffix = 0.0, 1.0, ""
+        z_all = np.concatenate(all_blocks)
+    z_all_t, global_shift = color_transform(z_all)
+    cmin_t = float(np.nanmin(z_all_t))
+    cmax_t = float(np.nanmax(z_all_t))
+
+    # For contour line greys: invert luminance of colourscale at normalized transformed level
+    cs = get_colorscale(colourscale)
+
+    def contour_line_color(level_raw: float) -> str:
+        zt = np.log10(max(level_raw + global_shift, log_shift_epsilon)) if use_log_scale_for_target else level_raw
+        t = 0.5 if cmax_t == cmin_t else (zt - cmin_t) / (cmax_t - cmin_t)
+        t = float(np.clip(t, 0.0, 1.0))
+        rgb = sample_colorscale(cs, [t])[0]  # "rgb(r,g,b)"
+        r, g, b = _rgb_string_to_tuple(rgb)
+        lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+        inv = 1.0 - lum
+        grey = int(round(inv * 255))
+        return f"rgba({grey},{grey},{grey},0.9)"
 
     # ---------- figure ----------
     fig = make_subplots(
         rows=num_features, cols=num_features,
         shared_xaxes=False, shared_yaxes=False,
-        horizontal_spacing=0.06, vertical_spacing=0.06
+        horizontal_spacing=0.06, vertical_spacing=0.06,
     )
 
-    # ---- off-diagonals: heatmap, shading, contours, data ----
-    for (row_feat_idx, col_feat_idx), payload in offdiag_payload.items():
-        row_idx, col_idx = row_feat_idx + 1, col_feat_idx + 1
-        x_vals, y_vals = payload["x_display"], payload["y_display"]
-        Z_mu_raw, Z_p = payload["Z_mu"], payload["Z_p"]
-        Z_for_colour, _, _ = transform_for_colour(Z_mu_raw)
+    # Experimental points setup
+    success_mask = ~pd.isna(df_raw[ds.attrs["target_column"]]).to_numpy()
+    fail_mask = ~success_mask
 
-        # heatmap
+    def data_vals_for_feature(j: int) -> np.ndarray:
+        name = feature_names[j]
+        if name not in df_raw.columns:
+            raise KeyError(f"Column '{name}' not found in artifact.")
+        return df_raw[name].to_numpy().astype(float)
+
+    # Off-diagonals
+    for (i, j), PAY in off_payload.items():
+        row, col = i + 1, j + 1
+        x_vals = PAY["x"]; y_vals = PAY["y"]; Zmu_raw = PAY["Zmu"]; Zp = PAY["Zp"]
+        Z_t, _ = color_transform(Zmu_raw)
+
+        # Heatmap
         fig.add_trace(go.Heatmap(
-            x=x_vals, y=y_vals, z=Z_for_colour,
-            coloraxis="coloraxis", zsmooth=False, showscale=False,
+            x=x_vals, y=y_vals, z=Z_t, coloraxis="coloraxis", zsmooth=False, showscale=False,
             hovertemplate=(
-                f"{feature_names_list[col_feat_idx]}: %{{x:.6g}}<br>"
-                f"{feature_names_list[row_feat_idx]}: %{{y:.6g}}"
-                "<br>E[loss|success]: %{customdata:.3f}<extra></extra>"
+                f"{feature_names[j]}: %{{x:.6g}}<br>{feature_names[i]}: %{{y:.6g}}"
+                "<br>E[target|success]: %{customdata:.3f}<extra></extra>"
             ),
-            customdata=Z_mu_raw
-        ), row=row_idx, col=col_idx)
+            customdata=Zmu_raw
+        ), row=row, col=col)
 
-        # shading overlays (draw BEFORE contours so contours stay visible)
-        mask_lt_05 = np.where(Z_p < 0.5, 1.0, np.nan)
-        mask_lt_08 = np.where(Z_p < 0.8, 1.0, np.nan)
-        fig.add_trace(go.Heatmap(
-            x=x_vals, y=y_vals, z=mask_lt_05, zmin=0, zmax=1,
-            colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(128,128,128,0.25)"]],
-            showscale=False, hoverinfo="skip"
-        ), row=row_idx, col=col_idx)
-        fig.add_trace(go.Heatmap(
-            x=x_vals, y=y_vals, z=mask_lt_08, zmin=0, zmax=1,
-            colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(128,128,128,0.40)"]],
-            showscale=False, hoverinfo="skip"
-        ), row=row_idx, col=col_idx)
+        # Probability shading
+        for thr, alpha in ((0.5, 0.25), (0.8, 0.40)):
+            mask = np.where(Zp < thr, 1.0, np.nan)
+            fig.add_trace(go.Heatmap(
+                x=x_vals, y=y_vals, z=mask, zmin=0, zmax=1,
+                colorscale=[[0, "rgba(0,0,0,0)"], [1, f"rgba(128,128,128,{alpha})"]],
+                showscale=False, hoverinfo="skip"
+            ), row=row, col=col)
 
-        # contours: one trace per level, greyscale inverted from colourscale luminance
-        zmin_raw = float(np.nanmin(Z_mu_raw))
-        zmax_raw = float(np.nanmax(Z_mu_raw))
-        levels = np.linspace(zmin_raw, zmax_raw, max(n_contours, 2))
+        # Contours
+        zmin_r, zmax_r = float(np.nanmin(Zmu_raw)), float(np.nanmax(Zmu_raw))
+        levels = np.linspace(zmin_r, zmax_r, max(n_contours, 2))
         for lev in levels:
-            line_color = contour_line_color_for_level(lev, cmin_t, cmax_t)
             fig.add_trace(go.Contour(
-                x=x_vals, y=y_vals, z=Z_mu_raw,
+                x=x_vals, y=y_vals, z=Zmu_raw,
                 autocontour=False,
                 contours=dict(coloring="lines", showlabels=False, start=lev, end=lev, size=1e-9),
-                line=dict(width=1, color=line_color),
+                line=dict(width=1, color=contour_line_color(lev)),
                 showscale=False, hoverinfo="skip"
-            ), row=row_idx, col=col_idx)
+            ), row=row, col=col)
 
-        # experimental points on top
-        x_data = data_vals_for_feature(col_feat_idx)
-        y_data = data_vals_for_feature(row_feat_idx)
+        # Experimental points
+        xd = data_vals_for_feature(j)
+        yd = data_vals_for_feature(i)
+
         fig.add_trace(go.Scattergl(
-            x=x_data[success_mask], y=y_data[success_mask],
-            mode="markers",
+            x=xd[success_mask], y=yd[success_mask], mode="markers",
             marker=dict(size=4, color="black", line=dict(width=0)),
-            name="data (success)", legendgroup="data_success",
-            showlegend=(row_idx == 1 and col_idx == 1),
+            name="data (success)", legendgroup="data_succ",
+            showlegend=(row == 1 and col == 1),
             hovertemplate=(
-                f"trial_id: %{{customdata[0]}}<br>"
-                f"{feature_names_list[col_feat_idx]}: %{{x:.6g}}<br>"
-                f"{feature_names_list[row_feat_idx]}: %{{y:.6g}}<br>"
-                "loss: %{customdata[1]:.4f}<extra></extra>"
+                "trial_id: %{customdata[0]}<br>"
+                f"{feature_names[j]}: %{{x:.6g}}<br>"
+                f"{feature_names[i]}: %{{y:.6g}}<br>"
+                f"{ds.attrs['target_column']}: %{{customdata[1]:.4f}}<extra></extra>"
             ),
             customdata=np.column_stack([
-                dataframe_input["trial_id"].to_numpy()[success_mask],
-                dataframe_input["loss"].to_numpy()[success_mask],
+                df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask],
+                df_raw[ds.attrs["target_column"]].to_numpy()[success_mask],
             ])
-        ), row=row_idx, col=col_idx)
+        ), row=row, col=col)
+
         fig.add_trace(go.Scattergl(
-            x=x_data[fail_mask], y=y_data[fail_mask],
-            mode="markers",
+            x=xd[fail_mask], y=yd[fail_mask], mode="markers",
             marker=dict(size=5, color="red", line=dict(color="black", width=0.8)),
-            name="data (failed)", legendgroup="data_failed",
-            showlegend=(row_idx == 1 and col_idx == 1),
+            name="data (failed)", legendgroup="data_fail",
+            showlegend=(row == 1 and col == 1),
             hovertemplate=(
-                f"trial_id: %{{customdata}}<br>"
-                f"{feature_names_list[col_feat_idx]}: %{{x:.6g}}<br>"
-                f"{feature_names_list[row_feat_idx]}: %{{y:.6g}}<br>"
-                "status: failed (NaN loss)<extra></extra>"
+                "trial_id: %{customdata}<br>"
+                f"{feature_names[j]}: %{{x:.6g}}<br>"
+                f"{feature_names[i]}: %{{y:.6g}}<br>"
+                "status: failed (NaN target)<extra></extra>"
             ),
-            customdata=dataframe_input["trial_id"].to_numpy()[fail_mask]
-        ), row=row_idx, col=col_idx)
+            customdata=df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
+        ), row=row, col=col)
 
-        maybe_set_log_x(fig, row_idx, col_idx, col_feat_idx)
-        maybe_set_log_y(fig, row_idx, col_idx, row_feat_idx)
+        _maybe_log_axis(fig, row, col, feature_names[j], axis="x")
+        _maybe_log_axis(fig, row, col, feature_names[i], axis="y", transforms=transforms, j=i)
 
-    # ---- diagonal: symmetric heatmap, shading, contours, points ----
-    for j, payload in diagonal_payload.items():
-        row_idx = col_idx = j + 1
-        axis_x = payload["x_display"]
-        axis_y = payload["x_display"]
-        Z_mu_diag_raw = payload["Z_mu"]
-        Z_p_diag = payload["Z_p"]
-        Z_for_colour_diag, _, _ = transform_for_colour(Z_mu_diag_raw)
+    # Diagonals
+    for j, PAY in diag_payload.items():
+        row = col = j + 1
+        axis = PAY["x"]
+        Zmu_raw = PAY["Zmu"]; Zp = PAY["Zp"]
+        Z_t, _ = color_transform(Zmu_raw)
 
         fig.add_trace(go.Heatmap(
-            x=axis_x, y=axis_y, z=Z_for_colour_diag,
-            coloraxis="coloraxis", zsmooth=False, showscale=False,
+            x=axis, y=axis, z=Z_t, coloraxis="coloraxis", zsmooth=False, showscale=False,
             hovertemplate=(
-                f"{feature_names_list[j]}: %{{x:.6g}} / %{{y:.6g}}"
-                "<br>E[loss|success]: %{customdata:.3f}<extra></extra>"
+                f"{feature_names[j]}: %{{x:.6g}} / %{{y:.6g}}"
+                "<br>E[target|success]: %{customdata:.3f}<extra></extra>"
             ),
-            customdata=Z_mu_diag_raw
-        ), row=row_idx, col=col_idx)
+            customdata=Zmu_raw
+        ), row=row, col=col)
 
-        # shading first
-        mask_lt_05 = np.where(Z_p_diag < 0.5, 1.0, np.nan)
-        mask_lt_08 = np.where(Z_p_diag < 0.8, 1.0, np.nan)
-        fig.add_trace(go.Heatmap(
-            x=axis_x, y=axis_y, z=mask_lt_05, zmin=0, zmax=1,
-            colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(128,128,128,0.25)"]],
-            showscale=False, hoverinfo="skip"
-        ), row=row_idx, col=col_idx)
-        fig.add_trace(go.Heatmap(
-            x=axis_x, y=axis_y, z=mask_lt_08, zmin=0, zmax=1,
-            colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(128,128,128,0.40)"]],
-            showscale=False, hoverinfo="skip"
-        ), row=row_idx, col=col_idx)
+        for thr, alpha in ((0.5, 0.25), (0.8, 0.40)):
+            mask = np.where(Zp < thr, 1.0, np.nan)
+            fig.add_trace(go.Heatmap(
+                x=axis, y=axis, z=mask, zmin=0, zmax=1,
+                colorscale=[[0, "rgba(0,0,0,0)"], [1, f"rgba(128,128,128,{alpha})"]],
+                showscale=False, hoverinfo="skip"
+            ), row=row, col=col)
 
-        # contours per level
-        zmin_raw = float(np.nanmin(Z_mu_diag_raw))
-        zmax_raw = float(np.nanmax(Z_mu_diag_raw))
-        levels = np.linspace(zmin_raw, zmax_raw, max(n_contours, 2))
+        zmin_r, zmax_r = float(np.nanmin(Zmu_raw)), float(np.nanmax(Zmu_raw))
+        levels = np.linspace(zmin_r, zmax_r, max(n_contours, 2))
         for lev in levels:
-            line_color = contour_line_color_for_level(lev, cmin_t, cmax_t)
             fig.add_trace(go.Contour(
-                x=axis_x, y=axis_y, z=Z_mu_diag_raw,
+                x=axis, y=axis, z=Zmu_raw,
                 autocontour=False,
                 contours=dict(coloring="lines", showlabels=False, start=lev, end=lev, size=1e-9),
-                line=dict(width=1, color=line_color),
+                line=dict(width=1, color=contour_line_color(lev)),
                 showscale=False, hoverinfo="skip"
-            ), row=row_idx, col=col_idx)
+            ), row=row, col=col)
 
-        # points (x=y)
-        x_data = data_vals_for_feature(j); y_data = x_data
+        # Experimental points (x=y)
+        xd = data_vals_for_feature(j)
         fig.add_trace(go.Scattergl(
-            x=x_data[success_mask], y=y_data[success_mask],
-            mode="markers",
+            x=xd[success_mask], y=xd[success_mask], mode="markers",
             marker=dict(size=4, color="black", line=dict(width=0)),
-            name="data (success)", legendgroup="data_success",
+            name="data (success)", legendgroup="data_succ",
             showlegend=False,
             hovertemplate=(
-                f"trial_id: %{{customdata[0]}}<br>"
-                f"{feature_names_list[j]}: %{{x:.6g}}<br>"
-                "loss: %{customdata[1]:.4f}<extra></extra>"
+                "trial_id: %{customdata[0]}<br>"
+                f"{feature_names[j]}: %{{x:.6g}}<br>"
+                f"{ds.attrs['target_column']}: %{{customdata[1]:.4f}}<extra></extra>"
             ),
             customdata=np.column_stack([
-                dataframe_input["trial_id"].to_numpy()[success_mask],
-                dataframe_input["loss"].to_numpy()[success_mask],
+                df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask],
+                df_raw[ds.attrs["target_column"]].to_numpy()[success_mask],
             ])
-        ), row=row_idx, col=col_idx)
+        ), row=row, col=col)
+
         fig.add_trace(go.Scattergl(
-            x=x_data[fail_mask], y=y_data[fail_mask],
-            mode="markers",
+            x=xd[fail_mask], y=xd[fail_mask], mode="markers",
             marker=dict(size=5, color="red", line=dict(color="black", width=0.8)),
-            name="data (failed)", legendgroup="data_failed",
+            name="data (failed)", legendgroup="data_fail",
             showlegend=False,
             hovertemplate=(
-                f"trial_id: %{{customdata}}<br>"
-                f"{feature_names_list[j]}: %{{x:.6g}}<br>"
-                "status: failed (NaN loss)<extra></extra>"
+                "trial_id: %{customdata}<br>"
+                f"{feature_names[j]}: %{{x:.6g}}<br>"
+                "status: failed (NaN target)<extra></extra>"
             ),
-            customdata=dataframe_input["trial_id"].to_numpy()[fail_mask]
-        ), row=row_idx, col=col_idx)
+            customdata=df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
+        ), row=row, col=col)
 
-        if feature_names_list[j] == "learning_rate":
-            fig.update_xaxes(type="log", row=row_idx, col=col_idx)
-            fig.update_yaxes(type="log", row=row_idx, col=col_idx)
+        _maybe_log_axis(fig, row, col, feature_names[j], axis="x")
+        _maybe_log_axis(fig, row, col, feature_names[j], axis="y")
 
-    # axis labels
+    # Axis titles
     for j in range(num_features):
-        fig.update_xaxes(title_text=feature_names_list[j], row=num_features, col=j + 1)
+        fig.update_xaxes(title_text=feature_names[j], row=num_features, col=j + 1)
     for i in range(num_features):
-        fig.update_yaxes(title_text=feature_names_list[i], row=i + 1, col=1)
+        fig.update_yaxes(title_text=feature_names[i], row=i + 1, col=1)
 
-    # layout
-    cell_px = 250
-    colorbar_title = f"E[loss|success]{colorbar_suffix}"
+    # Layout & export
+    cell = 250
+    colorbar_title = "E[target|success]" + (" (log10)" if use_log_scale_for_target else "")
+    if use_log_scale_for_target and global_shift > 0:
+        colorbar_title += f" (shift Δ={global_shift:.3g})"
     fig.update_layout(
         coloraxis=dict(colorscale=colourscale, cmin=cmin_t, cmax=cmax_t,
                        colorbar=dict(title=colorbar_title)),
         template="simple_white",
-        width=cell_px * num_features,
-        height=cell_px * num_features,
-        title="Pairplot — E[loss|success] with inverted-luminance contours & data points",
+        width=cell * num_features,
+        height=cell * num_features,
+        title="Pairplot — E[target|success] with inverted-luminance contours & data points",
         legend_title_text=""
     )
 
-    fig.write_html(outfile, include_plotlyjs="cdn")
+    fig.write_html(str(output), include_plotlyjs="cdn")
+    if show:
+        fig.show()
+
+
+def make_partial_dependence1D(
+    model: Path,
+    output: Path,
+    csv_out: Path,
+    n_points_1d: int = 300,
+    line_color: str = "rgb(31,119,180)",
+    band_alpha: float = 0.25,
+    figure_height_per_row_px: int = 320,
+    show_figure: bool = False,
+    use_log_scale_for_target_y: bool = True,   # log-y for target
+    log_y_epsilon: float = 1e-9,
+    fixed: Optional[Dict[str, float]] = None,  # <-- condition on variables in ORIGINAL units
+) -> None:
+    """
+    Vertical 1D PD panels of E[target|success] vs each feature:
+      - single colour & legend across variables
+      - ±2σ band, mean curve
+      - shading where P(success)<0.8 (darker) and <0.5 (lighter)
+      - experimental points: successes (black); failures (red w/ black outline, drawn above)
+    """
+    ds = xr.load_dataset(model)
+    pred_success, pred_loss = _build_predictors(ds)
+
+    feature_names = [str(n) for n in ds["feature"].values.tolist()]
+    transforms = [str(t) for t in ds["feature_transform"].values.tolist()]
+    X_mean = ds["feature_mean"].values.astype(float)
+    X_std = ds["feature_std"].values.astype(float)
+
+    df_raw = _raw_dataframe_from_dataset(ds)
+    Xn_train = ds["Xn_train"].values.astype(float)
+    num_features = Xn_train.shape[1]
+
+    # Base standardized point (median), then apply 'fixed'
+    base_std = np.median(Xn_train, axis=0)
+    if fixed:
+        base_std = _apply_fixed_to_base(base_std, fixed, feature_names, transforms, X_mean, X_std)
+
+    # Build standardized sweeps per feature
+    sweeps_std = [
+        np.linspace(*np.percentile(Xn_train[:, j], [1, 99]), n_points_1d)
+        for j in range(num_features)
+    ]
+
+    # Masks and data for experimental points
+    tgt_col = str(ds.attrs["target_column"])
+    success_mask = ~pd.isna(df_raw[tgt_col]).to_numpy()
+    fail_mask = ~success_mask
+    losses_success = df_raw.loc[success_mask, tgt_col].to_numpy().astype(float)
+    trial_ids_success = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask]
+    trial_ids_fail = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
+
+    # Helpers for colour fill
+    band_fill_rgba = _rgb_to_rgba(line_color, band_alpha)
+
+    # Figure
+    fig = make_subplots(
+        rows=num_features, cols=1, shared_xaxes=False, vertical_spacing=0.08,
+        subplot_titles=[f"E[target|success] — {name}" for name in feature_names]
+    )
+
+    tidy_rows: List[dict] = []
+
+    for j in range(num_features):
+        grid = sweeps_std[j]
+        Xn_grid = np.repeat(base_std[None, :], len(grid), axis=0)
+        Xn_grid[:, j] = grid
+
+        p_grid = pred_success(Xn_grid)
+        mu_grid, sd_grid = pred_loss(Xn_grid, include_observation_noise=True)
+
+        x_internal = grid * X_std[j] + X_mean[j]
+        x_display = _inverse_transform(transforms[j], x_internal)
+
+        # Target transforms for plotting
+        if use_log_scale_for_target_y:
+            mu_plot = np.maximum(mu_grid, log_y_epsilon)
+            lo_plot = np.maximum(mu_grid - 2.0 * sd_grid, log_y_epsilon)
+            hi_plot = np.maximum(mu_grid + 2.0 * sd_grid, log_y_epsilon)
+            losses_s_plot = np.maximum(losses_success, log_y_epsilon) if losses_success.size else losses_success
+        else:
+            mu_plot = mu_grid
+            lo_plot = mu_grid - 2.0 * sd_grid
+            hi_plot = mu_grid + 2.0 * sd_grid
+            losses_s_plot = losses_success
+
+        # Y-range pad; include observed successes
+        y_arrays = [lo_plot, hi_plot] + ([losses_s_plot] if losses_s_plot.size else [])
+        y_low = float(np.min([arr.min() for arr in y_arrays]))
+        y_high = float(np.max([arr.max() for arr in y_arrays]))
+        pad = 0.05 * (y_high - y_low + 1e-12)
+        y0_plot = (y_low - pad) if not use_log_scale_for_target_y else max(y_low / 1.5, log_y_epsilon)
+        y1_tmp = (y_high + pad) if not use_log_scale_for_target_y else y_high * 1.2
+        y_failed_band = y1_tmp + (y_high - y_low + 1e-12) * (0.08 if not use_log_scale_for_target_y else 0.3)
+        if use_log_scale_for_target_y and y_failed_band <= log_y_epsilon:
+            y_failed_band = max(10.0 * log_y_epsilon, y_high * 2.0)
+        y1_plot = y_failed_band + (0.02 if not use_log_scale_for_target_y else 0.05) * (y_high - y_low + 1e-12)
+
+        # Shading (below the PD)
+        _add_low_success_shading_1d(fig, j + 1, x_display, p_grid, y0_plot, y1_plot)
+
+        # ±2σ band (legend shown only once)
+        show_legend = (j == 0)
+        fig.add_trace(go.Scatter(
+            x=x_display, y=lo_plot, mode="lines",
+            line=dict(width=0, color=line_color),
+            name="±2σ", legendgroup="band", showlegend=False, hoverinfo="skip"
+        ), row=j + 1, col=1)
+        fig.add_trace(go.Scatter(
+            x=x_display, y=hi_plot, mode="lines", fill="tonexty",
+            line=dict(width=0, color=line_color), fillcolor=band_fill_rgba,
+            name="±2σ", legendgroup="band", showlegend=show_legend,
+            hovertemplate="E[target|success]: %{y:.3f}<extra>±2σ</extra>"
+        ), row=j + 1, col=1)
+
+        # Mean curve
+        fig.add_trace(go.Scatter(
+            x=x_display, y=mu_plot, mode="lines",
+            line=dict(width=2, color=line_color),
+            name="E[target|success]", legendgroup="mean", showlegend=show_legend,
+            hovertemplate=f"{feature_names[j]}: %{{x:.6g}}<br>E[target|success]: %{{y:.3f}}<extra></extra>"
+        ), row=j + 1, col=1)
+
+        # Experimental successes
+        x_data_all = df_raw[feature_names[j]].to_numpy().astype(float)
+        x_succ = x_data_all[success_mask]
+        if x_succ.size:
+            fig.add_trace(go.Scattergl(
+                x=x_succ, y=losses_s_plot,
+                mode="markers",
+                marker=dict(size=5, color="black", line=dict(width=0)),
+                name="data (success)", legendgroup="data_s", showlegend=show_legend,
+                hovertemplate=(
+                    "trial_id: %{customdata}<br>"
+                    f"{feature_names[j]}: %{{x:.6g}}<br>"
+                    f"{tgt_col}: %{{y:.4f}}<extra></extra>"
+                ),
+                customdata=trial_ids_success
+            ), row=j + 1, col=1)
+
+        # Experimental failures (hover shows failure status)
+        x_fail = x_data_all[fail_mask]
+        if x_fail.size:
+            y_fail_plot = np.full_like(x_fail, y_failed_band, dtype=float)
+            fig.add_trace(go.Scattergl(
+                x=x_fail, y=y_fail_plot, mode="markers",
+                marker=dict(size=6, color="red", line=dict(color="black", width=0.8)),
+                name="data (failed)", legendgroup="data_f", showlegend=show_legend,
+                hovertemplate=(
+                    "trial_id: %{customdata}<br>"
+                    f"{feature_names[j]}: %{{x:.6g}}<br>"
+                    "status: failed (NaN target)<extra></extra>"
+                ),
+                customdata=trial_ids_fail
+            ), row=j + 1, col=1)
+
+        # Axes
+        _maybe_log_axis(fig, j + 1, 1, feature_names[j], axis="x", transforms=transforms, j=j)
+        fig.update_yaxes(
+            title_text=f"{tgt_col} (E[target|success])",
+            type="log" if use_log_scale_for_target_y else "-",
+            row=j + 1, col=1
+        )
+        fig.update_yaxes(range=[y0_plot, y1_plot], row=j + 1, col=1)
+        fig.update_xaxes(title_text=feature_names[j], row=j + 1, col=1)
+
+        # tidy lines
+        for xd, xi, mu_i, sd_i, p_i in zip(x_display, x_internal, mu_grid, sd_grid, p_grid):
+            tidy_rows.append({
+                "feature": feature_names[j],
+                "x_display": float(xd),
+                "x_internal": float(xi),
+                "target_conditional_mean": float(mu_i),
+                "target_conditional_sd": float(sd_i),
+                "success_probability": float(p_i),
+            })
+
+    fig.update_layout(
+        height=figure_height_per_row_px * num_features,
+        template="simple_white",
+        title="1D Partial Dependence: E[target|success] with experimental points & low-success shading",
+        legend_title_text=""
+    )
+
+    fig.write_html(str(output), include_plotlyjs="cdn")
+    pd.DataFrame(tidy_rows).to_csv(str(csv_out), index=False)
     if show_figure:
         fig.show()
-    print(f"Wrote {outfile}")
+
+
+# =============================================================================
+# Helpers: dataset → predictors & featurization
+# =============================================================================
+
+def _build_predictors(ds: xr.Dataset):
+    """Reconstruct fast GP predictors from the artifact (no PyMC required)."""
+    # Training matrices / targets
+    Xn_all = ds["Xn_train"].values.astype(float)               # (N, p)
+    y_success = ds["y_success"].values.astype(float)           # (N,)
+    Xn_ok = ds["Xn_success_only"].values.astype(float)         # (N_ok, p)
+    y_loss_centered = ds["y_loss_centered"].values.astype(float)
+    cond_mean = float(ds["conditional_loss_mean"].values)
+
+    # Success head MAP params
+    ell_s = ds["map_success_ell"].values.astype(float)         # (p,)
+    eta_s = float(ds["map_success_eta"].values)
+    sigma_s = float(ds["map_success_sigma"].values)
+    beta0_s = float(ds["map_success_beta0"].values)
+
+    # Loss head MAP params
+    ell_l = ds["map_loss_ell"].values.astype(float)            # (p,)
+    eta_l = float(ds["map_loss_eta"].values)
+    sigma_l = float(ds["map_loss_sigma"].values)
+    mean_c = float(ds["map_loss_mean_const"].values)
+
+    # Cholesky precomputations
+    K_s = _kernel_m52_ard(Xn_all, Xn_all, ell_s, eta_s) + (sigma_s**2) * np.eye(Xn_all.shape[0])
+    L_s = np.linalg.cholesky(_add_jitter(K_s))
+    alpha_s = _solve_chol(L_s, (y_success - beta0_s))
+
+    K_l = _kernel_m52_ard(Xn_ok, Xn_ok, ell_l, eta_l) + (sigma_l**2) * np.eye(Xn_ok.shape[0])
+    L_l = np.linalg.cholesky(_add_jitter(K_l))
+    alpha_l = _solve_chol(L_l, (y_loss_centered - mean_c))
+
+    def predict_success_probability(Xn: np.ndarray) -> np.ndarray:
+        Ks = _kernel_m52_ard(Xn, Xn_all, ell_s, eta_s)
+        mu = beta0_s + Ks @ alpha_s
+        return np.clip(mu, 0.0, 1.0)
+
+    def predict_conditional_target(Xn: np.ndarray, include_observation_noise: bool = True):
+        Kl = _kernel_m52_ard(Xn, Xn_ok, ell_l, eta_l)
+        mu_centered = mean_c + Kl @ alpha_l
+        mu = mu_centered + cond_mean
+        v = _solve_lower(L_l, Kl.T)
+        var = _kernel_diag_m52(Xn, ell_l, eta_l) - np.sum(v * v, axis=0)
+        var = np.maximum(var, 1e-12)
+        if include_observation_noise:
+            var = var + sigma_l**2
+        sd = np.sqrt(var)
+        return mu, sd
+
+    return predict_success_probability, predict_conditional_target
+
+
+def _raw_dataframe_from_dataset(ds: xr.Dataset) -> pd.DataFrame:
+    """Collect raw columns from the artifact into a DataFrame for plotting."""
+    cols = {}
+    for name in ds.data_vars:
+        # include only row-aligned arrays
+        da = ds[name]
+        if "row" in da.dims and len(da.dims) == 1 and da.sizes["row"] == ds.sizes["row"]:
+            cols[name] = da.values
+    # Ensure trial_id exists for hover
+    if "trial_id" not in cols:
+        cols["trial_id"] = np.arange(ds.sizes["row"], dtype=int)
+    return pd.DataFrame(cols)
+
+
+def _apply_fixed_to_base(
+    base_std: np.ndarray,
+    fixed: Dict[str, float],
+    feature_names: List[str],
+    transforms: List[str],
+    X_mean: np.ndarray,
+    X_std: np.ndarray,
+) -> np.ndarray:
+    """Override base point in standardized space with fixed ORIGINAL values."""
+    out = base_std.copy()
+    name_to_idx = {n: i for i, n in enumerate(feature_names)}
+    for k, v in fixed.items():
+        if k not in name_to_idx:
+            raise KeyError(f"Fixed variable '{k}' is not a model feature.")
+        j = name_to_idx[k]
+        x_raw = _forward_transform(transforms[j], float(v))
+        out[j] = (x_raw - X_mean[j]) / X_std[j]
+    return out
+
+
+def _denormalize_then_inverse_transform(j: int, x_std: np.ndarray, transforms, X_mean, X_std) -> np.ndarray:
+    x_raw = x_std * X_std[j] + X_mean[j]
+    return _inverse_transform(transforms[j], x_raw)
+
+
+def _forward_transform(tr: str, x: float | np.ndarray) -> np.ndarray:
+    if tr == "log10":
+        x = np.asarray(x, dtype=float)
+        return np.log10(np.maximum(x, 1e-12))
+    return np.asarray(x, dtype=float)
+
+
+def _inverse_transform(tr: str, x: np.ndarray) -> np.ndarray:
+    if tr == "log10":
+        return 10.0 ** x
+    return x
+
+
+def _maybe_log_axis(fig: go.Figure, row: int, col: int, name: str, axis: str = "x", transforms: List[str] | None = None, j: int | None = None):
+    """Use log axis for features that were log10-transformed."""
+    use_log = False
+    if transforms is not None and j is not None:
+        use_log = (transforms[j] == "log10")
+    else:
+        use_log = ("learning_rate" in name.lower() or name.lower() == "lr")
+    if use_log:
+        if axis == "x":
+            fig.update_xaxes(type="log", row=row, col=col)
+        else:
+            fig.update_yaxes(type="log", row=row, col=col)
+
+
+def _rgb_string_to_tuple(s: str) -> Tuple[int, int, int]:
+    vals = s[s.find("(") + 1 : s.find(")")].split(",")
+    r, g, b = [int(float(v)) for v in vals[:3]]
+    return r, g, b
+
+
+def _rgb_to_rgba(rgb: str, alpha: float) -> str:
+    # expects "rgb(r,g,b)" or "rgba(r,g,b,a)"
+    try:
+        r, g, b = _rgb_string_to_tuple(rgb)
+    except Exception:
+        r, g, b = (31, 119, 180)
+    return f"rgba({r},{g},{b},{alpha:.3f})"
+
+
+def _add_low_success_shading_1d(fig: go.Figure, row_idx: int, x_vals: np.ndarray, p: np.ndarray, y0: float, y1: float):
+    xref = "x" if row_idx == 1 else f"x{row_idx}"
+    yref = "y" if row_idx == 1 else f"y{row_idx}"
+
+    def _spans(vals: np.ndarray, mask: np.ndarray):
+        m = mask.astype(int)
+        diff = np.diff(np.concatenate([[0], m, [0]]))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0] - 1
+        return [(vals[s], vals[e]) for s, e in zip(starts, ends)]
+
+    for x0, x1 in _spans(x_vals, p < 0.5):
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=y0, y1=y1, xref=xref, yref=yref,
+                      line=dict(width=0), fillcolor="rgba(128,128,128,0.25)", layer="below")
+    for x0, x1 in _spans(x_vals, p < 0.8):
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=y0, y1=y1, xref=xref, yref=yref,
+                      line=dict(width=0), fillcolor="rgba(128,128,128,0.40)", layer="below")
+
+
+# =============================================================================
+# GP kernel & linear algebra (same as in opt.py)
+# =============================================================================
+
+def _kernel_m52_ard(XA: np.ndarray, XB: np.ndarray, ls: np.ndarray, eta: float) -> np.ndarray:
+    XA = np.asarray(XA, float)
+    XB = np.asarray(XB, float)
+    ls = np.asarray(ls, float).reshape(1, 1, -1)
+    diff = (XA[:, None, :] - XB[None, :, :]) / ls
+    r2 = np.sum(diff * diff, axis=2)
+    r = np.sqrt(np.maximum(r2, 0.0))
+    sqrt5_r = np.sqrt(5.0) * r
+    k = (eta ** 2) * (1.0 + sqrt5_r + (5.0 / 3.0) * r2) * np.exp(-sqrt5_r)
+    return k
+
+
+def _kernel_diag_m52(XA: np.ndarray, ls: np.ndarray, eta: float) -> np.ndarray:
+    return np.full(XA.shape[0], eta ** 2, dtype=float)
+
+
+def _add_jitter(K: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    jitter = eps * float(np.mean(np.diag(K)) + 1.0)
+    return K + jitter * np.eye(K.shape[0], dtype=K.dtype)
+
+
+def _solve_chol(L: np.ndarray, b: np.ndarray) -> np.ndarray:
+    y = np.linalg.solve(L, b)
+    return np.linalg.solve(L.T, y)
+
+
+def _solve_lower(L: np.ndarray, B: np.ndarray) -> np.ndarray:
+    return np.linalg.solve(L, B)
