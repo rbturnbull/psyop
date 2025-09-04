@@ -11,6 +11,15 @@ from plotly.subplots import make_subplots
 from plotly.colors import get_colorscale, sample_colorscale
 from plotly.colors import get_colorscale, sample_colorscale  # make sure you have these imports
 
+from .model import (
+    kernel_diag_m52, 
+    kernel_m52_ard,
+    add_jitter,
+    solve_chol,
+    solve_lower,
+    feature_raw_from_artifact_or_reconstruct,
+)
+
 def _edges_from_centers(vals: np.ndarray, is_log: bool) -> tuple[float, float]:
     """Return (min_edge, max_edge) that tightly bound a heatmap with given center coords."""
     v = np.asarray(vals, float)
@@ -213,7 +222,7 @@ def make_pairplot(
         if name in df_raw.columns:
             return df_raw[name].to_numpy().astype(float)
         # fallback: reconstruct from Xn_train + (mean, std, transform)
-        return _feature_raw_from_artifact_or_reconstruct(ds, index, name, transforms[index]).astype(float)
+        return feature_raw_from_artifact_or_reconstruct(ds, index, name, transforms[index]).astype(float)
 
     # Off-diagonals
     for (i, j), PAY in off_payload.items():
@@ -516,7 +525,7 @@ def make_partial_dependence1D(
         if name_j in df_raw.columns:
             x_data_all = df_raw[name_j].to_numpy().astype(float)
         else:
-            x_data_all = _feature_raw_from_artifact_or_reconstruct(ds, j, name_j, transforms[j]).astype(float)
+            x_data_all = feature_raw_from_artifact_or_reconstruct(ds, j, name_j, transforms[j]).astype(float)
 
         x_succ = x_data_all[success_mask]
         if x_succ.size:
@@ -609,25 +618,25 @@ def _build_predictors(ds: xr.Dataset):
     mean_c = float(ds["map_loss_mean_const"].values)
 
     # Cholesky precomputations
-    K_s = _kernel_m52_ard(Xn_all, Xn_all, ell_s, eta_s) + (sigma_s**2) * np.eye(Xn_all.shape[0])
-    L_s = np.linalg.cholesky(_add_jitter(K_s))
-    alpha_s = _solve_chol(L_s, (y_success - beta0_s))
+    K_s = kernel_m52_ard(Xn_all, Xn_all, ell_s, eta_s) + (sigma_s**2) * np.eye(Xn_all.shape[0])
+    L_s = np.linalg.cholesky(add_jitter(K_s))
+    alpha_s = solve_chol(L_s, (y_success - beta0_s))
 
-    K_l = _kernel_m52_ard(Xn_ok, Xn_ok, ell_l, eta_l) + (sigma_l**2) * np.eye(Xn_ok.shape[0])
-    L_l = np.linalg.cholesky(_add_jitter(K_l))
-    alpha_l = _solve_chol(L_l, (y_loss_centered - mean_c))
+    K_l = kernel_m52_ard(Xn_ok, Xn_ok, ell_l, eta_l) + (sigma_l**2) * np.eye(Xn_ok.shape[0])
+    L_l = np.linalg.cholesky(add_jitter(K_l))
+    alpha_l = solve_chol(L_l, (y_loss_centered - mean_c))
 
     def predict_success_probability(Xn: np.ndarray) -> np.ndarray:
-        Ks = _kernel_m52_ard(Xn, Xn_all, ell_s, eta_s)
+        Ks = kernel_m52_ard(Xn, Xn_all, ell_s, eta_s)
         mu = beta0_s + Ks @ alpha_s
         return np.clip(mu, 0.0, 1.0)
 
     def predict_conditional_target(Xn: np.ndarray, include_observation_noise: bool = True):
-        Kl = _kernel_m52_ard(Xn, Xn_ok, ell_l, eta_l)
+        Kl = kernel_m52_ard(Xn, Xn_ok, ell_l, eta_l)
         mu_centered = mean_c + Kl @ alpha_l
         mu = mu_centered + cond_mean
-        v = _solve_lower(L_l, Kl.T)
-        var = _kernel_diag_m52(Xn, ell_l, eta_l) - np.sum(v * v, axis=0)
+        v = solve_lower(L_l, Kl.T)
+        var = kernel_diag_m52(Xn, ell_l, eta_l) - np.sum(v * v, axis=0)
         var = np.maximum(var, 1e-12)
         if include_observation_noise:
             var = var + sigma_l**2
@@ -735,70 +744,6 @@ def _add_low_success_shading_1d(fig: go.Figure, row_idx: int, x_vals: np.ndarray
     for x0, x1 in _spans(x_vals, p < 0.8):
         fig.add_shape(type="rect", x0=x0, x1=x1, y0=y0, y1=y1, xref=xref, yref=yref,
                       line=dict(width=0), fillcolor="rgba(128,128,128,0.40)", layer="below")
-
-
-# =============================================================================
-# GP kernel & linear algebra (same as in opt.py)
-# =============================================================================
-
-def _kernel_m52_ard(XA: np.ndarray, XB: np.ndarray, ls: np.ndarray, eta: float) -> np.ndarray:
-    XA = np.asarray(XA, float)
-    XB = np.asarray(XB, float)
-    ls = np.asarray(ls, float).reshape(1, 1, -1)
-    diff = (XA[:, None, :] - XB[None, :, :]) / ls
-    r2 = np.sum(diff * diff, axis=2)
-    r = np.sqrt(np.maximum(r2, 0.0))
-    sqrt5_r = np.sqrt(5.0) * r
-    k = (eta ** 2) * (1.0 + sqrt5_r + (5.0 / 3.0) * r2) * np.exp(-sqrt5_r)
-    return k
-
-
-def _kernel_diag_m52(XA: np.ndarray, ls: np.ndarray, eta: float) -> np.ndarray:
-    return np.full(XA.shape[0], eta ** 2, dtype=float)
-
-
-def _add_jitter(K: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    jitter = eps * float(np.mean(np.diag(K)) + 1.0)
-    return K + jitter * np.eye(K.shape[0], dtype=K.dtype)
-
-
-def _solve_chol(L: np.ndarray, b: np.ndarray) -> np.ndarray:
-    y = np.linalg.solve(L, b)
-    return np.linalg.solve(L.T, y)
-
-
-def _solve_lower(L: np.ndarray, B: np.ndarray) -> np.ndarray:
-    return np.linalg.solve(L, B)
-
-
-def _feature_raw_from_artifact_or_reconstruct(
-    ds: xr.Dataset,
-    j: int,
-    name: str,
-    transform: str,
-) -> np.ndarray:
-    """
-    Return the feature values in ORIGINAL units for each training row.
-    Prefer a stored raw column (ds[name]) if present; otherwise reconstruct
-    from Xn_train using feature_mean/std and the recorded transform.
-    """
-    # 1) Use stored raw per-row column if present
-    if name in ds.data_vars:
-        da = ds[name]
-        if "row" in da.dims and da.sizes.get("row", None) == ds.sizes.get("row", None):
-            vals = np.asarray(da.values, dtype=float)
-            return vals
-
-    # 2) Reconstruct from standardized training matrix
-    Xn = ds["Xn_train"].values.astype(float)            # (N, p)
-    mu = ds["feature_mean"].values.astype(float)[j]
-    sd = ds["feature_std"].values.astype(float)[j]
-    x_internal = Xn[:, j] * sd + mu                    # internal model space
-    if transform == "log10":
-        raw = 10.0 ** x_internal
-    else:
-        raw = x_internal
-    return raw
 
 
 def _set_yaxis_range(fig, *, row: int, col: int, y0: float, y1: float, log: bool, eps: float = 1e-12):

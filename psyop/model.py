@@ -253,6 +253,66 @@ def run_model(
     ds.to_netcdf(output_path, encoding=encoding)
 
 
+def kernel_diag_m52(XA: np.ndarray, ls: np.ndarray, eta: float) -> np.ndarray:
+    return np.full(XA.shape[0], eta ** 2, dtype=float)
+
+
+def kernel_m52_ard(XA: np.ndarray, XB: np.ndarray, ls: np.ndarray, eta: float) -> np.ndarray:
+    XA = np.asarray(XA, float)
+    XB = np.asarray(XB, float)
+    ls = np.asarray(ls, float).reshape(1, 1, -1)
+    diff = (XA[:, None, :] - XB[None, :, :]) / ls
+    r2 = np.sum(diff * diff, axis=2)
+    r = np.sqrt(np.maximum(r2, 0.0))
+    sqrt5_r = np.sqrt(5.0) * r
+    k = (eta ** 2) * (1.0 + sqrt5_r + (5.0 / 3.0) * r2) * np.exp(-sqrt5_r)
+    return k
+
+
+def add_jitter(K: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    jitter = eps * float(np.mean(np.diag(K)) + 1.0)
+    return K + jitter * np.eye(K.shape[0], dtype=K.dtype)
+
+
+def solve_chol(L: np.ndarray, b: np.ndarray) -> np.ndarray:
+    y = np.linalg.solve(L, b)
+    return np.linalg.solve(L.T, y)
+
+
+def solve_lower(L: np.ndarray, B: np.ndarray) -> np.ndarray:
+    return np.linalg.solve(L, B)
+
+
+def feature_raw_from_artifact_or_reconstruct(
+    ds: xr.Dataset,
+    j: int,
+    name: str,
+    transform: str,
+) -> np.ndarray:
+    """
+    Return the feature values in ORIGINAL units for each training row.
+    Prefer a stored raw column (ds[name]) if present; otherwise reconstruct
+    from Xn_train using feature_mean/std and the recorded transform.
+    """
+    # 1) Use stored raw per-row column if present
+    if name in ds.data_vars:
+        da = ds[name]
+        if "row" in da.dims and da.sizes.get("row", None) == ds.sizes.get("row", None):
+            vals = np.asarray(da.values, dtype=float)
+            return vals
+
+    # 2) Reconstruct from standardized training matrix
+    Xn = ds["Xn_train"].values.astype(float)            # (N, p)
+    mu = ds["feature_mean"].values.astype(float)[j]
+    sd = ds["feature_std"].values.astype(float)[j]
+    x_internal = Xn[:, j] * sd + mu                    # internal model space
+    if transform == "log10":
+        raw = 10.0 ** x_internal
+    else:
+        raw = x_internal
+    return raw
+
+
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
