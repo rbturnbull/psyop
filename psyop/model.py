@@ -32,34 +32,26 @@ def run_model(
 ) -> None:
     """
     Fit two-head GP (success prob + conditional loss) and save a single NetCDF artifact.
-
-    The artifact contains:
-      - raw columns (for plotting),
-      - feature list + transforms + standardization stats,
-      - training design matrices (standardized) and targets for both heads,
-      - MAP hyperparameters for both heads,
-      - convenience training predictions,
-      - metadata (direction, schema, seed, etc.).
     """
     # -----------------------
     # Load CSV & basic checks
     # -----------------------
-    if not Path(input_path).exists():
-        raise FileNotFoundError(f"Input CSV not found: {Path(input_path).resolve()}")
+    input_path = Path(input_path)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input CSV not found: {input_path.resolve()}")
 
     df: pd.DataFrame = pd.read_csv(input_path)
     if target_column not in df.columns:
         raise ValueError(f"Target column '{target_column}' not found in CSV.")
 
-    # Normalize dtypes: keep a copy of raw for artifact
+    # Keep a raw copy for artifact (strings as pandas 'string' so NetCDF can handle them)
     df_raw = df.copy()
-    # Convert object to string to be NetCDF-safe
     for c in df_raw.columns:
         if df_raw[c].dtype == object:
             df_raw[c] = df_raw[c].astype("string")
 
     # -----------------------
-    # Success inference/usage
+    # Success inference/usage (NO __success__ column written)
     # -----------------------
     if success_column is not None:
         if success_column not in df.columns:
@@ -69,7 +61,6 @@ def run_model(
         # Infer success as ~isna(target)
         success = (~df[target_column].isna()).to_numpy().astype(int)
 
-    df["__success__"] = success
     has_success = bool(np.any(success == 1))
     if not has_success:
         raise RuntimeError("No successful rows detected (cannot fit conditional-loss GP).")
@@ -77,11 +68,13 @@ def run_model(
     # -----------------------
     # Feature selection (generic)
     # -----------------------
-    excluded = set(exclude_columns) | {target_column}
+    # Exclude user-specified + target + success column + INTERNALS like "__success__"
+    reserved_internals = {"__success__", "__fail__", "__status__"}
+    excluded = set(exclude_columns) | {target_column} | reserved_internals
     if success_column:
         excluded.add(success_column)
 
-    # Use numeric columns as candidates for features (float/int/boolean)
+    # Candidate features: numeric columns not excluded
     numeric_cols = [
         c for c in df.columns
         if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
@@ -141,7 +134,6 @@ def run_model(
         _ = gp_s.marginal_likelihood("y_obs_s", X=Xn, y=y_success, noise=sigma_s)
         map_s = pm.find_MAP()
 
-    # Training preds for success (mean only used downstream)
     with model_s:
         mu_s, var_s = gp_s.predict(Xn, point=map_s, diag=True, pred_noise=True)
     mu_s = np.clip(mu_s, 0.0, 1.0)
@@ -171,14 +163,13 @@ def run_model(
     sd_l = np.sqrt(var_l)
 
     # -----------------------
-    # Build xarray Dataset artifact
+    # Build xarray Dataset artifact (NO __success__ variable)
     # -----------------------
-    # Coords
     feature_coord = xr.DataArray(feature_names, dims=("feature",), name="feature")
     row_coord = xr.DataArray(np.arange(n, dtype=np.int64), dims=("row",), name="row")
     row_ok_coord = xr.DataArray(np.where(ok_mask)[0].astype(np.int64), dims=("row_success",), name="row_success")
 
-    # Raw columns (strings and numerics)
+    # Raw columns (strings and numerics) — from df_raw (no __success__ ever added)
     raw_vars = {}
     for col in df_raw.columns:
         vals = df_raw[col].to_numpy()
@@ -234,18 +225,18 @@ def run_model(
             "row_success": row_ok_coord,
         },
         attrs={
-            "artifact_version": "0.1.0",
+            "artifact_version": "0.1.1",  # bumped after removing __success__
             "target_column": target_column,
             "direction": direction,
             "success_column": success_column if success_column is not None else "__inferred__",
             "random_seed": int(random_seed),
             "n_rows": int(n),
             "n_features": int(p),
-            "input_csv": str(Path(input_path)),
+            "input_csv": str(input_path),
         },
     )
 
-    # Attach raw columns under top-level dataset
+    # Attach raw columns
     for k, v in raw_vars.items():
         ds[k] = v
 
@@ -254,11 +245,10 @@ def run_model(
     if compress:
         encoding = {}
         for name, da in ds.data_vars.items():
-            # zlib only for numeric arrays
             if np.issubdtype(da.dtype, np.number):
                 encoding[name] = {"zlib": True, "complevel": 4}
 
-    # Write artifact
+    # Save
     output_path = Path(output_path)
     ds.to_netcdf(output_path, encoding=encoding)
 
@@ -272,7 +262,6 @@ def _to_bool01(arr: np.ndarray) -> np.ndarray:
         return arr.astype(np.int32)
     if np.issubdtype(arr.dtype, np.number):
         return (arr != 0).astype(np.int32)
-    # strings/objects
     truthy = {"1", "true", "yes", "y", "ok", "success"}
     return np.array([1 if (str(x).strip().lower() in truthy) else 0 for x in arr], dtype=np.int32)
 
@@ -282,7 +271,7 @@ def _choose_transform(name: str, col: np.ndarray) -> str:
     Choose a simple per-feature transform: 'identity' or 'log10'.
     Heuristics:
       - if column name looks like a learning rate (lr/learning_rate) AND >0 => log10
-      - else if strictly positive and has large dynamic range (p99/p1 >= 1e3) => log10
+      - else if strictly positive and p99/p1 >= 1e3 => log10
       - else identity
     """
     name_l = name.lower()
@@ -304,7 +293,6 @@ def _large_dynamic_range(col: np.ndarray) -> bool:
 
 def _apply_transform(tr: str, col: np.ndarray) -> np.ndarray:
     if tr == "log10":
-        # Guard against non-positive just in case
         x = np.asarray(col, dtype=float)
         x = np.where(x <= 0, np.nan, x)
         return np.log10(x)
@@ -314,6 +302,5 @@ def _apply_transform(tr: str, col: np.ndarray) -> np.ndarray:
 def _np1d(x: np.ndarray, p: int) -> np.ndarray:
     a = np.asarray(x, dtype=float).ravel()
     if a.size != p:
-        # broadcast scalar to length p (shouldn't happen for ell)
         a = np.full((p,), float(a.item()) if a.size == 1 else np.nan, dtype=float)
     return a

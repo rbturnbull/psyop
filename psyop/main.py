@@ -1,19 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Ψ-op CLI
 
-Commands:
-  - model                Fit the model on a CSV and save a single model artifact
-  - suggest              Propose candidates via BO (reads model artifact)
-  - optimal              Rank by probability of being best feasible (reads model artifact)
-  - pairplot             2D PD heatmaps with contours & data points (reads model artifact)
-  - partial-dependence   1D PD panels with shading & experimental points (reads model artifact)
-"""
-
-# ---------------------------------------------------------------------
 # Make BLAS single-threaded to avoid oversubscription / macOS crashes
-# ---------------------------------------------------------------------
 import os
 for _env_var in (
     "MKL_NUM_THREADS",
@@ -38,7 +26,7 @@ from .opt import suggest_candidates, find_optimal
 __version__ = "0.1.0"
 
 console = Console()
-app = typer.Typer(no_args_is_help=True, add_completion=True, rich_markup_mode="rich")
+app = typer.Typer(no_args_is_help=True, add_completion=False, rich_markup_mode="rich")
 
 
 class Direction(str, Enum):
@@ -47,9 +35,6 @@ class Direction(str, Enum):
     AUTO = "auto"
 
 
-# ---------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------
 def _ensure_parent_dir(path: Path) -> None:
     if path.suffix and path.parent:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,17 +53,12 @@ def _default_out_for(model_path: Path, stem_suffix: str, ext: str) -> Path:
     return base.with_name(base.name + stem_suffix).with_suffix(ext)
 
 
-# ---------------------------------------------------------------------
-# Global options
-# ---------------------------------------------------------------------
 @app.callback()
 def main(
-    version: bool = typer.Option(
-        False, "--version", "-v", help="Show version and exit.", is_eager=True
-    )
+    version: bool = typer.Option(False, "--version", "-v", help="Show version and exit.", is_eager=True),
 ):
     if version:
-        console.print(f"[bold]Ψ-op[/] {__version__}")
+        console.print(f"[bold]psyop[/] {__version__}")
         raise typer.Exit()
 
 
@@ -279,8 +259,5 @@ def plot1d(
     console.print(f"[green]Wrote PD CSV  →[/] {csv_out}")
 
 
-# ---------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------
 if __name__ == "__main__":
     app()
