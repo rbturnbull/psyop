@@ -62,9 +62,6 @@ def main(
         raise typer.Exit()
 
 
-# ---------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------
 @app.command(help="Fit the model on a CSV and save a single model artifact.")
 def model(
     input: Path = typer.Argument(..., help="Input CSV file."),
@@ -218,7 +215,7 @@ def plot2d(
     console.print(f"[green]Wrote pairplot →[/] {output}")
 
 
-@app.command(name="partial-dependence", help="Create 1D PD panels with shading & experimental points.")
+@app.command(help="Create 1D PD panels with shading & experimental points.")
 def plot1d(
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
     output: Optional[Path] = typer.Option(None, "-o", help="Output HTML (defaults relative to model)."),

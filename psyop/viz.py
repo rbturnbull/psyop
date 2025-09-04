@@ -475,8 +475,9 @@ def make_partial_dependence1D(
 
         # Y-range pad; include observed successes
         y_arrays = [lo_plot, hi_plot] + ([losses_s_plot] if losses_s_plot.size else [])
-        y_low = float(np.min([arr.min() for arr in y_arrays]))
-        y_high = float(np.max([arr.max() for arr in y_arrays]))
+        y_low  = float(np.nanmin([np.nanmin(arr) for arr in y_arrays]))
+        y_high = float(np.nanmax([np.nanmax(arr) for arr in y_arrays]))
+
         pad = 0.05 * (y_high - y_low + 1e-12)
         y0_plot = (y_low - pad) if not use_log_scale_for_target_y else max(y_low / 1.5, log_y_epsilon)
         y1_tmp = (y_high + pad) if not use_log_scale_for_target_y else y_high * 1.2
@@ -550,12 +551,12 @@ def make_partial_dependence1D(
 
         # Axes
         _maybe_log_axis(fig, j + 1, 1, feature_names[j], axis="x", transforms=transforms, j=j)
-        fig.update_yaxes(
-            title_text=f"{tgt_col} (E[target|success])",
-            type="log" if use_log_scale_for_target_y else "-",
-            row=j + 1, col=1
+        fig.update_yaxes(title_text=f"{tgt_col} (E[target|success])", row=j + 1, col=1)
+        _set_yaxis_range(
+            fig, row=j + 1, col=1,
+            y0=y0_plot, y1=y1_plot,
+            log=use_log_scale_for_target_y, eps=log_y_epsilon
         )
-        fig.update_yaxes(range=[y0_plot, y1_plot], row=j + 1, col=1)
         fig.update_xaxes(title_text=feature_names[j], row=j + 1, col=1)
 
         # tidy lines
@@ -798,3 +799,13 @@ def _feature_raw_from_artifact_or_reconstruct(
     else:
         raw = x_internal
     return raw
+
+
+def _set_yaxis_range(fig, *, row: int, col: int, y0: float, y1: float, log: bool, eps: float = 1e-12):
+    """Update a subplot's Y axis to [y0, y1]. For log axes, the range is given in log10 units."""
+    if log:
+        y0 = max(y0, eps)
+        y1 = max(y1, y0 * (1.0 + 1e-6))
+        fig.update_yaxes(type="log", range=[np.log10(y0), np.log10(y1)], row=row, col=col)
+    else:
+        fig.update_yaxes(type="-", range=[y0, y1], row=row, col=col)
