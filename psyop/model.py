@@ -22,13 +22,13 @@ import xarray as xr
 
 def run_model(
     input_path: Path,
-    output_path: Path,               # must be .nc (handled in CLI)
+    output_path: Path,
     target_column: str,
-    exclude_columns: list[str],
-    direction: str,                  # "min" | "max" | "auto"
-    success_column: str | None,
-    random_seed: int,
-    compress: bool,
+    exclude_columns: list[str] | None = None,
+    direction: str = "auto",
+    success_column: str | None = None,
+    random_seed: int = 42,
+    compress: bool = True,
 ) -> None:
     """
     Fit two-head GP (success prob + conditional loss) and save a single NetCDF artifact.
