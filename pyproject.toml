@@ -1,0 +1,52 @@
+[tool.poetry]
+name = "Psyop"
+version = "0.1.0"
+description = "Parameter Space Yield Optimizer"
+authors = ["Robert Turnbull <robert.turnbull@unimelb.edu.au>"]
+license = "Apache-2.0"
+readme = "README.rst"
+repository = "https://github.com/rbturnbull/psyop/"
+documentation = "https://rbturnbull.github.io/psyop"
+homepage = "https://github.com/rbturnbull/psyop/"
+keywords = ["torchapp", "pytorch", "deep learning", "command-line interface"]
+# For classifiers see https://pypi.org/classifiers/
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Intended Audience :: Science/Research",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+torchapp = ">=0.4.13"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=6.2.5"
+ipython = ">=8.1.1"
+ipykernel = ">=6.6.1"
+coverage = ">=5.5"
+autopep8 = ">=1.5.7"
+Sphinx = ">=5.0.0"
+nbsphinx = ">=0.8.7"
+sphinx-rtd-theme = ">=1.0.0"
+sphinx-autobuild = ">=2021.3.14"
+myst-parser = ">=0.15.2"
+pre-commit = ">=2.15.0"
+sphinx-copybutton = ">=0.4.0"
+black = ">=21.10b0"
+sphinx-click = {git = "https://github.com/rbturnbull/sphinx-click.git"}
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+testpaths = [
+    "tests",
+]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+psyop = "psyop.apps:Psyop.main"
+psyop-tools = "psyop.apps:Psyop.tools"
