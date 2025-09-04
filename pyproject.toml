@@ -8,7 +8,7 @@ readme = "README.rst"
 repository = "https://github.com/rbturnbull/psyop/"
 documentation = "https://rbturnbull.github.io/psyop"
 homepage = "https://github.com/rbturnbull/psyop/"
-keywords = ["torchapp", "pytorch", "deep learning", "command-line interface"]
+keywords = ["command-line interface"]
 # For classifiers see https://pypi.org/classifiers/
 classifiers = [
     "License :: OSI Approved :: Apache Software License",

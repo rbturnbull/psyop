@@ -1,9 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# ---------------------------------------------------------------------
 # Make BLAS single-threaded to avoid oversubscription / macOS crashes
-# ---------------------------------------------------------------------
 import os
 for _env_var in (
     "MKL_NUM_THREADS",
@@ -14,12 +12,7 @@ for _env_var in (
 ):
     os.environ.setdefault(_env_var, "1")
 
-# ---------------------------------------------------------------------
-# Imports
-# ---------------------------------------------------------------------
-
 from pathlib import Path
-from typing import Iterable, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,9 +20,6 @@ import pymc as pm
 import xarray as xr
 
 
-# ---------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------
 def run_model(
     input_path: Path,
     output_path: Path,               # must be .nc (handled in CLI)

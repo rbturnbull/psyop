@@ -24,12 +24,9 @@ for _env_var in (
 ):
     os.environ.setdefault(_env_var, "1")
 
-# ---------------------------------------------------------------------
-# Imports
-# ---------------------------------------------------------------------
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import typer
 from rich.console import Console
@@ -93,7 +90,7 @@ def model(
     input: Path = typer.Argument(..., help="Input CSV file."),
     output: Path = typer.Argument(..., help="Path to save model artifact (.nc)."),
     target: str = typer.Option("loss", "--target", "-t", help="Target column name."),
-    exclude: List[str] = typer.Option([], "--exclude", help="Feature columns to exclude."),
+    exclude: list[str] = typer.Option([], "--exclude", help="Feature columns to exclude."),
     direction: Direction = typer.Option(
         Direction.AUTO, "--direction", "-d",
         help="Optimization direction for the target."
@@ -207,11 +204,9 @@ def optimal(
 
 
 @app.command(help="Create a 2D pairplot PD heatmap with contours & data points.")
-def pairplot(
+def plot2d(
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
-    output: Optional[Path] = typer.Option(
-        None, "--output", "-o", help="Output HTML (defaults relative to model)."
-    ),
+    output: Optional[Path] = typer.Option(None, "-o", help="Output HTML (defaults relative to model)."),
     n_points_1d: int = typer.Option(300, help="Points along 1D sweeps (diagonal)."),
     n_points_2d: int = typer.Option(70, help="Grid size per axis for 2D panels."),
     use_log_scale_for_target: bool = typer.Option(False, "--log-target", help="Log10 colours for target."),
@@ -244,14 +239,10 @@ def pairplot(
 
 
 @app.command(name="partial-dependence", help="Create 1D PD panels with shading & experimental points.")
-def partial_dependence(
+def plot1d(
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
-    output: Optional[Path] = typer.Option(
-        None, "--output", "-o", help="Output HTML (defaults relative to model)."
-    ),
-    csv_out: Optional[Path] = typer.Option(
-        None, "--csv-out", help="Optional CSV export of tidy PD data."
-    ),
+    output: Optional[Path] = typer.Option(None, "-o", help="Output HTML (defaults relative to model)."),
+    csv_out: Optional[Path] = typer.Option(None, help="Optional CSV export of tidy PD data."),
     n_points_1d: int = typer.Option(300, help="Points along 1D sweep."),
     line_color: str = typer.Option("rgb(31,119,180)", help="Line/band color (consistent across variables)."),
     band_alpha: float = typer.Option(0.25, help="Fill alpha for ±2σ."),

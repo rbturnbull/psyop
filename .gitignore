@@ -1,3 +1,4 @@
+output/
 docs/_build/
 wandb/*
 wandb*/*
