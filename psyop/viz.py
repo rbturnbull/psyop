@@ -1,9 +1,6 @@
-# viz.py
 # -*- coding: utf-8 -*-
-from __future__ import annotations
-
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -12,11 +9,61 @@ import xarray as xr
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from plotly.colors import get_colorscale, sample_colorscale
+from plotly.colors import get_colorscale, sample_colorscale  # make sure you have these imports
 
+def _edges_from_centers(vals: np.ndarray, is_log: bool) -> tuple[float, float]:
+    """Return (min_edge, max_edge) that tightly bound a heatmap with given center coords."""
+    v = np.asarray(vals, float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return (0.0, 1.0)
+    if v.size == 1:
+        # tiny pad
+        if is_log:
+            lo = max(v[0] / 1.5, 1e-12)
+            hi = v[0] * 1.5
+        else:
+            span = max(abs(v[0]) * 0.5, 1e-9)
+            lo, hi = v[0] - span, v[0] + span
+        return float(lo), float(hi)
 
-# =============================================================================
-# Public API
-# =============================================================================
+    if is_log:
+        lv = np.log10(v)
+        l0 = lv[0] - 0.5 * (lv[1] - lv[0])
+        lN = lv[-1] + 0.5 * (lv[-1] - lv[-2])
+        lo = 10.0 ** l0
+        hi = 10.0 ** lN
+        lo = max(lo, 1e-12)
+        hi = max(hi, lo * 1.0000001)
+        return float(lo), float(hi)
+    else:
+        d0 = v[1] - v[0]
+        dN = v[-1] - v[-2]
+        lo = v[0] - 0.5 * d0
+        hi = v[-1] + 0.5 * dN
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = float(v.min()), float(v.max())
+        return float(lo), float(hi)
+
+def _update_axis_type_and_range(
+    fig, *, row: int, col: int, axis: str, centers: np.ndarray, is_log: bool
+):
+    """Set axis type and range to heatmap edges so tiles meet the axes exactly."""
+    lo, hi = _edges_from_centers(centers, is_log)
+    if axis == "x":
+        if is_log:
+            fig.update_xaxes(type="log", range=[np.log10(lo), np.log10(hi)], row=row, col=col)
+        else:
+            fig.update_xaxes(range=[lo, hi], row=row, col=col)
+    else:
+        if is_log:
+            fig.update_yaxes(type="log", range=[np.log10(lo), np.log10(hi)], row=row, col=col)
+        else:
+            fig.update_yaxes(range=[lo, hi], row=row, col=col)
+
+def _is_log_feature(j: int, transforms: list[str]) -> bool:
+    return str(transforms[j]).lower() == "log10"
+
 
 def make_pairplot(
     model: Path,
@@ -28,7 +75,7 @@ def make_pairplot(
     colourscale: str = "RdBu",
     show: bool = False,
     n_contours: int = 12,
-    fixed: Optional[Dict[str, float]] = None,  # <-- condition on variables in ORIGINAL units
+    fixed: Optional[dict[str, float]] = None,  # <-- condition on variables in ORIGINAL units
 ) -> None:
     """
     Pairplot of E[target | success] under the two-head GP:
@@ -92,7 +139,7 @@ def make_pairplot(
         diag_payload[j] = {"x": x_display, "Zmu": Z_mu_diag, "Zp": Z_p_diag}
 
     # ---------- off-diagonals (true 2D) ----------
-    off_payload: dict[Tuple[int, int], dict] = {}
+    off_payload: dict[tuple[int, int], dict] = {}
     for i in range(num_features):
         for j in range(num_features):
             if i == j:
@@ -116,7 +163,7 @@ def make_pairplot(
             off_payload[(i, j)] = {"x": x_orig, "y": y_orig, "Zmu": Zmu, "Zp": Zp}
 
     # ---------- colour transform globals ----------
-    def color_transform(z_raw: np.ndarray) -> Tuple[np.ndarray, float]:
+    def color_transform(z_raw: np.ndarray) -> tuple[np.ndarray, float]:
         """Return transformed Z and global shift used."""
         if not use_log_scale_for_target:
             return z_raw, 0.0
@@ -240,8 +287,10 @@ def make_pairplot(
             customdata=df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
         ), row=row, col=col)
 
-        _maybe_log_axis(fig, row, col, feature_names[j], axis="x")
-        _maybe_log_axis(fig, row, col, feature_names[i], axis="y", transforms=transforms, j=i)
+        is_log_x = _is_log_feature(j, transforms)
+        is_log_y = _is_log_feature(i, transforms)
+        _update_axis_type_and_range(fig, row=row, col=col, axis="x", centers=x_vals, is_log=is_log_x)
+        _update_axis_type_and_range(fig, row=row, col=col, axis="y", centers=y_vals, is_log=is_log_y)
 
     # Diagonals
     for j, PAY in diag_payload.items():
@@ -309,8 +358,9 @@ def make_pairplot(
             customdata=df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
         ), row=row, col=col)
 
-        _maybe_log_axis(fig, row, col, feature_names[j], axis="x")
-        _maybe_log_axis(fig, row, col, feature_names[j], axis="y")
+        is_log = _is_log_feature(j, transforms)
+        _update_axis_type_and_range(fig, row=row, col=col, axis="x", centers=axis, is_log=is_log)
+        _update_axis_type_and_range(fig, row=row, col=col, axis="y", centers=axis, is_log=is_log)
 
     # Axis titles
     for j in range(num_features):
@@ -349,7 +399,7 @@ def make_partial_dependence1D(
     show_figure: bool = False,
     use_log_scale_for_target_y: bool = True,   # log-y for target
     log_y_epsilon: float = 1e-9,
-    fixed: Optional[Dict[str, float]] = None,  # <-- condition on variables in ORIGINAL units
+    fixed: Optional[dict[str, float]] = None,  # <-- condition on variables in ORIGINAL units
 ) -> None:
     """
     Vertical 1D PD panels of E[target|success] vs each feature:
@@ -398,7 +448,7 @@ def make_partial_dependence1D(
         subplot_titles=[f"E[target|success] — {name}" for name in feature_names]
     )
 
-    tidy_rows: List[dict] = []
+    tidy_rows: list[dict] = []
 
     for j in range(num_features):
         grid = sweeps_std[j]
@@ -602,9 +652,9 @@ def _raw_dataframe_from_dataset(ds: xr.Dataset) -> pd.DataFrame:
 
 def _apply_fixed_to_base(
     base_std: np.ndarray,
-    fixed: Dict[str, float],
-    feature_names: List[str],
-    transforms: List[str],
+    fixed: dict[str, float],
+    feature_names: list[str],
+    transforms: list[str],
     X_mean: np.ndarray,
     X_std: np.ndarray,
 ) -> np.ndarray:
@@ -638,7 +688,7 @@ def _inverse_transform(tr: str, x: np.ndarray) -> np.ndarray:
     return x
 
 
-def _maybe_log_axis(fig: go.Figure, row: int, col: int, name: str, axis: str = "x", transforms: List[str] | None = None, j: int | None = None):
+def _maybe_log_axis(fig: go.Figure, row: int, col: int, name: str, axis: str = "x", transforms: list[str] | None = None, j: int | None = None):
     """Use log axis for features that were log10-transformed."""
     use_log = False
     if transforms is not None and j is not None:
@@ -652,7 +702,7 @@ def _maybe_log_axis(fig: go.Figure, row: int, col: int, name: str, axis: str = "
             fig.update_yaxes(type="log", row=row, col=col)
 
 
-def _rgb_string_to_tuple(s: str) -> Tuple[int, int, int]:
+def _rgb_string_to_tuple(s: str) -> tuple[int, int, int]:
     vals = s[s.find("(") + 1 : s.find(")")].split(",")
     r, g, b = [int(float(v)) for v in vals[:3]]
     return r, g, b
