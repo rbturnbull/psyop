@@ -6,6 +6,11 @@
 Welcome to Psyop's documentation!
 ===========================================================
 
+.. image:: ../docs/static/img/psyop-banner.jpg
+   :alt: Psyop banner
+   :align: center
+
+
 .. include:: ../README.rst
    :start-after: start-badges
    :end-before: end-badges
