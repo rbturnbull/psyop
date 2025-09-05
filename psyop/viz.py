@@ -399,7 +399,7 @@ def make_pairplot(
 def make_partial_dependence1D(
     model: Path,
     output: Path,
-    csv_out: Path,
+    csv_out: Path = None,
     n_points_1d: int = 300,
     line_color: str = "rgb(31,119,180)",
     band_alpha: float = 0.25,
@@ -586,7 +586,9 @@ def make_partial_dependence1D(
     )
 
     fig.write_html(str(output), include_plotlyjs="cdn")
-    pd.DataFrame(tidy_rows).to_csv(str(csv_out), index=False)
+    if csv_out:
+        pd.DataFrame(tidy_rows).to_csv(str(csv_out), index=False)
+    
     if show_figure:
         fig.show("browser")
 
