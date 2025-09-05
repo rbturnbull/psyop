@@ -12,10 +12,11 @@ for _env_var in (
 ):
     os.environ.setdefault(_env_var, "1")
 
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Optional
-
+import xarray as xr
 import typer
 from rich.console import Console
 
@@ -33,6 +34,85 @@ class Direction(str, Enum):
     MINIMIZE = "min"
     MAXIMIZE = "max"
     AUTO = "auto"
+
+
+def _coerce_scalar(s: str):
+    """Best-effort scalar coercion: bool -> int -> float -> str."""
+    sl = s.strip().lower()
+    if sl in {"true", "t", "yes", "y", "on"}:
+        return True
+    if sl in {"false", "f", "no", "n", "off"}:
+        return False
+    try:
+        if re.fullmatch(r"[+-]?\d+", sl):
+            return int(sl)
+        return float(sl)
+    except Exception:
+        return s
+
+def _parse_unknown_cli_kv(args: list[str]) -> dict[str, object]:
+    """
+    Parse ['--epochs','20','--dropout=0.1','--learning-rate','0.001'] → dict.
+    Unknown positionals are ignored. Repeated keys overwrite (last wins).
+    """
+    fixed: dict[str, object] = {}
+    it = iter(args)
+    for tok in it:
+        if not tok.startswith("--"):
+            continue
+        key = tok[2:]
+        if "=" in key:
+            key, val = key.split("=", 1)
+        else:
+            # next token may be the value; if it's another option, treat as True
+            try:
+                nxt = next(it)
+            except StopIteration:
+                nxt = "true"
+            if nxt.startswith("--"):
+                # push back one step by re-inserting into iterator — simplest is to treat as True
+                val = "true"
+            else:
+                val = nxt
+        key = key.strip().replace("-", "_")
+        fixed[key] = _coerce_scalar(val)
+    return fixed
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def _canonicalize_fixed_keys(
+    model_path: Path, fixed_raw: dict[str, object]
+) -> tuple[dict[str, object], dict[str, str]]:
+    """
+    Map user keys (any style) to dataset feature names by normalization.
+    Returns (fixed_mapped, alias_map). Unmatched keys are dropped with a warning.
+    """
+    ds = xr.load_dataset(model_path)
+    features = [str(x) for x in ds["feature"].values.tolist()]
+    index = {_norm(f): f for f in features}
+    # also allow exact feature names as-is (with underscores)
+    feature_set = set(features)
+
+    mapped: dict[str, object] = {}
+    alias: dict[str, str] = {}
+
+    for k, v in fixed_raw.items():
+        # exact match first
+        if k in feature_set:
+            mapped[k] = v
+            alias[k] = k
+            continue
+        # normalized match
+        nk = _norm(k)
+        if nk in index:
+            canonical = index[nk]
+            mapped[canonical] = v
+            alias[k] = canonical
+        else:
+            console.print(f":warning: [yellow]Ignoring unknown feature key[/]: '{k}'")
+    return mapped, alias
 
 
 def _ensure_parent_dir(path: Path) -> None:
@@ -180,17 +260,21 @@ def optimal(
     console.print(f"[green]Wrote top probable minima →[/] {output}")
 
 
-@app.command(help="Create a 2D pairplot PD heatmap with contours & data points.")
+@app.command(
+    help="Create a 2D Partial Dependence of Expected Target (Pairwise Features).",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 def plot2d(
+    ctx: typer.Context,
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
-    output: Optional[Path] = typer.Option(None, "-o", help="Output HTML (defaults relative to model)."),
+    output: Optional[Path] = typer.Option(None, help="Output HTML (defaults relative to model)."),
     n_points_1d: int = typer.Option(300, help="Points along 1D sweeps (diagonal)."),
     n_points_2d: int = typer.Option(70, help="Grid size per axis for 2D panels."),
-    use_log_scale_for_target: bool = typer.Option(False, "--log-target", help="Log10 colours for target."),
-    log_shift_epsilon: float = typer.Option(1e-9, "--log-eps", help="Epsilon shift for log colours."),
-    colourscale: str = typer.Option("RdBu", "--colourscale", help="Plotly colourscale name."),
-    show: bool = typer.Option(False, "--show", help="Open the figure in a browser."),
-    n_contours: int = typer.Option(12, "--n-contours", help="Number of contour levels."),
+    use_log_scale_for_target: bool = typer.Option(False, help="Log10 colours for target."),
+    log_shift_epsilon: float = typer.Option(1e-9, help="Epsilon shift for log colours."),
+    colourscale: str = typer.Option("RdBu", help="Plotly colourscale name."),
+    show: bool = typer.Option(False, help="Open the figure in a browser."),
+    n_contours: int = typer.Option(12, help="Number of contour levels."),
 ):
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
@@ -200,6 +284,9 @@ def plot2d(
     if output is None:
         output = _default_out_for(model, stem_suffix="__pairplot", ext=".html")
     _ensure_parent_dir(output)
+
+    kwargs = _parse_unknown_cli_kv(ctx.args)
+    kwargs, _ = _canonicalize_fixed_keys(_force_netcdf_suffix(model), kwargs)
 
     make_pairplot(
         model=_force_netcdf_suffix(model),
@@ -211,12 +298,17 @@ def plot2d(
         colourscale=colourscale,
         show=show,
         n_contours=n_contours,
+        **kwargs,
     )
     console.print(f"[green]Wrote pairplot →[/] {output}")
 
 
-@app.command(help="Create 1D PD panels with shading & experimental points.")
+@app.command(
+    help="Create 1D PD panels with shading & experimental points.",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 def plot1d(
+    ctx: typer.Context,
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
     output: Optional[Path] = typer.Option(None, "-o", help="Output HTML (defaults relative to model)."),
     csv_out: Optional[Path] = typer.Option(None, help="Optional CSV export of tidy PD data."),
@@ -240,6 +332,9 @@ def plot1d(
     _ensure_parent_dir(output)
     _ensure_parent_dir(csv_out)
 
+    kwargs = _parse_unknown_cli_kv(ctx.args)
+    kwargs, _ = _canonicalize_fixed_keys(_force_netcdf_suffix(model), kwargs)
+
     make_partial_dependence1D(
         model=_force_netcdf_suffix(model),
         output=output,
@@ -251,6 +346,7 @@ def plot1d(
         show_figure=show_figure,
         use_log_scale_for_target_y=use_log_scale_for_target_y,
         log_y_epsilon=log_y_epsilon,
+        **kwargs,
     )
     console.print(f"[green]Wrote PD HTML →[/] {output}")
     console.print(f"[green]Wrote PD CSV  →[/] {csv_out}")

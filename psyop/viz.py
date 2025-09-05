@@ -83,78 +83,92 @@ def make_pairplot(
     colourscale: str = "RdBu",
     show: bool = False,
     n_contours: int = 12,
-    fixed: Optional[dict[str, float]] = None,  # <-- condition on variables in ORIGINAL units
+    **kwargs,
 ) -> None:
     """
-    Pairplot of E[target | success] under the two-head GP:
-      - diagonal: symmetric 2D heatmap from 1D PD (Z = 0.5*(mu(x_i)+mu(x_j)))
-      - off-diagonals: true 2D heatmaps over (x_j, x_i)
-      - shading: grey where P(success)<0.8 (darker) and <0.5 (lighter)
-      - contours: line colour is inverse greyscale of colourscale luminance at same level
-      - experimental points: successes (black), failures (red with black outline)
-
-    `fixed` lets you condition the slice: all other dims are set to their **fixed**
-    values (standardized internally), otherwise to the median in standardized space.
+    2D Partial Dependence of E[target|success] (pairwise features), optionally
+    conditioned on fixed variables passed as kwargs, e.g. --epochs 20.
+    Fixed variables are clamped in the slice and **not plotted** as axes.
     """
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    from plotly.colors import get_colorscale, sample_colorscale
+
     ds = xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
 
-    # Features & transforms
+    # --- features & transforms
     feature_names = [str(n) for n in ds["feature"].values.tolist()]
     transforms = [str(t) for t in ds["feature_transform"].values.tolist()]
     X_mean = ds["feature_mean"].values.astype(float)
     X_std = ds["feature_std"].values.astype(float)
 
-    # Raw dataframe for experimental points (columns are stored directly in ds)
+    # canonicalize kwargs keys to exact feature names
+    # (simple case-sensitive match; you can reuse your CLI canonicalizer if needed)
+    kw_fixed = {k: v for k, v in kwargs.items() if k in feature_names}
+
+    # raw DF for experimental points
     df_raw = _raw_dataframe_from_dataset(ds)
 
-    # Standardized training X for ranges & medians
+    # standardized training X for ranges/medians
     Xn_train = ds["Xn_train"].values.astype(float)
-    num_features = Xn_train.shape[1]
+    p = Xn_train.shape[1]
 
-    # Base point in standardized space (median), conditioned by 'fixed'
+    # --- base point in standardized space; apply fixed slice there
     base_std = np.median(Xn_train, axis=0)
-    if fixed:
-        base_std = _apply_fixed_to_base(base_std, fixed, feature_names, transforms, X_mean, X_std)
+    if kw_fixed:
+        base_std = _apply_fixed_to_base(base_std, kw_fixed, feature_names, transforms, X_mean, X_std)
 
-    # 1D and 2D sweep ranges (in standardized space) from empirical 1–99% quantiles
+    # --- choose which features to PLOT (exclude fixed)
+    free_idx = [j for j, name in enumerate(feature_names) if name not in kw_fixed]
+    if len(free_idx) == 0:
+        # Nothing to plot if everything is fixed
+        raise ValueError("All features are fixed; nothing to plot. Fix fewer variables.")
+
+    # helper to test if a feature is log on axis
+    def _is_log_feature(j: int) -> bool:
+        return (transforms[j] == "log10")
+
+    # 1D / 2D sweep ranges for *all* features (we'll index by free_idx)
     ranges_1d_std = [
         np.linspace(*np.percentile(Xn_train[:, j], [1, 99]), n_points_1d)
-        for j in range(num_features)
+        for j in range(p)
     ]
     ranges_2d_std = [
         np.linspace(*np.percentile(Xn_train[:, j], [1, 99]), n_points_2d)
-        for j in range(num_features)
+        for j in range(p)
     ]
 
-    # ---------- diagonal (1D -> symmetric 2D) ----------
+    # ---------- diagonal payload over FREE features ----------
     diag_payload: dict[int, dict] = {}
-    for j in range(num_features):
+    for pos, j in enumerate(free_idx):
         grid = ranges_1d_std[j]
         Xn_grid = np.repeat(base_std[None, :], len(grid), axis=0)
         Xn_grid[:, j] = grid
 
-        # predictions
         p_1d = pred_success(Xn_grid)
         mu_1d, _ = pred_loss(Xn_grid, include_observation_noise=True)
 
-        # original display axis (inverse transform)
         x_orig = _denormalize_then_inverse_transform(j, grid, transforms, X_mean, X_std)
-        x_display = x_orig  # original units
-        # store symmetric Z for diagonal
-        Z_mu_diag = 0.5 * (mu_1d[:, None] + mu_1d[None, :])
-        Z_p_diag = np.minimum(p_1d[:, None], p_1d[None, :])
-        diag_payload[j] = {"x": x_display, "Zmu": Z_mu_diag, "Zp": Z_p_diag}
+        diag_payload[pos] = {
+            "j": j,              # real feature index
+            "x": x_orig,         # original units
+            "Zmu": 0.5 * (mu_1d[:, None] + mu_1d[None, :]),
+            "Zp":  np.minimum(p_1d[:, None], p_1d[None, :]),
+        }
 
-    # ---------- off-diagonals (true 2D) ----------
+    # ---------- off-diagonal payload over FREE×FREE ----------
     off_payload: dict[tuple[int, int], dict] = {}
-    for i in range(num_features):
-        for j in range(num_features):
+    for r, i in enumerate(free_idx):
+        for c, j in enumerate(free_idx):
             if i == j:
                 continue
             xg = ranges_2d_std[j]
             yg = ranges_2d_std[i]
-            XX, YY = np.meshgrid(xg, yg)  # (Ny, Nx)
+            XX, YY = np.meshgrid(xg, yg)
 
             Xn_grid = np.repeat(base_std[None, :], XX.size, axis=0)
             Xn_grid[:, j] = XX.ravel()
@@ -163,92 +177,84 @@ def make_pairplot(
             mu_flat, _ = pred_loss(Xn_grid, include_observation_noise=True)
             p_flat = pred_success(Xn_grid)
 
-            Zmu = mu_flat.reshape(YY.shape)
-            Zp = p_flat.reshape(YY.shape)
+            off_payload[(r, c)] = {
+                "i": i, "j": j,
+                "x": _denormalize_then_inverse_transform(j, xg, transforms, X_mean, X_std),
+                "y": _denormalize_then_inverse_transform(i, yg, transforms, X_mean, X_std),
+                "Zmu": mu_flat.reshape(YY.shape),
+                "Zp":  p_flat.reshape(YY.shape),
+            }
 
-            x_orig = _denormalize_then_inverse_transform(j, xg, transforms, X_mean, X_std)
-            y_orig = _denormalize_then_inverse_transform(i, yg, transforms, X_mean, X_std)
-            off_payload[(i, j)] = {"x": x_orig, "y": y_orig, "Zmu": Zmu, "Zp": Zp}
-
-    # ---------- colour transform globals ----------
+    # ---------- colour transform (global bounds over plotted cells only) ----------
     def color_transform(z_raw: np.ndarray) -> tuple[np.ndarray, float]:
-        """Return transformed Z and global shift used."""
         if not use_log_scale_for_target:
             return z_raw, 0.0
         zmin = float(np.nanmin(z_raw))
-        shift = 0.0
-        if zmin <= 0:
-            shift = -zmin + float(log_shift_epsilon)
+        shift = 0.0 if zmin > 0 else -zmin + float(log_shift_epsilon)
         return np.log10(np.maximum(z_raw + shift, log_shift_epsilon)), shift
 
-    all_blocks = [d["Zmu"].ravel() for d in diag_payload.values()] + [d["Zmu"].ravel() for d in off_payload.values()]
-    if len(all_blocks) == 0:
-        z_all = np.array([0.0, 1.0])
-    else:
-        z_all = np.concatenate(all_blocks)
+    blocks = [d["Zmu"].ravel() for d in diag_payload.values()] + \
+             [d["Zmu"].ravel() for d in off_payload.values()]
+    z_all = np.concatenate(blocks) if blocks else np.array([0.0, 1.0])
     z_all_t, global_shift = color_transform(z_all)
     cmin_t = float(np.nanmin(z_all_t))
     cmax_t = float(np.nanmax(z_all_t))
 
-    # For contour line greys: invert luminance of colourscale at normalized transformed level
     cs = get_colorscale(colourscale)
 
     def contour_line_color(level_raw: float) -> str:
         zt = np.log10(max(level_raw + global_shift, log_shift_epsilon)) if use_log_scale_for_target else level_raw
         t = 0.5 if cmax_t == cmin_t else (zt - cmin_t) / (cmax_t - cmin_t)
-        t = float(np.clip(t, 0.0, 1.0))
-        rgb = sample_colorscale(cs, [t])[0]  # "rgb(r,g,b)"
-        r, g, b = _rgb_string_to_tuple(rgb)
+        from_colorscale = sample_colorscale(cs, [float(np.clip(t, 0.0, 1.0))])[0]
+        r, g, b = _rgb_string_to_tuple(from_colorscale)
         lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
         inv = 1.0 - lum
         grey = int(round(inv * 255))
         return f"rgba({grey},{grey},{grey},0.9)"
 
     # ---------- figure ----------
+    k = len(free_idx)
     fig = make_subplots(
-        rows=num_features, cols=num_features,
+        rows=k, cols=k,
         shared_xaxes=False, shared_yaxes=False,
         horizontal_spacing=0.03, vertical_spacing=0.03,
     )
 
-    # Experimental points setup
-    success_mask = ~pd.isna(df_raw[ds.attrs["target_column"]]).to_numpy()
+    # success/fail masks for experimental points
+    tgt_col = str(ds.attrs["target_column"])
+    success_mask = ~pd.isna(df_raw[tgt_col]).to_numpy()
     fail_mask = ~success_mask
 
-    def data_vals_for_feature(index: int) -> np.ndarray:
-        name = feature_names[index]
-        # use raw column if available
+    def data_vals_for_feature(j_full: int) -> np.ndarray:
+        name = feature_names[j_full]
         if name in df_raw.columns:
             return df_raw[name].to_numpy().astype(float)
-        # fallback: reconstruct from Xn_train + (mean, std, transform)
-        return feature_raw_from_artifact_or_reconstruct(ds, index, name, transforms[index]).astype(float)
+        return feature_raw_from_artifact_or_reconstruct(ds, j_full, name, transforms[j_full]).astype(float)
 
-    # Off-diagonals
-    for (i, j), PAY in off_payload.items():
-        row, col = i + 1, j + 1
+    # ---- off-diagonals (r,c) over FREE features only
+    for (r, c), PAY in off_payload.items():
+        i, j = PAY["i"], PAY["j"]
         x_vals = PAY["x"]; y_vals = PAY["y"]; Zmu_raw = PAY["Zmu"]; Zp = PAY["Zp"]
         Z_t, _ = color_transform(Zmu_raw)
 
-        # Heatmap
         fig.add_trace(go.Heatmap(
-            x=x_vals, y=y_vals, z=Z_t, coloraxis="coloraxis", zsmooth=False, showscale=False,
+            x=x_vals, y=y_vals, z=Z_t,
+            coloraxis="coloraxis", zsmooth=False, showscale=False,
             hovertemplate=(
                 f"{feature_names[j]}: %{{x:.6g}}<br>{feature_names[i]}: %{{y:.6g}}"
                 "<br>E[target|success]: %{customdata:.3f}<extra></extra>"
             ),
             customdata=Zmu_raw
-        ), row=row, col=col)
+        ), row=r+1, col=c+1)
 
-        # Probability shading
         for thr, alpha in ((0.5, 0.25), (0.8, 0.40)):
             mask = np.where(Zp < thr, 1.0, np.nan)
             fig.add_trace(go.Heatmap(
                 x=x_vals, y=y_vals, z=mask, zmin=0, zmax=1,
                 colorscale=[[0, "rgba(0,0,0,0)"], [1, f"rgba(128,128,128,{alpha})"]],
                 showscale=False, hoverinfo="skip"
-            ), row=row, col=col)
+            ), row=r+1, col=c+1)
 
-        # Contours
         zmin_r, zmax_r = float(np.nanmin(Zmu_raw)), float(np.nanmax(Zmu_raw))
         levels = np.linspace(zmin_r, zmax_r, max(n_contours, 2))
         for lev in levels:
@@ -258,34 +264,31 @@ def make_pairplot(
                 contours=dict(coloring="lines", showlabels=False, start=lev, end=lev, size=1e-9),
                 line=dict(width=1, color=contour_line_color(lev)),
                 showscale=False, hoverinfo="skip"
-            ), row=row, col=col)
+            ), row=r+1, col=c+1)
 
-        # Experimental points
-        xd = data_vals_for_feature(j)
-        yd = data_vals_for_feature(i)
-
+        # experimental points for (i,j)
+        xd = data_vals_for_feature(j); yd = data_vals_for_feature(i)
         fig.add_trace(go.Scattergl(
             x=xd[success_mask], y=yd[success_mask], mode="markers",
             marker=dict(size=4, color="black", line=dict(width=0)),
             name="data (success)", legendgroup="data_succ",
-            showlegend=(row == 1 and col == 1),
+            showlegend=(r == 0 and c == 0),
             hovertemplate=(
                 "trial_id: %{customdata[0]}<br>"
                 f"{feature_names[j]}: %{{x:.6g}}<br>"
                 f"{feature_names[i]}: %{{y:.6g}}<br>"
-                f"{ds.attrs['target_column']}: %{{customdata[1]:.4f}}<extra></extra>"
+                f"{tgt_col}: %{{customdata[1]:.4f}}<extra></extra>"
             ),
             customdata=np.column_stack([
                 df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask],
-                df_raw[ds.attrs["target_column"]].to_numpy()[success_mask],
+                df_raw[tgt_col].to_numpy()[success_mask],
             ])
-        ), row=row, col=col)
-
+        ), row=r+1, col=c+1)
         fig.add_trace(go.Scattergl(
             x=xd[fail_mask], y=yd[fail_mask], mode="markers",
             marker=dict(size=5, color="red", line=dict(color="black", width=0.8)),
             name="data (failed)", legendgroup="data_fail",
-            showlegend=(row == 1 and col == 1),
+            showlegend=(r == 0 and c == 0),
             hovertemplate=(
                 "trial_id: %{customdata}<br>"
                 f"{feature_names[j]}: %{{x:.6g}}<br>"
@@ -293,28 +296,26 @@ def make_pairplot(
                 "status: failed (NaN target)<extra></extra>"
             ),
             customdata=df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
-        ), row=row, col=col)
+        ), row=r+1, col=c+1)
 
-        is_log_x = _is_log_feature(j, transforms)
-        is_log_y = _is_log_feature(i, transforms)
-        _update_axis_type_and_range(fig, row=row, col=col, axis="x", centers=x_vals, is_log=is_log_x)
-        _update_axis_type_and_range(fig, row=row, col=col, axis="y", centers=y_vals, is_log=is_log_y)
+        _update_axis_type_and_range(fig, row=r+1, col=c+1, axis="x", centers=x_vals, is_log=_is_log_feature(j))
+        _update_axis_type_and_range(fig, row=r+1, col=c+1, axis="y", centers=y_vals, is_log=_is_log_feature(i))
 
-    # Diagonals
-    for j, PAY in diag_payload.items():
-        row = col = j + 1
-        axis = PAY["x"]
-        Zmu_raw = PAY["Zmu"]; Zp = PAY["Zp"]
+    # ---- diagonals over FREE features only
+    for pos, PAY in diag_payload.items():
+        j = PAY["j"]
+        axis = PAY["x"]; Zmu_raw = PAY["Zmu"]; Zp = PAY["Zp"]
         Z_t, _ = color_transform(Zmu_raw)
 
         fig.add_trace(go.Heatmap(
-            x=axis, y=axis, z=Z_t, coloraxis="coloraxis", zsmooth=False, showscale=False,
+            x=axis, y=axis, z=Z_t,
+            coloraxis="coloraxis", zsmooth=False, showscale=False,
             hovertemplate=(
                 f"{feature_names[j]}: %{{x:.6g}} / %{{y:.6g}}"
                 "<br>E[target|success]: %{customdata:.3f}<extra></extra>"
             ),
             customdata=Zmu_raw
-        ), row=row, col=col)
+        ), row=pos+1, col=pos+1)
 
         for thr, alpha in ((0.5, 0.25), (0.8, 0.40)):
             mask = np.where(Zp < thr, 1.0, np.nan)
@@ -322,7 +323,7 @@ def make_pairplot(
                 x=axis, y=axis, z=mask, zmin=0, zmax=1,
                 colorscale=[[0, "rgba(0,0,0,0)"], [1, f"rgba(128,128,128,{alpha})"]],
                 showscale=False, hoverinfo="skip"
-            ), row=row, col=col)
+            ), row=pos+1, col=pos+1)
 
         zmin_r, zmax_r = float(np.nanmin(Zmu_raw)), float(np.nanmax(Zmu_raw))
         levels = np.linspace(zmin_r, zmax_r, max(n_contours, 2))
@@ -333,9 +334,9 @@ def make_pairplot(
                 contours=dict(coloring="lines", showlabels=False, start=lev, end=lev, size=1e-9),
                 line=dict(width=1, color=contour_line_color(lev)),
                 showscale=False, hoverinfo="skip"
-            ), row=row, col=col)
+            ), row=pos+1, col=pos+1)
 
-        # Experimental points (x=y)
+        # experimental points (x=y) for this feature
         xd = data_vals_for_feature(j)
         fig.add_trace(go.Scattergl(
             x=xd[success_mask], y=xd[success_mask], mode="markers",
@@ -345,14 +346,13 @@ def make_pairplot(
             hovertemplate=(
                 "trial_id: %{customdata[0]}<br>"
                 f"{feature_names[j]}: %{{x:.6g}}<br>"
-                f"{ds.attrs['target_column']}: %{{customdata[1]:.4f}}<extra></extra>"
+                f"{tgt_col}: %{{customdata[1]:.4f}}<extra></extra>"
             ),
             customdata=np.column_stack([
                 df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask],
-                df_raw[ds.attrs["target_column"]].to_numpy()[success_mask],
+                df_raw[tgt_col].to_numpy()[success_mask],
             ])
-        ), row=row, col=col)
-
+        ), row=pos+1, col=pos+1)
         fig.add_trace(go.Scattergl(
             x=xd[fail_mask], y=xd[fail_mask], mode="markers",
             marker=dict(size=5, color="red", line=dict(color="black", width=0.8)),
@@ -364,19 +364,24 @@ def make_pairplot(
                 "status: failed (NaN target)<extra></extra>"
             ),
             customdata=df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
-        ), row=row, col=col)
+        ), row=pos+1, col=pos+1)
 
-        is_log = _is_log_feature(j, transforms)
-        _update_axis_type_and_range(fig, row=row, col=col, axis="x", centers=axis, is_log=is_log)
-        _update_axis_type_and_range(fig, row=row, col=col, axis="y", centers=axis, is_log=is_log)
+        _update_axis_type_and_range(fig, row=pos+1, col=pos+1, axis="x", centers=axis, is_log=_is_log_feature(j))
+        _update_axis_type_and_range(fig, row=pos+1, col=pos+1, axis="y", centers=axis, is_log=_is_log_feature(j))
 
-    # Axis titles
-    for j in range(num_features):
-        fig.update_xaxes(title_text=feature_names[j], row=num_features, col=j + 1)
-    for i in range(num_features):
-        fig.update_yaxes(title_text=feature_names[i], row=i + 1, col=1)
+    # axis titles (free only)
+    free_names = [feature_names[j] for j in free_idx]
+    for c, name in enumerate(free_names):
+        fig.update_xaxes(title_text=name, row=len(free_idx), col=c+1)
+    for r, name in enumerate(free_names):
+        fig.update_yaxes(title_text=name, row=r+1, col=1)
 
-    # Layout & export
+
+    title = "2D Partial Dependence of Expected Target."
+    for key,value in kw_fixed.items():
+        title += f" {key}={value}"
+
+    # layout
     cell = 250
     colorbar_title = "E[target|success]" + (" (log10)" if use_log_scale_for_target else "")
     if use_log_scale_for_target and global_shift > 0:
@@ -385,9 +390,9 @@ def make_pairplot(
         coloraxis=dict(colorscale=colourscale, cmin=cmin_t, cmax=cmax_t,
                        colorbar=dict(title=colorbar_title)),
         template="simple_white",
-        width=cell * num_features,
-        height=cell * num_features,
-        title="2D Partial Dependence of Expected Target (Pairwise Features)",
+        width=cell * len(free_idx),
+        height=cell * len(free_idx),
+        title=title,
         legend_title_text=""
     )
 
@@ -407,58 +412,74 @@ def make_partial_dependence1D(
     show_figure: bool = False,
     use_log_scale_for_target_y: bool = True,   # log-y for target
     log_y_epsilon: float = 1e-9,
-    fixed: Optional[dict[str, float]] = None,  # <-- condition on variables in ORIGINAL units
+    **kwargs,
 ) -> None:
     """
-    Vertical 1D PD panels of E[target|success] vs each feature:
+    Vertical 1D PD panels of E[target|success] vs each *free* feature:
       - single colour & legend across variables
       - ±2σ band, mean curve
       - shading where P(success)<0.8 (darker) and <0.5 (lighter)
-      - experimental points: successes (black); failures (red w/ black outline, drawn above)
+      - experimental points: successes (black); failures (red w/ black outline)
+    Any feature passed via kwargs (e.g. --epochs 20) is clamped in the slice and not plotted.
     """
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
     ds = xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
 
     feature_names = [str(n) for n in ds["feature"].values.tolist()]
-    transforms = [str(t) for t in ds["feature_transform"].values.tolist()]
+    transforms    = [str(t) for t in ds["feature_transform"].values.tolist()]
     X_mean = ds["feature_mean"].values.astype(float)
-    X_std = ds["feature_std"].values.astype(float)
+    X_std  = ds["feature_std"].values.astype(float)
 
-    df_raw = _raw_dataframe_from_dataset(ds)
+    df_raw   = _raw_dataframe_from_dataset(ds)
     Xn_train = ds["Xn_train"].values.astype(float)
-    num_features = Xn_train.shape[1]
+    p = Xn_train.shape[1]
 
-    # Base standardized point (median), then apply 'fixed'
+    # --- fixed slice from kwargs (only match exact feature names) ---
+    kw_fixed = {k: v for k, v in kwargs.items() if k in feature_names}
+
+    # Base standardized point (median), then apply fixed values
     base_std = np.median(Xn_train, axis=0)
-    if fixed:
-        base_std = _apply_fixed_to_base(base_std, fixed, feature_names, transforms, X_mean, X_std)
+    if kw_fixed:
+        base_std = _apply_fixed_to_base(base_std, kw_fixed, feature_names, transforms, X_mean, X_std)
 
-    # Build standardized sweeps per feature
-    sweeps_std = [
-        np.linspace(*np.percentile(Xn_train[:, j], [1, 99]), n_points_1d)
-        for j in range(num_features)
-    ]
+    # Determine which features to PLOT (exclude fixed ones)
+    free_idx = [j for j, name in enumerate(feature_names) if name not in kw_fixed]
+    if len(free_idx) == 0:
+        raise ValueError("All features are fixed; nothing to plot. Fix fewer variables.")
+
+    # Build standardized sweeps only for FREE features
+    sweeps_std = {
+        j: np.linspace(*np.percentile(Xn_train[:, j], [1, 99]), n_points_1d)
+        for j in free_idx
+    }
 
     # Masks and data for experimental points
     tgt_col = str(ds.attrs["target_column"])
     success_mask = ~pd.isna(df_raw[tgt_col]).to_numpy()
-    fail_mask = ~success_mask
+    fail_mask    = ~success_mask
     losses_success = df_raw.loc[success_mask, tgt_col].to_numpy().astype(float)
     trial_ids_success = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask]
-    trial_ids_fail = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
+    trial_ids_fail    = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
 
     # Helpers for colour fill
     band_fill_rgba = _rgb_to_rgba(line_color, band_alpha)
 
-    # Figure
+    # Figure with rows = number of FREE features
+    free_names = [feature_names[j] for j in free_idx]
     fig = make_subplots(
-        rows=num_features, cols=1, shared_xaxes=False,
-        subplot_titles=[f"E[target|success] — {name}" for name in feature_names]
+        rows=len(free_idx), cols=1, shared_xaxes=False,
+        subplot_titles=[f"E[target|success] — {name}" for name in free_names]
     )
 
     tidy_rows: list[dict] = []
 
-    for j in range(num_features):
+    for row_pos, j in enumerate(free_idx, start=1):
         grid = sweeps_std[j]
         Xn_grid = np.repeat(base_std[None, :], len(grid), axis=0)
         Xn_grid[:, j] = grid
@@ -467,7 +488,7 @@ def make_partial_dependence1D(
         mu_grid, sd_grid = pred_loss(Xn_grid, include_observation_noise=True)
 
         x_internal = grid * X_std[j] + X_mean[j]
-        x_display = _inverse_transform(transforms[j], x_internal)
+        x_display  = _inverse_transform(transforms[j], x_internal)
 
         # Target transforms for plotting
         if use_log_scale_for_target_y:
@@ -488,28 +509,28 @@ def make_partial_dependence1D(
 
         pad = 0.05 * (y_high - y_low + 1e-12)
         y0_plot = (y_low - pad) if not use_log_scale_for_target_y else max(y_low / 1.5, log_y_epsilon)
-        y1_tmp = (y_high + pad) if not use_log_scale_for_target_y else y_high * 1.2
+        y1_tmp  = (y_high + pad) if not use_log_scale_for_target_y else y_high * 1.2
         y_failed_band = y1_tmp + (y_high - y_low + 1e-12) * (0.08 if not use_log_scale_for_target_y else 0.3)
         if use_log_scale_for_target_y and y_failed_band <= log_y_epsilon:
             y_failed_band = max(10.0 * log_y_epsilon, y_high * 2.0)
         y1_plot = y_failed_band + (0.02 if not use_log_scale_for_target_y else 0.05) * (y_high - y_low + 1e-12)
 
         # Shading (below the PD)
-        _add_low_success_shading_1d(fig, j + 1, x_display, p_grid, y0_plot, y1_plot)
+        _add_low_success_shading_1d(fig, row_pos, x_display, p_grid, y0_plot, y1_plot)
 
         # ±2σ band (legend shown only once)
-        show_legend = (j == 0)
+        show_legend = (row_pos == 1)
         fig.add_trace(go.Scatter(
             x=x_display, y=lo_plot, mode="lines",
             line=dict(width=0, color=line_color),
             name="±2σ", legendgroup="band", showlegend=False, hoverinfo="skip"
-        ), row=j + 1, col=1)
+        ), row=row_pos, col=1)
         fig.add_trace(go.Scatter(
             x=x_display, y=hi_plot, mode="lines", fill="tonexty",
             line=dict(width=0, color=line_color), fillcolor=band_fill_rgba,
             name="±2σ", legendgroup="band", showlegend=show_legend,
             hovertemplate="E[target|success]: %{y:.3f}<extra>±2σ</extra>"
-        ), row=j + 1, col=1)
+        ), row=row_pos, col=1)
 
         # Mean curve
         fig.add_trace(go.Scatter(
@@ -517,14 +538,13 @@ def make_partial_dependence1D(
             line=dict(width=2, color=line_color),
             name="E[target|success]", legendgroup="mean", showlegend=show_legend,
             hovertemplate=f"{feature_names[j]}: %{{x:.6g}}<br>E[target|success]: %{{y:.3f}}<extra></extra>"
-        ), row=j + 1, col=1)
+        ), row=row_pos, col=1)
 
-        # Experimental successes
-        name_j = feature_names[j]
-        if name_j in df_raw.columns:
-            x_data_all = df_raw[name_j].to_numpy().astype(float)
+        # Experimental successes/failures for this feature (x vs observed target)
+        if feature_names[j] in df_raw.columns:
+            x_data_all = df_raw[feature_names[j]].to_numpy().astype(float)
         else:
-            x_data_all = feature_raw_from_artifact_or_reconstruct(ds, j, name_j, transforms[j]).astype(float)
+            x_data_all = feature_raw_from_artifact_or_reconstruct(ds, j, feature_names[j], transforms[j]).astype(float)
 
         x_succ = x_data_all[success_mask]
         if x_succ.size:
@@ -539,9 +559,8 @@ def make_partial_dependence1D(
                     f"{tgt_col}: %{{y:.4f}}<extra></extra>"
                 ),
                 customdata=trial_ids_success
-            ), row=j + 1, col=1)
+            ), row=row_pos, col=1)
 
-        # Experimental failures (hover shows failure status)
         x_fail = x_data_all[fail_mask]
         if x_fail.size:
             y_fail_plot = np.full_like(x_fail, y_failed_band, dtype=float)
@@ -555,19 +574,17 @@ def make_partial_dependence1D(
                     "status: failed (NaN target)<extra></extra>"
                 ),
                 customdata=trial_ids_fail
-            ), row=j + 1, col=1)
+            ), row=row_pos, col=1)
 
         # Axes
-        _maybe_log_axis(fig, j + 1, 1, feature_names[j], axis="x", transforms=transforms, j=j)
-        fig.update_yaxes(title_text=f"{tgt_col} (E[target|success])", row=j + 1, col=1)
-        _set_yaxis_range(
-            fig, row=j + 1, col=1,
-            y0=y0_plot, y1=y1_plot,
-            log=use_log_scale_for_target_y, eps=log_y_epsilon
-        )
-        fig.update_xaxes(title_text=feature_names[j], row=j + 1, col=1)
+        _maybe_log_axis(fig, row_pos, 1, feature_names[j], axis="x", transforms=transforms, j=j)
+        fig.update_yaxes(title_text=f"{tgt_col} (E[target|success])", row=row_pos, col=1)
+        _set_yaxis_range(fig, row=row_pos, col=1,
+                         y0=y0_plot, y1=y1_plot,
+                         log=use_log_scale_for_target_y, eps=log_y_epsilon)
+        fig.update_xaxes(title_text=feature_names[j], row=row_pos, col=1)
 
-        # tidy lines
+        # tidy rows
         for xd, xi, mu_i, sd_i, p_i in zip(x_display, x_internal, mu_grid, sd_grid, p_grid):
             tidy_rows.append({
                 "feature": feature_names[j],
@@ -579,18 +596,18 @@ def make_partial_dependence1D(
             })
 
     fig.update_layout(
-        height=figure_height_per_row_px * num_features,
+        height=figure_height_per_row_px * len(free_idx),
         template="simple_white",
-        title="1D Partial Dependence: E[target|success] with experimental points & low-success shading",
+        title="1D Partial Dependence of Expected Target (conditioned slice)",
         legend_title_text=""
     )
 
     fig.write_html(str(output), include_plotlyjs="cdn")
     if csv_out:
         pd.DataFrame(tidy_rows).to_csv(str(csv_out), index=False)
-    
     if show_figure:
         fig.show("browser")
+
 
 
 # =============================================================================
