@@ -10,20 +10,15 @@ Welcome to Psyop's documentation!
    :alt: Psyop banner
    :align: center
 
-
 .. include:: ../README.rst
    :start-after: start-badges
    :end-before: end-badges
-
-Parameter Space Yield Optimizer
 
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
 
    quickstart
-   api
-   cli
    credits
 
 Indices and tables

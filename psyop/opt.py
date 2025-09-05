@@ -1,9 +1,8 @@
 # opt.py
 # -*- coding: utf-8 -*-
-from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple, Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -27,7 +26,7 @@ def suggest_candidates(
     explore_fraction: float = 0.34,
     candidates_pool: int = 5000,
     random_seed: int = 0,
-    fixed: Optional[Dict[str, float]] = None, 
+    fixed: Optional[dict[str, float]] = None, 
 ) -> pd.DataFrame:
     """
     Propose a batch of candidates using constrained Expected Improvement (cEI)
@@ -110,7 +109,7 @@ def find_optimal(
     n_draws: int = 2000,
     min_success_probability: float = 0.0,
     random_seed: int = 0,
-    fixed: Optional[Dict[str, float]] = None, 
+    fixed: Optional[dict[str, float]] = None, 
 ) -> pd.DataFrame:
     """
     Rank candidates by probability of being the best feasible optimum (min/max),
@@ -207,9 +206,9 @@ def find_optimal(
 # Predictors reconstructed from artifact (no PyMC at runtime)
 # =============================================================================
 
-def _build_predictors(ds: xr.Dataset) -> Tuple[
+def _build_predictors(ds: xr.Dataset) -> tuple[
     Callable[[np.ndarray], np.ndarray],
-    Callable[[np.ndarray, bool], Tuple[np.ndarray, np.ndarray]]
+    Callable[[np.ndarray, bool], tuple[np.ndarray, np.ndarray]]
 ]:
     """Return (predict_success_probability, predict_conditional_target)."""
     Xn_all = ds["Xn_train"].values.astype(float)
@@ -244,7 +243,7 @@ def _build_predictors(ds: xr.Dataset) -> Tuple[
         mu = beta0_s + Ks @ alpha_s
         return np.clip(mu, 0.0, 1.0)
 
-    def predict_conditional_target(Xn: np.ndarray, include_observation_noise: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+    def predict_conditional_target(Xn: np.ndarray, include_observation_noise: bool = True) -> tuple[np.ndarray, np.ndarray]:
         Kl = kernel_m52_ard(Xn, Xn_ok, ell_l, eta_l)
         mu_c = mean_c + Kl @ alpha_l
         mu = mu_c + cond_mean
@@ -263,13 +262,13 @@ def _build_predictors(ds: xr.Dataset) -> Tuple[
 # Search space, conditioning, and featurization
 # =============================================================================
 
-def _infer_search_specs(ds: xr.Dataset, feature_names: List[str], transforms: List[str]) -> List[Dict]:
+def _infer_search_specs(ds: xr.Dataset, feature_names: list[str], transforms: list[str]) -> list[dict]:
     """
     Build per-feature sampling specs directly from the artifact.
     If a raw per-feature column is missing, reconstruct original-unit values
     from Xn_train + (mean, std, transform). This avoids KeyErrors like '__success__'.
     """
-    specs: List[Dict] = []
+    specs: list[dict] = []
     for j, name in enumerate(feature_names):
         tr = str(transforms[j])
 
@@ -307,7 +306,7 @@ def _infer_search_specs(ds: xr.Dataset, feature_names: List[str], transforms: Li
     return specs
 
 
-def _normalize_fixed(fixed: Dict[str, float], specs: List[Dict]) -> Dict[str, float]:
+def _normalize_fixed(fixed: dict[str, float], specs: list[dict]) -> dict[str, float]:
     """
     Validate & normalize fixed dict to match the search specs:
       - discrete: snap to nearest available choice
@@ -318,7 +317,7 @@ def _normalize_fixed(fixed: Dict[str, float], specs: List[Dict]) -> Dict[str, fl
     if not fixed:
         return {}
     spec_by_name = {s["name"]: s for s in specs}
-    out: Dict[str, float] = {}
+    out: dict[str, float] = {}
     for k, v in fixed.items():
         if k not in spec_by_name:
             raise KeyError(f"Fixed variable '{k}' is not a model feature.")
@@ -343,10 +342,10 @@ def _normalize_fixed(fixed: Dict[str, float], specs: List[Dict]) -> Dict[str, fl
 
 
 def _sample_candidates(
-    specs: List[Dict],
+    specs: list[dict],
     n: int,
     rng: np.random.Generator,
-    fixed: Optional[Dict[str, float]] = None,
+    fixed: Optional[dict[str, float]] = None,
 ) -> pd.DataFrame:
     fixed = fixed or {}
     cols = {}
@@ -375,8 +374,8 @@ def _sample_candidates(
 
 def _original_df_to_standardized(
     df: pd.DataFrame,
-    feature_names: List[str],
-    transforms: List[str],
+    feature_names: list[str],
+    transforms: list[str],
     feat_mean: np.ndarray,
     feat_std: np.ndarray,
 ) -> np.ndarray:
@@ -427,7 +426,7 @@ def _novelty_score(Xn_cands: np.ndarray, Xn_seen: np.ndarray) -> np.ndarray:
     return out
 
 
-def _maybe_flip_for_direction(mu: np.ndarray, best_y: float, direction: str) -> Tuple[np.ndarray, float]:
+def _maybe_flip_for_direction(mu: np.ndarray, best_y: float, direction: str) -> tuple[np.ndarray, float]:
     if direction == "max":
         return -mu, -best_y
     return mu, best_y
@@ -442,7 +441,7 @@ def _best_feasible_observed(ds: xr.Dataset, direction: str) -> float:
     return float(np.nanmin(y_ok))
 
 
-def _fixed_as_string(fixed: Dict[str, float]) -> str:
+def _fixed_as_string(fixed: dict[str, float]) -> str:
     if not fixed:
         return ""
     items = [f"{k}={v:.6g}" for k, v in sorted(fixed.items())]

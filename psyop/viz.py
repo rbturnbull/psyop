@@ -9,7 +9,6 @@ import xarray as xr
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from plotly.colors import get_colorscale, sample_colorscale
-from plotly.colors import get_colorscale, sample_colorscale  # make sure you have these imports
 
 from .model import (
     kernel_diag_m52, 
@@ -209,7 +208,7 @@ def make_pairplot(
     fig = make_subplots(
         rows=num_features, cols=num_features,
         shared_xaxes=False, shared_yaxes=False,
-        horizontal_spacing=0.06, vertical_spacing=0.06,
+        horizontal_spacing=0.03, vertical_spacing=0.03,
     )
 
     # Experimental points setup
@@ -388,7 +387,7 @@ def make_pairplot(
         template="simple_white",
         width=cell * num_features,
         height=cell * num_features,
-        title="Pairplot — E[target|success] with inverted-luminance contours & data points",
+        title="2D Partial Dependence of Expected Target (Pairwise Features)",
         legend_title_text=""
     )
 
@@ -453,7 +452,7 @@ def make_partial_dependence1D(
 
     # Figure
     fig = make_subplots(
-        rows=num_features, cols=1, shared_xaxes=False, vertical_spacing=0.08,
+        rows=num_features, cols=1, shared_xaxes=False,
         subplot_titles=[f"E[target|success] — {name}" for name in feature_names]
     )
 
