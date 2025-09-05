@@ -188,22 +188,11 @@ def model(
 def suggest(
     ctx: typer.Context,
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
-    output: Optional[Path] = typer.Option(
-        None, "--output", "-o", help="Where to save candidates CSV (defaults relative to model)."
-    ),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Where to save candidates CSV (defaults relative to model)."),
     count: int = typer.Option(12, "--count", "-n", help="Number of candidates to propose."),
-    p_success_threshold: float = typer.Option(
-        0.8, "--p-threshold",
-        help="Feasibility threshold for constrained EI."
-    ),
-    explore_fraction: float = typer.Option(
-        0.34, "--explore-fraction",
-        help="Fraction of suggestions reserved for exploration."
-    ),
-    candidates_pool: int = typer.Option(
-        5000, "--pool",
-        help="Random candidate pool size to score."
-    ),
+    p_success_threshold: float = typer.Option(0.8, help="Feasibility threshold for constrained EI."),
+    explore_fraction: float = typer.Option(0.34, help="Fraction of suggestions reserved for exploration."),
+    candidates_pool: int = typer.Option( 5000, help="Random candidate pool size to score." ),
     seed: int = typer.Option(0, "--seed", help="Random seed for proposals."),
 ):
     if not model.exists():
@@ -238,15 +227,10 @@ def suggest(
 def optimal(
     ctx: typer.Context,
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
-    output: Optional[Path] = typer.Option(
-        None, "--output", "-o", help="Where to save top candidates CSV (defaults relative to model)."
-    ),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Where to save top candidates CSV (defaults relative to model)."),
     count: int = typer.Option(10, "--count", "-k", help="How many top rows to keep."),
     draws: int = typer.Option(2000, "--draws", help="Monte Carlo draws."),
-    min_success_probability: float = typer.Option(
-        0.0, "--min-p-success",
-        help="Hard feasibility cutoff (0 disables)."
-    ),
+    min_success_probability: float = typer.Option(0.0, "--min-p-success", help="Hard feasibility cutoff (0 disables)."),
     seed: int = typer.Option(0, "--seed", help="Random seed for MC."),
 ):
     if not model.exists():
@@ -264,7 +248,7 @@ def optimal(
     find_optimal(
         model_path=_force_netcdf_suffix(model),
         output_path=output,
-        top_k=count,
+        count=count,
         n_draws=draws,
         min_success_probability=min_success_probability,
         random_seed=seed,

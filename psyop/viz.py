@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -18,6 +17,11 @@ from .model import (
     solve_lower,
     feature_raw_from_artifact_or_reconstruct,
 )
+from .opt import (
+    suggest_candidates,
+    find_optimal,
+)
+
 
 def _edges_from_centers(vals: np.ndarray, is_log: bool) -> tuple[float, float]:
     """Return (min_edge, max_edge) that tightly bound a heatmap with given center coords."""
@@ -83,6 +87,7 @@ def make_pairplot(
     colourscale: str = "RdBu",
     show: bool = False,
     n_contours: int = 12,
+    optimal:bool = True,
     **kwargs,
 ) -> None:
     """
@@ -93,9 +98,8 @@ def make_pairplot(
     import numpy as np
     import pandas as pd
     import xarray as xr
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-    from plotly.colors import get_colorscale, sample_colorscale
+
+    optimal_df = find_optimal(model, count=1, **kwargs) if optimal else None
 
     ds = xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
@@ -298,6 +302,23 @@ def make_pairplot(
             customdata=df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
         ), row=r+1, col=c+1)
 
+        if optimal:
+            opt_x = optimal_df[feature_names[j]].values
+            opt_y = optimal_df[feature_names[i]].values
+            pred_target_mean = optimal_df["pred_target_mean"].values[0]
+            # breakpoint()
+            fig.add_trace(go.Scattergl(
+                x=opt_x, y=opt_y, mode="markers",
+                marker=dict(size=10, color="yellow", line=dict(color="black", width=1.5), symbol="x"),
+                name="optimal", legendgroup="optimal",
+                showlegend=(r == 0 and c == 0),
+                hovertemplate=(
+                    f"predicted: {pred_target_mean:.2g} ± {optimal_df['pred_target_sd'].values[0]:.2g}<br>"
+                    f"{feature_names[j]}: %{{x:.6g}}<br>"
+                    f"{feature_names[i]}: %{{y:.6g}}<extra></extra>"
+                ),
+            ), row=r+1, col=c+1)
+
         _update_axis_type_and_range(fig, row=r+1, col=c+1, axis="x", centers=x_vals, is_log=_is_log_feature(j))
         _update_axis_type_and_range(fig, row=r+1, col=c+1, axis="y", centers=y_vals, is_log=_is_log_feature(i))
 
@@ -425,8 +446,6 @@ def make_partial_dependence1D(
     import numpy as np
     import pandas as pd
     import xarray as xr
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
 
     ds = xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)

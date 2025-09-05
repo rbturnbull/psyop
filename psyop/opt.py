@@ -20,7 +20,7 @@ from .model import (
 
 def suggest_candidates(
     model_path: Path,
-    output_path: Path,
+    output_path: Path|None = None,
     count: int = 12,
     p_success_threshold: float = 0.8,
     explore_fraction: float = 0.34,
@@ -98,16 +98,20 @@ def suggest_candidates(
     out["direction"] = direction
     out["conditioned_on"] = _fixed_as_string(fixed_norm)
 
-    out.to_csv(output_path, index=False)
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        out.to_csv(output_path, index=False)
+
     return out
 
 
 def find_optimal(
     model_path: Path,
-    output_path: Path,
-    top_k: int = 10,
+    output_path: Path|None = None,
+    count: int = 10,
     n_draws: int = 2000,
-    min_success_probability: float = 0.0,
+    min_success_probability: float = 0.5,
     random_seed: int = 0,
     **kwargs,
 ) -> pd.DataFrame:
@@ -168,7 +172,7 @@ def find_optimal(
             kind="mergesort",
         ).reset_index(drop=True)
         result_sorted["rank_prob_best"] = np.arange(1, len(result_sorted) + 1)
-        top = result_sorted.head(top_k).reset_index(drop=True)
+        top = result_sorted.head(count).reset_index(drop=True)
         top.to_csv(output_path, index=False)
         return top
 
@@ -197,8 +201,12 @@ def find_optimal(
     ).reset_index(drop=True)
     result_sorted["rank_prob_best"] = np.arange(1, len(result_sorted) + 1)
 
-    top = result_sorted.head(top_k).reset_index(drop=True)
-    top.to_csv(output_path, index=False)
+    top = result_sorted.head(count).reset_index(drop=True)
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        top.to_csv(output_path, index=False)
+
     return top
 
 
