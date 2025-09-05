@@ -433,6 +433,7 @@ def make_partial_dependence1D(
     use_log_scale_for_target_y: bool = True,   # log-y for target
     log_y_epsilon: float = 1e-9,
     optimal: bool = True,
+    suggest:int = 0,
     **kwargs,
 ) -> None:
     """
@@ -448,6 +449,7 @@ def make_partial_dependence1D(
     import xarray as xr
 
     optimal_df = find_optimal(model, count=1, **kwargs) if optimal else None
+    suggest_df = suggest_candidates(model, count=suggest, **kwargs) if suggest and suggest > 0 else None
 
     ds = xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
@@ -611,6 +613,20 @@ def make_partial_dependence1D(
                         f"{feature_names[j]}: %{{x:.6g}}<extra></extra>"
                     ),
                 ), row=row_pos, col=1)
+
+        if suggest_df is not None and feature_names[j] in suggest_df.columns:
+            x_suggest = suggest_df[feature_names[j]].values
+            pred_suggest_mean = suggest_df["pred_target_mean"].values[0]
+            pred_suggest_sd = suggest_df["pred_target_sd"].values[0]
+            fig.add_trace(go.Scattergl(
+                x=x_suggest, y=[pred_suggest_mean], mode="markers",
+                marker=dict(size=10, color="cyan", line=dict(color="black", width=1.5), symbol="star"),
+                name="suggested", legendgroup="suggested", showlegend=show_legend,
+                hovertemplate=(
+                    f"predicted: {pred_suggest_mean:.2g} ± {pred_suggest_sd:.2g}<br>"
+                    f"{feature_names[j]}: %{{x:.6g}}<extra></extra>"
+                ),
+            ), row=row_pos, col=1)
 
         # Axes
         _maybe_log_axis(fig, row_pos, 1, feature_names[j], axis="x", transforms=transforms, j=j)
