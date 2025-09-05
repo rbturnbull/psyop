@@ -1,7 +1,5 @@
-================================================================
-Psyop
-================================================================
-
+.. image:: https://rbturnbull.github.io/psyop/_images/psyop-banner.jpg
+    
 .. start-badges
 
 |testing badge| |coverage badge| |docs badge| |black badge| |torchapp badge|
