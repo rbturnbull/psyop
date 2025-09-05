@@ -158,10 +158,7 @@ def model(
              "If omitted, success is inferred as ~isna(target)."
     ),
     seed: int = typer.Option(0, "--seed", help="Random seed for fitting/sampling."),
-    compress: bool = typer.Option(
-        True, "--compress/--no-compress",
-        help="Apply compression inside the artifact."
-    ),
+    compress: bool = typer.Option(True, help="Apply compression inside the artifact."),
 ):
     if not input.exists():
         raise typer.BadParameter(f"Input CSV not found: {input.resolve()}")
@@ -184,8 +181,12 @@ def model(
     console.print(f"[green]Wrote model artifact →[/] {output}")
 
 
-@app.command(help="Suggest BO candidates (constrained EI + exploration).")
+@app.command(
+    help="Suggest BO candidates (constrained EI + exploration).",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True}, 
+)
 def suggest(
+    ctx: typer.Context,
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
     output: Optional[Path] = typer.Option(
         None, "--output", "-o", help="Where to save candidates CSV (defaults relative to model)."
@@ -214,6 +215,9 @@ def suggest(
         output = _default_out_for(model, stem_suffix="__bo_proposals", ext=".csv")
     _ensure_parent_dir(output)
 
+    kwargs = _parse_unknown_cli_kv(ctx.args)
+    kwargs, _ = _canonicalize_fixed_keys(_force_netcdf_suffix(model), kwargs)
+
     suggest_candidates(
         model_path=_force_netcdf_suffix(model),
         output_path=output,
@@ -222,12 +226,17 @@ def suggest(
         explore_fraction=explore_fraction,
         candidates_pool=candidates_pool,
         random_seed=seed,
+        **kwargs,
     )
     console.print(f"[green]Wrote proposals →[/] {output}")
 
 
-@app.command(help="Rank points by probability of being the best feasible minimum.")
+@app.command(
+    help="Rank points by probability of being the best feasible minimum.",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True}, 
+)
 def optimal(
+    ctx: typer.Context,
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
     output: Optional[Path] = typer.Option(
         None, "--output", "-o", help="Where to save top candidates CSV (defaults relative to model)."
@@ -249,6 +258,9 @@ def optimal(
         output = _default_out_for(model, stem_suffix="__bo_best_probable", ext=".csv")
     _ensure_parent_dir(output)
 
+    kwargs = _parse_unknown_cli_kv(ctx.args)
+    kwargs, _ = _canonicalize_fixed_keys(_force_netcdf_suffix(model), kwargs)
+
     find_optimal(
         model_path=_force_netcdf_suffix(model),
         output_path=output,
@@ -256,6 +268,7 @@ def optimal(
         n_draws=draws,
         min_success_probability=min_success_probability,
         random_seed=seed,
+        **kwargs,
     )
     console.print(f"[green]Wrote top probable minima →[/] {output}")
 

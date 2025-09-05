@@ -26,7 +26,7 @@ def suggest_candidates(
     explore_fraction: float = 0.34,
     candidates_pool: int = 5000,
     random_seed: int = 0,
-    fixed: Optional[dict[str, float]] = None, 
+    **kwargs,
 ) -> pd.DataFrame:
     """
     Propose a batch of candidates using constrained Expected Improvement (cEI)
@@ -46,7 +46,7 @@ def suggest_candidates(
     search_specs = _infer_search_specs(ds, feature_names, transforms)
 
     # Validate / normalize fixed values (snap to grid / clamp to bounds)
-    fixed_norm = _normalize_fixed(fixed or {}, search_specs)
+    fixed_norm = _normalize_fixed(kwargs or {}, search_specs)
 
     # Best feasible observed target (for EI baseline)
     direction = str(ds.attrs.get("direction", "min"))
@@ -109,7 +109,7 @@ def find_optimal(
     n_draws: int = 2000,
     min_success_probability: float = 0.0,
     random_seed: int = 0,
-    fixed: Optional[dict[str, float]] = None, 
+    **kwargs,
 ) -> pd.DataFrame:
     """
     Rank candidates by probability of being the best feasible optimum (min/max),
@@ -125,7 +125,7 @@ def find_optimal(
 
     # Candidate pool with conditioning
     search_specs = _infer_search_specs(ds, feature_names, transforms)
-    fixed_norm = _normalize_fixed(fixed or {}, search_specs)
+    fixed_norm = _normalize_fixed(kwargs or {}, search_specs)
     rng = np.random.default_rng(random_seed)
     cand_df = _sample_candidates(search_specs, n=4000, rng=rng, fixed=fixed_norm)
     Xn_cands = _original_df_to_standardized(cand_df, feature_names, transforms, feat_mean, feat_std)
