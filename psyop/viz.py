@@ -306,7 +306,6 @@ def make_pairplot(
             opt_x = optimal_df[feature_names[j]].values
             opt_y = optimal_df[feature_names[i]].values
             pred_target_mean = optimal_df["pred_target_mean"].values[0]
-            # breakpoint()
             fig.add_trace(go.Scattergl(
                 x=opt_x, y=opt_y, mode="markers",
                 marker=dict(size=10, color="yellow", line=dict(color="black", width=1.5), symbol="x"),
@@ -433,6 +432,7 @@ def make_partial_dependence1D(
     show_figure: bool = False,
     use_log_scale_for_target_y: bool = True,   # log-y for target
     log_y_epsilon: float = 1e-9,
+    optimal: bool = True,
     **kwargs,
 ) -> None:
     """
@@ -446,6 +446,8 @@ def make_partial_dependence1D(
     import numpy as np
     import pandas as pd
     import xarray as xr
+
+    optimal_df = find_optimal(model, count=1, **kwargs) if optimal else None
 
     ds = xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
@@ -594,6 +596,21 @@ def make_partial_dependence1D(
                 ),
                 customdata=trial_ids_fail
             ), row=row_pos, col=1)
+
+        if optimal:
+            if feature_names[j] in optimal_df.columns:
+                x_opt = optimal_df[feature_names[j]].values
+                pred_target_mean = optimal_df["pred_target_mean"].values[0]
+                pred_target_sd   = optimal_df["pred_target_sd"].values[0]
+                fig.add_trace(go.Scattergl(
+                    x=x_opt, y=[pred_target_mean], mode="markers",
+                    marker=dict(size=10, color="yellow", line=dict(color="black", width=1.5), symbol="x"),
+                    name="optimal", legendgroup="optimal", showlegend=show_legend,
+                    hovertemplate=(
+                        f"predicted: {pred_target_mean:.2g} ± {pred_target_sd:.2g}<br>"
+                        f"{feature_names[j]}: %{{x:.6g}}<extra></extra>"
+                    ),
+                ), row=row_pos, col=1)
 
         # Axes
         _maybe_log_axis(fig, row_pos, 1, feature_names[j], axis="x", transforms=transforms, j=j)
