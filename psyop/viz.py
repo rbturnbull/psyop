@@ -506,8 +506,7 @@ def make_partial_dependence1D(
 ) -> None:
     """
     Vertical 1D PD panels of E[target|success] vs each *free* feature.
-    Any feature passed via kwargs (e.g. --epochs 20) is clamped in the slice and not plotted.
-    Slices (a:b) narrow the sweep; lists/tuples become discrete grids.
+    Scalars (fix & hide), slices (restrict sweep & x-range), lists/tuples (discrete grids).
     """
     import numpy as np
     import pandas as pd
@@ -527,20 +526,19 @@ def make_partial_dependence1D(
     Xn_train = ds["Xn_train"].values.astype(float)
     p = Xn_train.shape[1]
 
-    # --- canonicalize kwargs keys to real feature names (accept hyphens/underscores/case) ---
-    idx_map = _canon_key_set(ds)  # helper already present in the module
+    # --- canonicalize kwargs -> real feature names (same as plot2d) ---
+    idx_map = _canon_key_set(ds)
     kw_fixed_raw: dict[str, object] = {}
     for k, v in kwargs.items():
         if k in idx_map:
             kw_fixed_raw[idx_map[k]] = v
         else:
-            # try normalized key (same rule as plot2d)
             import re
             nk = re.sub(r"[^a-z0-9]+", "", str(k).lower())
             if nk in idx_map:
                 kw_fixed_raw[idx_map[nk]] = v
 
-    # --- split constraints into: scalar fixes, slice ranges, and discrete choices (all in STANDARDIZED space) ---
+    # --- split constraints into scalar fixes, ranges (slices), choices (lists/tuples) in STANDARDIZED space ---
     fixed_scalars: dict[int, float] = {}
     range_windows: dict[int, tuple[float, float]] = {}
     choice_values: dict[int, np.ndarray] = {}
@@ -559,33 +557,29 @@ def make_partial_dependence1D(
         else:
             fixed_scalars[j] = float(_orig_to_std(j, float(val), transforms, X_mean, X_std))
 
-    # --- optional overlays (use canonical keys so opt/suggest see the same constraints) ---
+    # --- optional overlays (use the same canonical constraints) ---
     optimal_df  = find_optimal(model, count=1, **kw_fixed_raw) if optimal else None
     suggest_df  = suggest_candidates(model, count=suggest, **kw_fixed_raw) if (suggest and suggest > 0) else None
 
-    # --- base standardized point (median), then apply scalar fixes ---
+    # --- base point (median) then apply scalar fixes ---
     base_std = np.median(Xn_train, axis=0)
     for j, vstd in fixed_scalars.items():
         base_std[j] = vstd
 
-    # --- features to PLOT (exclude only scalar-fixed) ---
+    # --- features to plot (exclude only scalar-fixed) ---
     free_idx = [j for j in range(p) if j not in fixed_scalars]
     if not free_idx:
         raise ValueError("All features are fixed; nothing to plot. Fix fewer variables.")
 
-    # --- empirical 1–99% bounds (standardized) to keep grids reasonable ---
+    # empirical 1–99% for sane bounds
     p01p99 = [np.percentile(Xn_train[:, j], [1, 99]) for j in range(p)]
 
     def _grid_1d(j: int, n: int) -> np.ndarray:
-        """Standardized sweep for feature j respecting ranges/choices."""
         p01, p99 = p01p99[j]
         if j in choice_values:
             vals = np.asarray(choice_values[j], dtype=float)
             vals = vals[(vals >= p01) & (vals <= p99)]
-            if vals.size == 0:
-                # fallback: median to avoid empty axis
-                return np.array([np.median(Xn_train[:, j])], dtype=float)
-            return np.unique(np.sort(vals))
+            return np.unique(np.sort(vals)) if vals.size else np.array([np.median(Xn_train[:, j])], dtype=float)
         lo, hi = p01, p99
         if j in range_windows:
             rlo, rhi = range_windows[j]
@@ -594,10 +588,10 @@ def make_partial_dependence1D(
             lo, hi = p01, max(p01 + 1e-9, p99)
         return np.linspace(lo, hi, n)
 
-    # Build standardized sweeps for FREE features
+    # sweeps (standardized)
     sweeps_std = {j: _grid_1d(j, n_points_1d) for j in free_idx}
 
-    # --- experimental data masks ---
+    # masks/data
     tgt_col = str(ds.attrs["target_column"])
     success_mask = ~pd.isna(df_raw[tgt_col]).to_numpy()
     fail_mask    = ~success_mask
@@ -605,10 +599,8 @@ def make_partial_dependence1D(
     trial_ids_success = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask]
     trial_ids_fail    = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
 
-    # --- style helpers ---
     band_fill_rgba = _rgb_to_rgba(line_color, band_alpha)
 
-    # --- figure with rows for FREE features only ---
     free_names = [feature_names[j] for j in free_idx]
     fig = make_subplots(
         rows=len(free_idx), cols=1, shared_xaxes=False,
@@ -626,11 +618,11 @@ def make_partial_dependence1D(
         p_grid = pred_success(Xn_grid)
         mu_grid, sd_grid = pred_loss(Xn_grid, include_observation_noise=True)
 
-        # x axis in ORIGINAL units
+        # x (original units)
         x_internal = grid * X_std[j] + X_mean[j]
         x_display  = _inverse_transform(transforms[j], x_internal)
 
-        # Y transforms
+        # y transform
         if use_log_scale_for_target_y:
             mu_plot = np.maximum(mu_grid, log_y_epsilon)
             lo_plot = np.maximum(mu_grid - 2.0 * sd_grid, log_y_epsilon)
@@ -642,7 +634,7 @@ def make_partial_dependence1D(
             hi_plot = mu_grid + 2.0 * sd_grid
             losses_s_plot = losses_success
 
-        # Y-range incl. observed successes
+        # y-range
         y_arrays = [lo_plot, hi_plot] + ([losses_s_plot] if losses_s_plot.size else [])
         y_low  = float(np.nanmin([np.nanmin(a) for a in y_arrays]))
         y_high = float(np.nanmax([np.nanmax(a) for a in y_arrays]))
@@ -673,7 +665,7 @@ def make_partial_dependence1D(
                                  hovertemplate=f"{feature_names[j]}: %{{x:.6g}}<br>E[target|success]: %{{y:.3f}}<extra></extra>"),
                       row=row_pos, col=1)
 
-        # Experimental points
+        # experimental points
         if feature_names[j] in df_raw.columns:
             x_data_all = df_raw[feature_names[j]].to_numpy().astype(float)
         else:
@@ -681,28 +673,30 @@ def make_partial_dependence1D(
 
         x_succ = x_data_all[success_mask]
         if x_succ.size:
-            fig.add_trace(go.Scattergl(x=x_succ, y=losses_s_plot, mode="markers",
-                                       marker=dict(size=5, color="black", line=dict(width=0)),
-                                       name="data (success)", legendgroup="data_s", showlegend=show_legend,
-                                       hovertemplate=("trial_id: %{customdata}<br>"
-                                                      f"{feature_names[j]}: %{{x:.6g}}<br>"
-                                                      f"{tgt_col}: %{{y:.4f}}<extra></extra>"),
-                                       customdata=trial_ids_success),
-                          row=row_pos, col=1)
+            fig.add_trace(go.Scattergl(
+                x=x_succ, y=losses_s_plot, mode="markers",
+                marker=dict(size=5, color="black", line=dict(width=0)),
+                name="data (success)", legendgroup="data_s", showlegend=show_legend,
+                hovertemplate=("trial_id: %{customdata}<br>"
+                               f"{feature_names[j]}: %{{x:.6g}}<br>"
+                               f"{tgt_col}: %{{y:.4f}}<extra></extra>"),
+                customdata=trial_ids_success
+            ), row=row_pos, col=1)
 
         x_fail = x_data_all[fail_mask]
         if x_fail.size:
             y_fail_plot = np.full_like(x_fail, y_failed_band, dtype=float)
-            fig.add_trace(go.Scattergl(x=x_fail, y=y_fail_plot, mode="markers",
-                                       marker=dict(size=6, color="red", line=dict(color="black", width=0.8)),
-                                       name="data (failed)", legendgroup="data_f", showlegend=show_legend,
-                                       hovertemplate=("trial_id: %{customdata}<br>"
-                                                      f"{feature_names[j]}: %{{x:.6g}}<br>"
-                                                      "status: failed (NaN target)<extra></extra>"),
-                                       customdata=trial_ids_fail),
-                          row=row_pos, col=1)
+            fig.add_trace(go.Scattergl(
+                x=x_fail, y=y_fail_plot, mode="markers",
+                marker=dict(size=6, color="red", line=dict(color="black", width=0.8)),
+                name="data (failed)", legendgroup="data_f", showlegend=show_legend,
+                hovertemplate=("trial_id: %{customdata}<br>"
+                               f"{feature_names[j]}: %{{x:.6g}}<br>"
+                               "status: failed (NaN target)<extra></extra>"),
+                customdata=trial_ids_fail
+            ), row=row_pos, col=1)
 
-        # Overlays
+        # overlays
         if optimal_df is not None and feature_names[j] in optimal_df.columns:
             x_opt = optimal_df[feature_names[j]].values
             y_opt = optimal_df["pred_target_mean"].values
@@ -726,11 +720,46 @@ def make_partial_dependence1D(
                                f"{feature_names[j]}: %{{x:.6g}}<extra></extra>")
             ), row=row_pos, col=1)
 
-        # Axes
+        # axes
         _maybe_log_axis(fig, row_pos, 1, feature_names[j], axis="x", transforms=transforms, j=j)
         fig.update_yaxes(title_text=f"{tgt_col} (E[target|success])", row=row_pos, col=1)
-        _set_yaxis_range(fig, row=row_pos, col=1, y0=y0_plot, y1=y1_plot,
+        _set_yaxis_range(fig, row=row_pos, col=1,
+                         y0=y0_plot, y1=y1_plot,
                          log=use_log_scale_for_target_y, eps=log_y_epsilon)
+
+        # --- HARD-RESTRICT X-RANGE TO CONSTRAINT WINDOW (original units) ---
+        is_log_x = (transforms[j] == "log10")
+
+        def _std_to_orig(val_std: float) -> float:
+            vi = val_std * X_std[j] + X_mean[j]
+            return float(_inverse_transform(transforms[j], np.array([vi]))[0])
+
+        x_min_override = x_max_override = None
+        if j in range_windows:
+            lo_std, hi_std = range_windows[j]
+            x_min_override = min(_std_to_orig(lo_std), _std_to_orig(hi_std))
+            x_max_override = max(_std_to_orig(lo_std), _std_to_orig(hi_std))
+        elif j in choice_values:
+            ints = choice_values[j] * X_std[j] + X_mean[j]
+            origs = _inverse_transform(transforms[j], ints)
+            x_min_override = float(np.min(origs))
+            x_max_override = float(np.max(origs))
+
+        if (x_min_override is not None) and (x_max_override is not None):
+            if is_log_x:
+                x0 = max(x_min_override, 1e-12)
+                x1 = max(x_max_override, x0 * (1 + 1e-9))
+                # small multiplicative pad
+                pad = (x1 / x0) ** 0.03
+                fig.update_xaxes(type="log",
+                                 range=[np.log10(x0 / pad), np.log10(x1 * pad)],
+                                 row=row_pos, col=1)
+            else:
+                span = (x_max_override - x_min_override) or 1.0
+                pad = 0.02 * span
+                fig.update_xaxes(range=[x_min_override - pad, x_max_override + pad],
+                                 row=row_pos, col=1)
+
         fig.update_xaxes(title_text=feature_names[j], row=row_pos, col=1)
 
         # tidy rows
@@ -744,7 +773,7 @@ def make_partial_dependence1D(
                 "success_probability": float(p_i),
             })
 
-    # Title w/ constraints summary (original kwargs as user passed)
+    # title w/ constraints summary
     def _fmt_c(v):
         if isinstance(v, slice):
             a = "" if v.start is None else f"{v.start:g}"
@@ -759,8 +788,7 @@ def make_partial_dependence1D(
 
     title = "1D Partial Dependence of Expected Target (conditioned slice)"
     if kw_fixed_raw:
-        parts = [f"{k}={_fmt_c(kw_fixed_raw[k])}" for k in kw_fixed_raw]
-        title += " — " + ", ".join(parts)
+        title += " — " + ", ".join(f"{k}={_fmt_c(kw_fixed_raw[k])}" for k in kw_fixed_raw)
 
     fig.update_layout(
         height=figure_height_per_row_px * len(free_idx),
@@ -769,7 +797,6 @@ def make_partial_dependence1D(
         legend_title_text=""
     )
 
-    # Output
     if output:
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -780,7 +807,6 @@ def make_partial_dependence1D(
         pd.DataFrame(tidy_rows).to_csv(str(csv_out), index=False)
     if show_figure:
         fig.show("browser")
-
 
 # =============================================================================
 # Helpers: dataset → predictors & featurization
