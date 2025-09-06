@@ -215,6 +215,10 @@ def find_optimal(
     ds = xr.load_dataset(model_path)
     pred_success, pred_loss = _build_predictors(ds)
 
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
     feature_names = list(map(str, ds["feature"].values.tolist()))
     transforms = list(map(str, ds["feature_transform"].values.tolist()))
     feat_mean = ds["feature_mean"].values.astype(float)
@@ -266,7 +270,8 @@ def find_optimal(
         ).reset_index(drop=True)
         result_sorted["rank_prob_best"] = np.arange(1, len(result_sorted) + 1)
         top = result_sorted.head(count).reset_index(drop=True)
-        top.to_csv(output_path, index=False)
+        if output_path:
+            top.to_csv(output_path, index=False)
         return top
 
     Z_eff = flip * Z
@@ -296,8 +301,6 @@ def find_optimal(
 
     top = result_sorted.head(count).reset_index(drop=True)
     if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
         top.to_csv(output_path, index=False)
 
     console.print(df_to_table(top))

@@ -106,39 +106,37 @@ def _parse_range_call(s: str) -> tuple:
     seq = list(range(lo, hi + 1, abs(step)))
     return tuple(seq)
 
-def _parse_colon_or_dots(s: str):
+
+def _parse_colon_or_dots(s: str) -> slice:
     """
-    Parse 'a:b' or 'a..b' or 'a:b:step'.
-    - if both ends int-like => return tuple of ints (inclusive), support int step
-    - else => return slice(float(a), float(b))  (float range)
+    Parse 'a:b', 'a..b', or 'a:b:step' → slice(start, stop, step).
+    - Works for int or float endpoints (we sort so start <= stop).
+    - Step is optional; if present it can be int or float.
+    - Any token with ':' (or '..') yields a slice (no tuples).
     """
-    # normalize '..' to ':'
     s_norm = re.sub(r"\.\.+", ":", s.strip())
-    parts = [p.strip() for p in s_norm.split(":") if p.strip() != ""]
+    parts = [p.strip() for p in s_norm.split(":")]
     if len(parts) not in (2, 3):
-        raise ValueError
+        raise ValueError(f"Not a range: {s!r}")
+
     a_str, b_str = parts[0], parts[1]
     a_num = _to_number(a_str)
     b_num = _to_number(b_str)
+    if not isinstance(a_num, (int, float)) or not isinstance(b_num, (int, float)):
+        raise ValueError(f"Non-numeric range endpoints: {s!r}")
 
-    # int range (inclusive), maybe with step
-    if isinstance(a_num, int) and isinstance(b_num, int):
-        step = 1
-        if len(parts) == 3:
-            step_val = _to_number(parts[2])
-            if not isinstance(step_val, int):
-                raise ValueError
-            step = step_val
-        lo, hi = (a_num, b_num) if a_num <= b_num else (b_num, a_num)
-        seq = list(range(lo, hi + 1, abs(step)))
-        return tuple(seq)
+    start, stop = (a_num, b_num)
+    if start > stop:
+        start, stop = stop, start  # normalize to ascending
 
-    # float range → slice (inclusive semantics, but we store as slice)
-    lo = float(a_num)
-    hi = float(b_num)
-    if lo > hi:
-        lo, hi = hi, lo
-    return slice(lo, hi)
+    step = None
+    if len(parts) == 3 and parts[2] != "":
+        step_val = _to_number(parts[2])
+        if not isinstance(step_val, (int, float)) or step_val == 0:
+            raise ValueError(f"Invalid step in range: {s!r}")
+        step = step_val
+
+    return slice(start, stop, step)
 
 def _parse_constraint_value(text: str):
     """
@@ -348,11 +346,6 @@ def suggest(
         console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
     model_nc = _force_netcdf_suffix(model)
-
-    if output is None:
-        output = _default_out_for(model, stem_suffix="__bo_proposals", ext=".csv")
-    _ensure_parent_dir(output)
-
     constraints = parse_constraints_from_ctx(ctx, model_nc)
 
     suggest_candidates(
@@ -365,7 +358,8 @@ def suggest(
         random_seed=seed,
         **constraints,
     )
-    console.print(f"[green]Wrote proposals →[/] {output}")
+    if output:
+        console.print(f"[green]Wrote proposals →[/] {output}")
 
 
 @app.command(
@@ -375,7 +369,7 @@ def suggest(
 def optimal(
     ctx: typer.Context,
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Where to save top candidates CSV (defaults relative to model)."),
+    output: Path|None = typer.Option(None, help="Where to save top candidates CSV (defaults relative to model)."),
     count: int = typer.Option(10, "--count", "-k", help="How many top rows to keep."),
     draws: int = typer.Option(2000, "--draws", help="Monte Carlo draws."),
     min_success_probability: float = typer.Option(0.0, "--min-p-success", help="Hard feasibility cutoff (0 disables)."),
@@ -386,14 +380,9 @@ def optimal(
     if model.suffix.lower() not in {".nc", ".netcdf"}:
         console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
-    if output is None:
-        output = _default_out_for(model, stem_suffix="__bo_best_probable", ext=".csv")
-    _ensure_parent_dir(output)
-
     model_nc = _force_netcdf_suffix(model)
 
     constraints = parse_constraints_from_ctx(ctx, model_nc)
-    breakpoint()
 
     find_optimal(
         model_path=_force_netcdf_suffix(model),
@@ -404,7 +393,8 @@ def optimal(
         random_seed=seed,
         **constraints,
     )
-    console.print(f"[green]Wrote top probable minima →[/] {output}")
+    if output:
+        console.print(f"[green]Wrote top probable minima →[/] {output}")
 
 
 @app.command(
