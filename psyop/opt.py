@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Any
 
 import numpy as np
 import pandas as pd
@@ -15,69 +15,159 @@ from .model import (
     add_jitter,
     solve_chol,
     solve_lower,
-    feature_raw_from_artifact_or_reconstruct,
 )
+
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
+
+
+def df_to_table(
+    pandas_dataframe: pd.DataFrame,
+    rich_table: Table|None = None,
+    show_index: bool = False,
+    index_name: str|None = None,
+) -> Table:
+    """Convert a pandas.DataFrame obj into a rich.Table obj.
+    Args:
+        pandas_dataframe (DataFrame): A Pandas DataFrame to be converted to a rich Table.
+        rich_table (Table): A rich Table that should be populated by the DataFrame values.
+        show_index (bool): Add a column with a row count to the table. Defaults to True.
+        index_name (str, optional): The column name to give to the index column. Defaults to None, showing no value.
+    Returns:
+        Table: The rich Table instance passed, populated with the DataFrame values."""
+
+    rich_table = rich_table or Table(show_header=True, header_style="bold magenta")
+
+    if show_index:
+        index_name = str(index_name) if index_name else ""
+        rich_table.add_column(index_name)
+
+    for column in pandas_dataframe.columns:
+        rich_table.add_column(str(column))
+
+    for index, value_list in enumerate(pandas_dataframe.values.tolist()):
+        row = [str(index)] if show_index else []
+        row += [str(x) for x in value_list]
+        rich_table.add_row(*row)
+
+    return rich_table
+
+
 
 def suggest_candidates(
     model_path: Path,
-    output_path: Path|None = None,
+    output_path: Path | None = None,
     count: int = 12,
     p_success_threshold: float = 0.8,
     explore_fraction: float = 0.34,
     candidates_pool: int = 5000,
     random_seed: int = 0,
-    **kwargs,
+    **kwargs,  # feature constraints: number (fixed), slice (float range), list/tuple (choices); range->tuple
 ) -> pd.DataFrame:
     """
-    Propose a batch of candidates using constrained Expected Improvement (cEI)
-    plus exploration (uncertainty + boundary + novelty), optionally conditioned on
-    some variables fixed to given original-unit values.
+    Propose candidates via constrained EI + exploration.
+
+    kwargs semantics (ORIGINAL units):
+      - number (int/float): fixed value (e.g. epochs=20).
+      - slice(start, stop): inclusive float range (e.g. learning_rate=slice(1e-5, 1e-3)).
+      - list/tuple: finite choices (e.g. batch_size=(16, 20, 24)).
+      - range(...): converted to tuple of ints, then treated as choices.
     """
     ds = xr.load_dataset(model_path)
     pred_success, pred_loss = _build_predictors(ds)
 
     feature_names = list(map(str, ds["feature"].values.tolist()))
-    transforms = list(map(str, ds["feature_transform"].values.tolist()))
+    transforms    = list(map(str, ds["feature_transform"].values.tolist()))
     feat_mean = ds["feature_mean"].values.astype(float)
-    feat_std = ds["feature_std"].values.astype(float)
-    Xn_train = ds["Xn_train"].values.astype(float)
+    feat_std  = ds["feature_std"].values.astype(float)
+    Xn_train  = ds["Xn_train"].values.astype(float)
 
-    # Search space from data
+    # 1) Defaults from data
     search_specs = _infer_search_specs(ds, feature_names, transforms)
 
-    # Validate / normalize fixed values (snap to grid / clamp to bounds)
-    fixed_norm = _normalize_fixed(kwargs or {}, search_specs)
+    # 2) Normalize user constraints according to the new convention
+    user_fixed: dict[str, float] = {}
+    user_ranges: dict[str, tuple[float, float]] = {}   # slice → (low, high) inclusive
+    user_choices: dict[str, list[float | int]] = {}
 
-    # Best feasible observed target (for EI baseline)
+    for key, raw_val in (kwargs or {}).items():
+        if key not in feature_names:
+            # silently ignore unknown keys
+            continue
+
+        # Convert range -> tuple of ints (then handled as choices)
+        if isinstance(raw_val, range):
+            raw_val = tuple(raw_val)
+
+        # number -> fixed
+        if isinstance(raw_val, (int, float, np.number)):
+            val = float(raw_val)
+            if np.isfinite(val):
+                user_fixed[key] = val
+            continue
+
+        # slice -> float range (inclusive)
+        if isinstance(raw_val, slice):
+            if raw_val.start is None or raw_val.stop is None:
+                continue  # require closed interval
+            lo = float(raw_val.start)
+            hi = float(raw_val.stop)
+            if np.isfinite(lo) and np.isfinite(hi):
+                if lo > hi:
+                    lo, hi = hi, lo
+                user_ranges[key] = (lo, hi)
+            continue
+
+        # list/tuple -> choices
+        if isinstance(raw_val, (list, tuple)):
+            if len(raw_val) == 0:
+                continue
+            # Keep ints as ints if all entries are integer-like
+            if all(isinstance(v, (int, np.integer)) or abs(float(v) - round(float(v))) < 1e-12 for v in raw_val):
+                user_choices[key] = [int(round(float(v))) for v in raw_val]
+            else:
+                user_choices[key] = [float(v) for v in raw_val]
+            continue
+
+        # anything else → ignore
+
+    # Fixed wins over range/choices for the same key
+    for k in list(user_fixed.keys()):
+        user_ranges.pop(k, None)
+        user_choices.pop(k, None)
+
+    # 3) Apply user bounds/choices to search space & normalize fixed values
+    _apply_user_bounds(search_specs, user_ranges, user_choices)
+    fixed_norm = _normalize_fixed(user_fixed, search_specs)
+
+    # 4) Best feasible observed target for EI baseline
     direction = str(ds.attrs.get("direction", "min"))
     best_feasible = _best_feasible_observed(ds, direction)
 
-    # Candidate pool in ORIGINAL units (respect fixed dims)
+    # 5) Sample candidate pool (respecting bounds + fixed)
     rng = np.random.default_rng(random_seed)
     cand_df = _sample_candidates(search_specs, n=candidates_pool, rng=rng, fixed=fixed_norm)
 
-    # Standardize to model space
+    # 6) Predict in model space
     Xn_cands = _original_df_to_standardized(cand_df, feature_names, transforms, feat_mean, feat_std)
-
-    # Predictions
-    p = pred_success(Xn_cands)                                # (N,)
+    p = pred_success(Xn_cands)
     mu, sd = pred_loss(Xn_cands, include_observation_noise=True)
     sd = np.maximum(sd, 1e-12)
 
-    # Acquisition scores
+    # 7) Acquisition: cEI + exploration + novelty
     mu_ei, best_y_ei = _maybe_flip_for_direction(mu, best_feasible, direction)
     c_ei = _constrained_EI(mu_ei, sd, p, best_y_ei, p_threshold=p_success_threshold, softness=0.05)
     expl = _exploration_score(sd, p, w_sd=1.0, w_boundary=0.5)
-    nov = _novelty_score(Xn_cands, Xn_train)
+    nov  = _novelty_score(Xn_cands, Xn_train)
 
     n_explore = int(np.ceil(count * explore_fraction))
     n_exploit = max(0, count - n_explore)
 
-    # Exploit: top by cEI
     idx_exploit = np.argsort(-c_ei)[:n_exploit]
     chosen = set(idx_exploit.tolist())
 
-    # Explore: rank by exploration * normalized novelty
     nov_norm = nov / (np.max(nov) + 1e-12)
     score_explore = expl * nov_norm
     for idx in np.argsort(-score_explore):
@@ -87,21 +177,24 @@ def suggest_candidates(
             chosen.add(int(idx))
 
     chosen_idx = np.array(sorted(chosen), dtype=int)
+
     out = cand_df.iloc[chosen_idx].copy()
     out.insert(0, "rank", np.arange(1, len(out) + 1))
-    out["pred_p_success"] = p[chosen_idx]
+    out["pred_p_success"]   = p[chosen_idx]
     out["pred_target_mean"] = mu[chosen_idx]
-    out["pred_target_sd"] = sd[chosen_idx]
-    out["acq_cEI"] = c_ei[chosen_idx]
-    out["acq_explore"] = expl[chosen_idx]
-    out["novelty_norm"] = nov_norm[chosen_idx]
-    out["direction"] = direction
-    out["conditioned_on"] = _fixed_as_string(fixed_norm)
+    out["pred_target_sd"]   = sd[chosen_idx]
+    out["acq_cEI"]          = c_ei[chosen_idx]
+    out["acq_explore"]      = expl[chosen_idx]
+    out["novelty_norm"]     = nov_norm[chosen_idx]
+    out["direction"]        = direction
+    out["conditioned_on"]   = _fixed_as_string(fixed_norm)
 
     if output_path:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         out.to_csv(output_path, index=False)
+
+    console.print(df_to_table(out))
 
     return out
 
@@ -207,6 +300,8 @@ def find_optimal(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         top.to_csv(output_path, index=False)
 
+    console.print(df_to_table(top))
+
     return top
 
 
@@ -270,114 +365,214 @@ def _build_predictors(ds: xr.Dataset) -> tuple[
 # Search space, conditioning, and featurization
 # =============================================================================
 
-def _infer_search_specs(ds: xr.Dataset, feature_names: list[str], transforms: list[str]) -> list[dict]:
+def _infer_search_specs(
+    ds: xr.Dataset,
+    feature_names: list[str],
+    transforms: list[str],
+    pad_frac: float = 0.10,
+) -> dict[str, dict]:
     """
-    Build per-feature sampling specs directly from the artifact.
-    If a raw per-feature column is missing, reconstruct original-unit values
-    from Xn_train + (mean, std, transform). This avoids KeyErrors like '__success__'.
+    Build per-feature search specs from the *original-unit* columns present in the artifact.
+    Returns dict: name -> spec, where spec is one of:
+      {"type":"float", "lo":float, "hi":float}
+      {"type":"int",   "lo":int,   "hi":int, "step":int (optional)}
+      {"type":"choice","choices": list[int|float], "dtype":"int"|"float"}
     """
-    specs: list[dict] = []
-    for j, name in enumerate(feature_names):
-        tr = str(transforms[j])
+    specs: dict[str, dict] = {}
 
-        raw = feature_raw_from_artifact_or_reconstruct(ds, j, name, tr)
-        if raw.size == 0:
-            # ultra-conservative fallback
-            if tr == "log10":
-                specs.append({"name": name, "transform": tr, "kind": "continuous", "bounds": (1e-6, 1.0)})
+    df_raw = pd.DataFrame({k: ds[k].values for k in ds.data_vars if ds[k].dims == ("row",)})
+    # prefer top-level columns if present
+    for name in feature_names:
+        if name in df_raw.columns:
+            vals = pd.to_numeric(pd.Series(df_raw[name]), errors="coerce").dropna().to_numpy()
+        else:
+            # fallback: reconstruct original units from standardized arrays if needed
+            # (in your artifact, raw columns are stored; so this path is rarely used)
+            vals = pd.to_numeric(pd.Series(ds[name].values), errors="coerce").dropna().to_numpy()
+
+        if vals.size == 0:
+            # degenerate column; fall back to [0,1]
+            specs[name] = {"type": "float", "lo": 0.0, "hi": 1.0}
+            continue
+
+        # detect integer-ish
+        intish = np.all(np.isfinite(vals)) and np.allclose(vals, np.round(vals))
+
+        # robust bounds with padding
+        p1, p99 = np.percentile(vals, [1, 99])
+        span = max(p99 - p1, 1e-12)
+        lo = p1 - pad_frac * span
+        hi = p99 + pad_frac * span
+
+        if intish:
+            lo_i = int(np.floor(lo))
+            hi_i = int(np.ceil(hi))
+            uniq = np.unique(vals.astype(int))
+            # if small finite set, treat as choices
+            if uniq.size <= 20:
+                specs[name] = {"type": "choice", "choices": uniq.tolist(), "dtype": "int"}
             else:
-                specs.append({"name": name, "transform": tr, "kind": "continuous", "bounds": (-2.0, 2.0)})
-            continue
-
-        # Discrete detection (small integer-ish support)
-        uniq = np.unique(raw)
-        is_int_like = np.all(np.isclose(uniq, np.round(uniq)))
-        few_unique = uniq.size <= 20
-
-        if is_int_like and few_unique:
-            specs.append({"name": name, "transform": tr, "kind": "discrete", "choices": uniq.astype(float)})
-            continue
-
-        # Continuous/integer bounds from 1–99% + 10% padding
-        p1, p99 = np.percentile(raw, [1, 99])
-        span = p99 - p1
-        lo, hi = p1 - 0.10 * span, p99 + 0.10 * span
-
-        # Ensure valid range for log10 variables (original units must be > 0)
-        if tr == "log10":
-            lo = max(lo, 1e-12)
-            hi = max(hi, lo * 1.0001)
-
-        kind = "integer" if is_int_like else "continuous"
-        specs.append({"name": name, "transform": tr, "kind": kind, "bounds": (float(lo), float(hi))})
-
+                specs[name] = {"type": "int", "lo": lo_i, "hi": hi_i}
+        else:
+            specs[name] = {"type": "float", "lo": float(lo), "hi": float(hi)}
     return specs
 
 
-def _normalize_fixed(fixed: dict[str, float], specs: list[dict]) -> dict[str, float]:
+def _normalize_fixed(
+    fixed_raw: dict[str, object],
+    specs: dict[str, dict],
+) -> dict[str, object]:
     """
-    Validate & normalize fixed dict to match the search specs:
-      - discrete: snap to nearest available choice
-      - integer: round and clamp to bounds
-      - continuous: clamp to bounds
-      - log10 vars must be > 0 (original units)
+    Normalize user constraints to sanitized forms within inferred bounds.
+    Keeps the *shape*:
+      - number (int/float)  -> fixed (clipped to [lo,hi])
+      - slice(lo, hi)       -> float range (clipped to [lo,hi])
+      - list/tuple          -> finite choices (filtered to within [lo,hi], cast to int for int specs)
+    Returns a dict usable directly by _sample_candidates.
     """
-    if not fixed:
-        return {}
-    spec_by_name = {s["name"]: s for s in specs}
-    out: dict[str, float] = {}
-    for k, v in fixed.items():
-        if k not in spec_by_name:
-            raise KeyError(f"Fixed variable '{k}' is not a model feature.")
-        s = spec_by_name[k]
-        if not np.isfinite(v):
-            raise ValueError(f"Fixed value for '{k}' is not finite.")
-        if s["transform"] == "log10" and v <= 0:
-            raise ValueError(f"Fixed value for '{k}' must be > 0 (log10 transform).")
-        kind = s["kind"]
-        if kind == "discrete":
-            choices = np.asarray(s["choices"], float)
-            idx = int(np.argmin(np.abs(choices - v)))
-            out[k] = float(choices[idx])
-        elif kind == "integer":
-            lo, hi = s["bounds"]
-            vv = int(np.round(v))
-            out[k] = float(np.clip(vv, int(np.floor(lo)), int(np.ceil(hi))))
-        else:  # continuous
-            lo, hi = s["bounds"]
-            out[k] = float(np.clip(v, lo, hi))
-    return out
+    fixed_norm: dict[str, object] = {}
+
+    for name, val in (fixed_raw or {}).items():
+        if name not in specs:
+            # unknown feature already warned upstream; skip silently here
+            continue
+
+        sp = specs[name]
+        typ = sp["type"]
+
+        # helper clamps
+        def _clip_float(x: float) -> float:
+            return float(np.clip(x, sp["lo"], sp["hi"]))
+
+        def _clip_int(x: int) -> int:
+            lo, hi = int(sp.get("lo", x)), int(sp.get("hi", x))
+            return int(np.clip(int(round(x)), lo, hi))
+
+        # numeric fixed
+        if isinstance(val, (int, float, np.number)):
+            if typ == "int":
+                fixed_norm[name] = _clip_int(int(round(val)))
+            elif typ == "choice" and sp.get("dtype") == "int":
+                fixed_norm[name] = _clip_int(int(round(val)))
+            else:
+                fixed_norm[name] = _clip_float(float(val))
+            continue
+
+        # float range via slice(lo, hi)
+        if isinstance(val, slice):
+            lo = float(val.start)
+            hi = float(val.stop)
+            if lo > hi:
+                lo, hi = hi, lo
+            if typ in ("float", "choice") and sp.get("dtype") != "int":
+                lo_c = _clip_float(lo); hi_c = _clip_float(hi)
+                if lo_c > hi_c: lo_c, hi_c = hi_c, lo_c
+                fixed_norm[name] = slice(lo_c, hi_c)
+            else:
+                # int spec: convert to inclusive integer tuple
+                lo_i = _clip_int(int(np.floor(lo)))
+                hi_i = _clip_int(int(np.ceil(hi)))
+                choices = tuple(range(lo_i, hi_i + 1))
+                fixed_norm[name] = choices
+            continue
+
+        # choices via list/tuple
+        if isinstance(val, (list, tuple)):
+            if typ in ("int",) or (typ == "choice" and sp.get("dtype") == "int"):
+                vv = [ _clip_int(int(round(x))) for x in val ]
+                # de-dup and sort
+                vv = sorted(set(vv))
+                if not vv:
+                    # fallback to center
+                    center = _clip_int(int(np.round((sp["lo"] + sp["hi"]) / 2)))
+                    vv = [center]
+                fixed_norm[name] = tuple(vv)
+            else:
+                vv = [ _clip_float(float(x)) for x in val ]
+                vv = sorted(set(vv))
+                if not vv:
+                    center = _clip_float((sp["lo"] + sp["hi"]) / 2.0)
+                    vv = [center]
+                # keep list/tuple shape (tuple preferred)
+                fixed_norm[name] = tuple(vv)
+            continue
+
+        # otherwise: ignore incompatible type
+        # (you could raise here if you prefer a hard failure)
+    return fixed_norm
 
 
 def _sample_candidates(
-    specs: list[dict],
+    specs: dict[str, dict],
     n: int,
     rng: np.random.Generator,
-    fixed: Optional[dict[str, float]] = None,
+    fixed: dict[str, object] | None = None,
 ) -> pd.DataFrame:
+    """
+    Sample n candidates in ORIGINAL units given search specs and optional fixed constraints.
+    """
     fixed = fixed or {}
-    cols = {}
-    for spec in specs:
-        name = spec["name"]
-        if name in fixed:
-            cols[name] = np.full(n, fixed[name], dtype=float)
-            continue
+    cols: dict[str, np.ndarray] = {}
 
-        kind = spec["kind"]; tr = spec["transform"]
-        if kind == "discrete":
-            choices = spec["choices"]
-            cols[name] = rng.choice(choices, size=n)
-        else:
-            lo, hi = spec["bounds"]
-            if tr == "log10":
-                lo, hi = max(lo, 1e-12), max(hi, lo * 1.0001)
-                cols[name] = 10 ** rng.uniform(np.log10(lo), np.log10(hi), size=n)
-            elif kind == "integer":
-                cols[name] = rng.integers(int(np.floor(lo)), int(np.ceil(hi)) + 1, size=n)
-            else:
+    for name, sp in specs.items():
+        typ = sp["type"]
+
+        # If fixed: honor numeric / slice / choices shape
+        if name in fixed:
+            val = fixed[name]
+
+            # numeric: constant column
+            if isinstance(val, (int, float, np.number)):
+                cols[name] = np.full(n, val, dtype=float)
+
+            # float range slice
+            elif isinstance(val, slice):
+                lo = float(val.start); hi = float(val.stop)
+                if lo > hi: lo, hi = hi, lo
                 cols[name] = rng.uniform(lo, hi, size=n)
 
-    return pd.DataFrame(cols)
+            # choices: list/tuple -> sample from set
+            elif isinstance(val, (list, tuple)):
+                arr = np.array(val, dtype=float)
+                if arr.size == 0:
+                    # fallback to center of spec
+                    if typ == "int":
+                        center = int(np.round((sp["lo"] + sp["hi"]) / 2))
+                        arr = np.array([center], dtype=float)
+                    else:
+                        center = (sp["lo"] + sp["hi"]) / 2.0
+                        arr = np.array([center], dtype=float)
+                idx = rng.integers(0, len(arr), size=n)
+                cols[name] = arr[idx]
+
+            else:
+                # unknown fixed type; fallback to spec sampling
+                if typ == "choice":
+                    choices = np.asarray(sp["choices"], dtype=float)
+                    idx = rng.integers(0, len(choices), size=n)
+                    cols[name] = choices[idx]
+                elif typ == "int":
+                    cols[name] = rng.integers(int(sp["lo"]), int(sp["hi"]) + 1, size=n).astype(float)
+                else:
+                    cols[name] = rng.uniform(sp["lo"], sp["hi"], size=n)
+
+        else:
+            # Not fixed: sample from spec
+            if typ == "choice":
+                choices = np.asarray(sp["choices"], dtype=float)
+                idx = rng.integers(0, len(choices), size=n)
+                cols[name] = choices[idx]
+            elif typ == "int":
+                cols[name] = rng.integers(int(sp["lo"]), int(sp["hi"]) + 1, size=n).astype(float)
+            else:
+                cols[name] = rng.uniform(sp["lo"], sp["hi"], size=n)
+
+    df = pd.DataFrame(cols)
+    # ensure integer columns are ints if the spec says so (pretty output)
+    for name, sp in specs.items():
+        if sp["type"] == "int" or (sp["type"] == "choice" and sp.get("dtype") == "int"):
+            df[name] = df[name].round().astype(int)
+    return df
 
 
 def _original_df_to_standardized(
@@ -449,9 +644,78 @@ def _best_feasible_observed(ds: xr.Dataset, direction: str) -> float:
     return float(np.nanmin(y_ok))
 
 
-def _fixed_as_string(fixed: dict[str, float]) -> str:
-    if not fixed:
-        return ""
-    items = [f"{k}={v:.6g}" for k, v in sorted(fixed.items())]
-    return "; ".join(items)
+def _is_number(x) -> bool:
+    return isinstance(x, (int, float, np.integer, np.floating))
 
+
+def _fmt_num(x) -> str:
+    try:
+        return f"{float(x):.6g}"
+    except Exception:
+        return str(x)
+
+
+def _fixed_as_string(fixed: dict) -> str:
+    """
+    Human-readable constraints:
+      - number  -> k=12 or k=0.00123
+      - slice   -> k=lo:hi   (inclusive; None shows as -inf/inf)
+      - list/tuple -> k=[v1, v2, ...]
+      - range   -> k=[start, stop, step]  (rare; usually normalized earlier)
+      - other scalars (str/bool) -> k=value
+    Keys are sorted for stability.
+    """
+    parts: list[str] = []
+    for k in sorted(fixed.keys()):
+        v = fixed[k]
+        if isinstance(v, slice):
+            a = "-inf" if v.start is None else _fmt_num(v.start)
+            b =  "inf" if v.stop  is None else _fmt_num(v.stop)
+            parts.append(f"{k}={a}:{b}")
+        elif isinstance(v, range):
+            parts.append(f"{k}=[{', '.join(_fmt_num(u) for u in (v.start, v.stop, v.step))}]")
+        elif isinstance(v, (list, tuple, np.ndarray)):
+            elems = ", ".join(_fmt_num(u) if _is_number(u) else str(u) for u in v)
+            parts.append(f"{k}=[{elems}]")
+        elif _is_number(v):
+            parts.append(f"{k}={_fmt_num(v)}")
+        else:
+            # fallback for str/bool/other scalars
+            parts.append(f"{k}={v}")
+    return ", ".join(parts)
+
+
+def _apply_user_bounds(
+    specs: dict[str, dict[str, Any]],
+    ranges: dict[str, tuple[float, float]],
+    choices: dict[str, list[float]],
+) -> None:
+    """
+    Mutate `specs` with user-provided bounds/choices.
+    """
+    for name, (lo, hi) in ranges.items():
+        if name not in specs:
+            continue
+        sp = specs[name]
+        sp["kind"] = sp.get("kind", "float")
+        if sp["kind"] == "choice":
+            # Convert to float/int range if user provided range for a choice var
+            sp["kind"] = "float"
+        sp["low"] = float(lo)
+        sp["high"] = float(hi)
+        sp.pop("choices", None)
+
+    for name, opts in choices.items():
+        if name not in specs:
+            continue
+        sp = specs[name]
+        # Keep kind="choice" and store list
+        sp["kind"] = "choice"
+        # Cast ints if all values are close to ints
+        if all(abs(v - round(v)) < 1e-12 for v in opts):
+            sp["choices"] = [int(round(v)) for v in opts]
+        else:
+            sp["choices"] = [float(v) for v in opts]
+        # Drop bounds (not used for choice)
+        sp.pop("low", None)
+        sp.pop("high", None)
