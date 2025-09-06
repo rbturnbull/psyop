@@ -491,8 +491,8 @@ def make_pairplot(
 
 def make_partial_dependence1D(
     model: Path,
-    output: Path,
-    csv_out: Path = None,
+    output: Path | None = None,
+    csv_out: Path | None = None,
     n_points_1d: int = 300,
     line_color: str = "rgb(31,119,180)",
     band_alpha: float = 0.25,
@@ -501,19 +501,19 @@ def make_partial_dependence1D(
     use_log_scale_for_target_y: bool = True,   # log-y for target
     log_y_epsilon: float = 1e-9,
     optimal: bool = True,
-    suggest:int = 0,
+    suggest: int = 0,
     **kwargs,
 ) -> None:
     """
-    Vertical 1D PD panels of E[target|success] vs each *free* feature:
-      - single colour & legend across variables
-      - ±2σ band, mean curve
-      - shading where P(success)<0.8 (darker) and <0.5 (lighter)
-      - experimental points: successes (black); failures (red w/ black outline)
+    Vertical 1D PD panels of E[target|success] vs each *free* feature.
     Any feature passed via kwargs (e.g. --epochs 20) is clamped in the slice and not plotted.
+    Slices (a:b) narrow the sweep; lists/tuples become discrete grids.
     """
-    optimal_df = find_optimal(model, count=1, **kwargs) if optimal else None
-    suggest_df = suggest_candidates(model, count=suggest, **kwargs) if suggest and suggest > 0 else None
+    import numpy as np
+    import pandas as pd
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import xarray as xr
 
     ds = xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
@@ -527,26 +527,77 @@ def make_partial_dependence1D(
     Xn_train = ds["Xn_train"].values.astype(float)
     p = Xn_train.shape[1]
 
-    # --- fixed slice from kwargs (only match exact feature names) ---
-    kw_fixed = {k: v for k, v in kwargs.items() if k in feature_names}
+    # --- canonicalize kwargs keys to real feature names (accept hyphens/underscores/case) ---
+    idx_map = _canon_key_set(ds)  # helper already present in the module
+    kw_fixed_raw: dict[str, object] = {}
+    for k, v in kwargs.items():
+        if k in idx_map:
+            kw_fixed_raw[idx_map[k]] = v
+        else:
+            # try normalized key (same rule as plot2d)
+            import re
+            nk = re.sub(r"[^a-z0-9]+", "", str(k).lower())
+            if nk in idx_map:
+                kw_fixed_raw[idx_map[nk]] = v
 
-    # Base standardized point (median), then apply fixed values
+    # --- split constraints into: scalar fixes, slice ranges, and discrete choices (all in STANDARDIZED space) ---
+    fixed_scalars: dict[int, float] = {}
+    range_windows: dict[int, tuple[float, float]] = {}
+    choice_values: dict[int, np.ndarray] = {}
+
+    for j, name in enumerate(feature_names):
+        if name not in kw_fixed_raw:
+            continue
+        val = kw_fixed_raw[name]
+        if isinstance(val, slice):
+            lo = _orig_to_std(j, val.start, transforms, X_mean, X_std)
+            hi = _orig_to_std(j, val.stop,  transforms, X_mean, X_std)
+            lo, hi = float(min(lo, hi)), float(max(lo, hi))
+            range_windows[j] = (lo, hi)
+        elif isinstance(val, (list, tuple)):
+            choice_values[j] = _orig_to_std(j, np.asarray(val, dtype=float), transforms, X_mean, X_std)
+        else:
+            fixed_scalars[j] = float(_orig_to_std(j, float(val), transforms, X_mean, X_std))
+
+    # --- optional overlays (use canonical keys so opt/suggest see the same constraints) ---
+    optimal_df  = find_optimal(model, count=1, **kw_fixed_raw) if optimal else None
+    suggest_df  = suggest_candidates(model, count=suggest, **kw_fixed_raw) if (suggest and suggest > 0) else None
+
+    # --- base standardized point (median), then apply scalar fixes ---
     base_std = np.median(Xn_train, axis=0)
-    if kw_fixed:
-        base_std = _apply_fixed_to_base(base_std, kw_fixed, feature_names, transforms, X_mean, X_std)
+    for j, vstd in fixed_scalars.items():
+        base_std[j] = vstd
 
-    # Determine which features to PLOT (exclude fixed ones)
-    free_idx = [j for j, name in enumerate(feature_names) if name not in kw_fixed]
-    if len(free_idx) == 0:
+    # --- features to PLOT (exclude only scalar-fixed) ---
+    free_idx = [j for j in range(p) if j not in fixed_scalars]
+    if not free_idx:
         raise ValueError("All features are fixed; nothing to plot. Fix fewer variables.")
 
-    # Build standardized sweeps only for FREE features
-    sweeps_std = {
-        j: np.linspace(*np.percentile(Xn_train[:, j], [1, 99]), n_points_1d)
-        for j in free_idx
-    }
+    # --- empirical 1–99% bounds (standardized) to keep grids reasonable ---
+    p01p99 = [np.percentile(Xn_train[:, j], [1, 99]) for j in range(p)]
 
-    # Masks and data for experimental points
+    def _grid_1d(j: int, n: int) -> np.ndarray:
+        """Standardized sweep for feature j respecting ranges/choices."""
+        p01, p99 = p01p99[j]
+        if j in choice_values:
+            vals = np.asarray(choice_values[j], dtype=float)
+            vals = vals[(vals >= p01) & (vals <= p99)]
+            if vals.size == 0:
+                # fallback: median to avoid empty axis
+                return np.array([np.median(Xn_train[:, j])], dtype=float)
+            return np.unique(np.sort(vals))
+        lo, hi = p01, p99
+        if j in range_windows:
+            rlo, rhi = range_windows[j]
+            lo, hi = max(lo, rlo), min(hi, rhi)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = p01, max(p01 + 1e-9, p99)
+        return np.linspace(lo, hi, n)
+
+    # Build standardized sweeps for FREE features
+    sweeps_std = {j: _grid_1d(j, n_points_1d) for j in free_idx}
+
+    # --- experimental data masks ---
     tgt_col = str(ds.attrs["target_column"])
     success_mask = ~pd.isna(df_raw[tgt_col]).to_numpy()
     fail_mask    = ~success_mask
@@ -554,10 +605,10 @@ def make_partial_dependence1D(
     trial_ids_success = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask]
     trial_ids_fail    = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
 
-    # Helpers for colour fill
+    # --- style helpers ---
     band_fill_rgba = _rgb_to_rgba(line_color, band_alpha)
 
-    # Figure with rows = number of FREE features
+    # --- figure with rows for FREE features only ---
     free_names = [feature_names[j] for j in free_idx]
     fig = make_subplots(
         rows=len(free_idx), cols=1, shared_xaxes=False,
@@ -571,13 +622,15 @@ def make_partial_dependence1D(
         Xn_grid = np.repeat(base_std[None, :], len(grid), axis=0)
         Xn_grid[:, j] = grid
 
+        # predictions
         p_grid = pred_success(Xn_grid)
         mu_grid, sd_grid = pred_loss(Xn_grid, include_observation_noise=True)
 
+        # x axis in ORIGINAL units
         x_internal = grid * X_std[j] + X_mean[j]
         x_display  = _inverse_transform(transforms[j], x_internal)
 
-        # Target transforms for plotting
+        # Y transforms
         if use_log_scale_for_target_y:
             mu_plot = np.maximum(mu_grid, log_y_epsilon)
             lo_plot = np.maximum(mu_grid - 2.0 * sd_grid, log_y_epsilon)
@@ -589,11 +642,10 @@ def make_partial_dependence1D(
             hi_plot = mu_grid + 2.0 * sd_grid
             losses_s_plot = losses_success
 
-        # Y-range pad; include observed successes
+        # Y-range incl. observed successes
         y_arrays = [lo_plot, hi_plot] + ([losses_s_plot] if losses_s_plot.size else [])
-        y_low  = float(np.nanmin([np.nanmin(arr) for arr in y_arrays]))
-        y_high = float(np.nanmax([np.nanmax(arr) for arr in y_arrays]))
-
+        y_low  = float(np.nanmin([np.nanmin(a) for a in y_arrays]))
+        y_high = float(np.nanmax([np.nanmax(a) for a in y_arrays]))
         pad = 0.05 * (y_high - y_low + 1e-12)
         y0_plot = (y_low - pad) if not use_log_scale_for_target_y else max(y_low / 1.5, log_y_epsilon)
         y1_tmp  = (y_high + pad) if not use_log_scale_for_target_y else y_high * 1.2
@@ -602,32 +654,26 @@ def make_partial_dependence1D(
             y_failed_band = max(10.0 * log_y_epsilon, y_high * 2.0)
         y1_plot = y_failed_band + (0.02 if not use_log_scale_for_target_y else 0.05) * (y_high - y_low + 1e-12)
 
-        # Shading (below the PD)
+        # shading + PD band + mean
         _add_low_success_shading_1d(fig, row_pos, x_display, p_grid, y0_plot, y1_plot)
 
-        # ±2σ band (legend shown only once)
         show_legend = (row_pos == 1)
-        fig.add_trace(go.Scatter(
-            x=x_display, y=lo_plot, mode="lines",
-            line=dict(width=0, color=line_color),
-            name="±2σ", legendgroup="band", showlegend=False, hoverinfo="skip"
-        ), row=row_pos, col=1)
-        fig.add_trace(go.Scatter(
-            x=x_display, y=hi_plot, mode="lines", fill="tonexty",
-            line=dict(width=0, color=line_color), fillcolor=band_fill_rgba,
-            name="±2σ", legendgroup="band", showlegend=show_legend,
-            hovertemplate="E[target|success]: %{y:.3f}<extra>±2σ</extra>"
-        ), row=row_pos, col=1)
+        fig.add_trace(go.Scatter(x=x_display, y=lo_plot, mode="lines",
+                                 line=dict(width=0, color=line_color),
+                                 name="±2σ", legendgroup="band", showlegend=False, hoverinfo="skip"),
+                      row=row_pos, col=1)
+        fig.add_trace(go.Scatter(x=x_display, y=hi_plot, mode="lines", fill="tonexty",
+                                 line=dict(width=0, color=line_color), fillcolor=band_fill_rgba,
+                                 name="±2σ", legendgroup="band", showlegend=show_legend,
+                                 hovertemplate="E[target|success]: %{y:.3f}<extra>±2σ</extra>"),
+                      row=row_pos, col=1)
+        fig.add_trace(go.Scatter(x=x_display, y=mu_plot, mode="lines",
+                                 line=dict(width=2, color=line_color),
+                                 name="E[target|success]", legendgroup="mean", showlegend=show_legend,
+                                 hovertemplate=f"{feature_names[j]}: %{{x:.6g}}<br>E[target|success]: %{{y:.3f}}<extra></extra>"),
+                      row=row_pos, col=1)
 
-        # Mean curve
-        fig.add_trace(go.Scatter(
-            x=x_display, y=mu_plot, mode="lines",
-            line=dict(width=2, color=line_color),
-            name="E[target|success]", legendgroup="mean", showlegend=show_legend,
-            hovertemplate=f"{feature_names[j]}: %{{x:.6g}}<br>E[target|success]: %{{y:.3f}}<extra></extra>"
-        ), row=row_pos, col=1)
-
-        # Experimental successes/failures for this feature (x vs observed target)
+        # Experimental points
         if feature_names[j] in df_raw.columns:
             x_data_all = df_raw[feature_names[j]].to_numpy().astype(float)
         else:
@@ -635,68 +681,55 @@ def make_partial_dependence1D(
 
         x_succ = x_data_all[success_mask]
         if x_succ.size:
-            fig.add_trace(go.Scattergl(
-                x=x_succ, y=losses_s_plot,
-                mode="markers",
-                marker=dict(size=5, color="black", line=dict(width=0)),
-                name="data (success)", legendgroup="data_s", showlegend=show_legend,
-                hovertemplate=(
-                    "trial_id: %{customdata}<br>"
-                    f"{feature_names[j]}: %{{x:.6g}}<br>"
-                    f"{tgt_col}: %{{y:.4f}}<extra></extra>"
-                ),
-                customdata=trial_ids_success
-            ), row=row_pos, col=1)
+            fig.add_trace(go.Scattergl(x=x_succ, y=losses_s_plot, mode="markers",
+                                       marker=dict(size=5, color="black", line=dict(width=0)),
+                                       name="data (success)", legendgroup="data_s", showlegend=show_legend,
+                                       hovertemplate=("trial_id: %{customdata}<br>"
+                                                      f"{feature_names[j]}: %{{x:.6g}}<br>"
+                                                      f"{tgt_col}: %{{y:.4f}}<extra></extra>"),
+                                       customdata=trial_ids_success),
+                          row=row_pos, col=1)
 
         x_fail = x_data_all[fail_mask]
         if x_fail.size:
             y_fail_plot = np.full_like(x_fail, y_failed_band, dtype=float)
+            fig.add_trace(go.Scattergl(x=x_fail, y=y_fail_plot, mode="markers",
+                                       marker=dict(size=6, color="red", line=dict(color="black", width=0.8)),
+                                       name="data (failed)", legendgroup="data_f", showlegend=show_legend,
+                                       hovertemplate=("trial_id: %{customdata}<br>"
+                                                      f"{feature_names[j]}: %{{x:.6g}}<br>"
+                                                      "status: failed (NaN target)<extra></extra>"),
+                                       customdata=trial_ids_fail),
+                          row=row_pos, col=1)
+
+        # Overlays
+        if optimal_df is not None and feature_names[j] in optimal_df.columns:
+            x_opt = optimal_df[feature_names[j]].values
+            y_opt = optimal_df["pred_target_mean"].values
+            y_sd  = optimal_df["pred_target_sd"].values
             fig.add_trace(go.Scattergl(
-                x=x_fail, y=y_fail_plot, mode="markers",
-                marker=dict(size=6, color="red", line=dict(color="black", width=0.8)),
-                name="data (failed)", legendgroup="data_f", showlegend=show_legend,
-                hovertemplate=(
-                    "trial_id: %{customdata}<br>"
-                    f"{feature_names[j]}: %{{x:.6g}}<br>"
-                    "status: failed (NaN target)<extra></extra>"
-                ),
-                customdata=trial_ids_fail
+                x=x_opt, y=y_opt, mode="markers",
+                marker=dict(size=10, color="yellow", line=dict(color="black", width=1.5), symbol="x"),
+                name="optimal", legendgroup="optimal", showlegend=show_legend,
+                hovertemplate=(f"predicted: %{{y:.3g}} ± {y_sd[0]:.3g}<br>"
+                               f"{feature_names[j]}: %{{x:.6g}}<extra></extra>")
             ), row=row_pos, col=1)
 
-        if optimal:
-            if feature_names[j] in optimal_df.columns:
-                x_opt = optimal_df[feature_names[j]].values
-                pred_target_mean = optimal_df["pred_target_mean"].values[0]
-                pred_target_sd   = optimal_df["pred_target_sd"].values[0]
-                fig.add_trace(go.Scattergl(
-                    x=x_opt, y=[pred_target_mean], mode="markers",
-                    marker=dict(size=10, color="yellow", line=dict(color="black", width=1.5), symbol="x"),
-                    name="optimal", legendgroup="optimal", showlegend=show_legend,
-                    hovertemplate=(
-                        f"predicted: {pred_target_mean:.2g} ± {pred_target_sd:.2g}<br>"
-                        f"{feature_names[j]}: %{{x:.6g}}<extra></extra>"
-                    ),
-                ), row=row_pos, col=1)
-
         if suggest_df is not None and feature_names[j] in suggest_df.columns:
-            x_suggest = suggest_df[feature_names[j]].values
-            pred_suggest_mean = suggest_df["pred_target_mean"].values[0]
-            pred_suggest_sd = suggest_df["pred_target_sd"].values[0]
+            x_sug = suggest_df[feature_names[j]].values
+            y_sug = suggest_df["pred_target_mean"].values
             fig.add_trace(go.Scattergl(
-                x=x_suggest, y=[pred_suggest_mean], mode="markers",
-                marker=dict(size=10, color="cyan", line=dict(color="black", width=1.5), symbol="star"),
+                x=x_sug, y=y_sug, mode="markers",
+                marker=dict(size=9, color="cyan", line=dict(color="black", width=1.2), symbol="star"),
                 name="suggested", legendgroup="suggested", showlegend=show_legend,
-                hovertemplate=(
-                    f"predicted: {pred_suggest_mean:.2g} ± {pred_suggest_sd:.2g}<br>"
-                    f"{feature_names[j]}: %{{x:.6g}}<extra></extra>"
-                ),
+                hovertemplate=(f"predicted: %{{y:.3g}}<br>"
+                               f"{feature_names[j]}: %{{x:.6g}}<extra></extra>")
             ), row=row_pos, col=1)
 
         # Axes
         _maybe_log_axis(fig, row_pos, 1, feature_names[j], axis="x", transforms=transforms, j=j)
         fig.update_yaxes(title_text=f"{tgt_col} (E[target|success])", row=row_pos, col=1)
-        _set_yaxis_range(fig, row=row_pos, col=1,
-                         y0=y0_plot, y1=y1_plot,
+        _set_yaxis_range(fig, row=row_pos, col=1, y0=y0_plot, y1=y1_plot,
                          log=use_log_scale_for_target_y, eps=log_y_epsilon)
         fig.update_xaxes(title_text=feature_names[j], row=row_pos, col=1)
 
@@ -711,19 +744,42 @@ def make_partial_dependence1D(
                 "success_probability": float(p_i),
             })
 
+    # Title w/ constraints summary (original kwargs as user passed)
+    def _fmt_c(v):
+        if isinstance(v, slice):
+            a = "" if v.start is None else f"{v.start:g}"
+            b = "" if v.stop  is None else f"{v.stop:g}"
+            return f"[{a},{b}]"
+        if isinstance(v, (list, tuple, np.ndarray)):
+            return "[" + ",".join(f"{x:g}" for x in np.asarray(v).tolist()) + "]"
+        try:
+            return f"{float(v):g}"
+        except Exception:
+            return str(v)
+
+    title = "1D Partial Dependence of Expected Target (conditioned slice)"
+    if kw_fixed_raw:
+        parts = [f"{k}={_fmt_c(kw_fixed_raw[k])}" for k in kw_fixed_raw]
+        title += " — " + ", ".join(parts)
+
     fig.update_layout(
         height=figure_height_per_row_px * len(free_idx),
         template="simple_white",
-        title="1D Partial Dependence of Expected Target (conditioned slice)",
+        title=title,
         legend_title_text=""
     )
 
-    fig.write_html(str(output), include_plotlyjs="cdn")
+    # Output
+    if output:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.write_html(str(output), include_plotlyjs="cdn")
     if csv_out:
+        csv_out = Path(csv_out)
+        csv_out.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(tidy_rows).to_csv(str(csv_out), index=False)
     if show_figure:
         fig.show("browser")
-
 
 
 # =============================================================================
