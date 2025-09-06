@@ -418,15 +418,12 @@ def plot2d(
     if model.suffix.lower() not in {".nc", ".netcdf"}:
         console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
-    if output is None:
-        output = _default_out_for(model, stem_suffix="__pairplot", ext=".html")
-    _ensure_parent_dir(output)
+    model_nc = _force_netcdf_suffix(model)
 
-    kwargs = _parse_unknown_cli_kv(ctx.args)
-    kwargs, _ = _canonicalize_fixed_keys(_force_netcdf_suffix(model), kwargs)
+    constraints = parse_constraints_from_ctx(ctx, model_nc)
 
     make_pairplot(
-        model=_force_netcdf_suffix(model),
+        model=model,
         output=output,
         n_points_1d=n_points_1d,
         n_points_2d=n_points_2d,
@@ -435,13 +432,14 @@ def plot2d(
         colourscale=colourscale,
         show=show,
         n_contours=n_contours,
-        **kwargs,
+        **constraints,
     )
-    console.print(f"[green]Wrote pairplot →[/] {output}")
+    if output:
+        console.print(f"[green]Wrote pairplot →[/] {output}")
 
 
 @app.command(
-    help="Create 1D PD panels with shading & experimental points.",
+    help="Create 1D Partial Dependence panels.",
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )
 def plot1d(
@@ -462,18 +460,12 @@ def plot1d(
     if model.suffix.lower() not in {".nc", ".netcdf"}:
         console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
-    if output is None:
-        output = _default_out_for(model, stem_suffix="__pd_1d", ext=".html")
-    if csv_out is None:
-        csv_out = _default_out_for(model, stem_suffix="__pd_1d", ext=".csv")
-    _ensure_parent_dir(output)
-    _ensure_parent_dir(csv_out)
+    model_nc = _force_netcdf_suffix(model)
 
-    kwargs = _parse_unknown_cli_kv(ctx.args)
-    kwargs, _ = _canonicalize_fixed_keys(_force_netcdf_suffix(model), kwargs)
+    constraints = parse_constraints_from_ctx(ctx, model_nc)
 
     make_partial_dependence1D(
-        model=_force_netcdf_suffix(model),
+        model=model_nc,
         output=output,
         csv_out=csv_out,
         n_points_1d=n_points_1d,
@@ -483,10 +475,12 @@ def plot1d(
         show_figure=show_figure,
         use_log_scale_for_target_y=use_log_scale_for_target_y,
         log_y_epsilon=log_y_epsilon,
-        **kwargs,
+        **constraints,
     )
-    console.print(f"[green]Wrote PD HTML →[/] {output}")
-    console.print(f"[green]Wrote PD CSV  →[/] {csv_out}")
+    if output:
+        console.print(f"[green]Wrote PD HTML →[/] {output}")
+    if csv_out:
+        console.print(f"[green]Wrote PD CSV  →[/] {csv_out}")
 
 
 if __name__ == "__main__":

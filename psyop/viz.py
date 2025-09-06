@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
-
+import re
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -21,6 +21,25 @@ from .opt import (
     suggest_candidates,
     find_optimal,
 )
+
+
+def _canon_key_set(ds) -> dict[str, str]:
+    feats = [str(x) for x in ds["feature"].values.tolist()]
+    def _norm(s: str) -> str:
+        import re
+        return re.sub(r"[^a-z0-9]+", "", s.lower())
+    return {**{f: f for f in feats}, **{_norm(f): f for f in feats}}
+
+def _apply_transform_name(tr: str, x):
+    x = np.asarray(x, dtype=float)
+    if tr == "log10":
+        return np.log10(np.maximum(x, 1e-300))
+    return x
+
+def _orig_to_std(j: int, vals, transforms, X_mean, X_std):
+    raw = _apply_transform_name(transforms[j], np.asarray(vals, dtype=float))
+    return (raw - X_mean[j]) / X_std[j]
+
 
 
 def _edges_from_centers(vals: np.ndarray, is_log: bool) -> tuple[float, float]:
@@ -73,13 +92,10 @@ def _update_axis_type_and_range(
         else:
             fig.update_yaxes(range=[lo, hi], row=row, col=col)
 
-def _is_log_feature(j: int, transforms: list[str]) -> bool:
-    return str(transforms[j]).lower() == "log10"
-
 
 def make_pairplot(
     model: Path,
-    output: Path,
+    output: Path| None = None,
     n_points_1d: int = 300,
     n_points_2d: int = 70,
     use_log_scale_for_target: bool = False,   # log10 colours for heatmaps
@@ -95,10 +111,6 @@ def make_pairplot(
     conditioned on fixed variables passed as kwargs, e.g. --epochs 20.
     Fixed variables are clamped in the slice and **not plotted** as axes.
     """
-    import numpy as np
-    import pandas as pd
-    import xarray as xr
-
     optimal_df = find_optimal(model, count=1, **kwargs) if optimal else None
 
     ds = xr.load_dataset(model)
@@ -121,30 +133,71 @@ def make_pairplot(
     Xn_train = ds["Xn_train"].values.astype(float)
     p = Xn_train.shape[1]
 
+    # --- map kwargs keys to real feature names (accept hyphens/underscores/case)
+    idx = _canon_key_set(ds)
+    kw_fixed_raw = {}
+    for k, v in kwargs.items():
+        if k in idx: kw_fixed_raw[idx[k]] = v
+        else:
+            nk = re.sub(r"[^a-z0-9]+", "", k.lower())
+            if nk in idx: kw_fixed_raw[idx[nk]] = v
+
+    # --- split constraints:
+    # scalars -> fix & hide axis; slice -> [lo,hi] window; list/tuple -> discrete grid
+    fixed_scalars: dict[int, float] = {}
+    range_windows: dict[int, tuple[float, float]] = {}
+    choice_values: dict[int, np.ndarray] = {}
+
+    for j, name in enumerate(feature_names):
+        if name not in kw_fixed_raw: 
+            continue
+        val = kw_fixed_raw[name]
+        if isinstance(val, slice):
+            # endpoints are in ORIGINAL units → convert to standardized
+            lo = _orig_to_std(j, val.start, transforms, X_mean, X_std)
+            hi = _orig_to_std(j, val.stop,  transforms, X_mean, X_std)
+            lo, hi = (float(min(lo, hi)), float(max(lo, hi)))
+            range_windows[j] = (lo, hi)
+        elif isinstance(val, (list, tuple)):
+            # choices in ORIGINAL units → convert each to standardized
+            choice_values[j] = _orig_to_std(j, np.array(val, dtype=float), transforms, X_mean, X_std)
+        else:
+            # scalar in ORIGINAL units → fix & hide axis
+            fixed_scalars[j] = float(_orig_to_std(j, float(val), transforms, X_mean, X_std))
+
     # --- base point in standardized space; apply fixed slice there
     base_std = np.median(Xn_train, axis=0)
-    if kw_fixed:
-        base_std = _apply_fixed_to_base(base_std, kw_fixed, feature_names, transforms, X_mean, X_std)
+    for j, vstd in fixed_scalars.items():
+        base_std[j] = vstd
 
-    # --- choose which features to PLOT (exclude fixed)
-    free_idx = [j for j, name in enumerate(feature_names) if name not in kw_fixed]
-    if len(free_idx) == 0:
-        # Nothing to plot if everything is fixed
-        raise ValueError("All features are fixed; nothing to plot. Fix fewer variables.")
+    free_idx = [j for j in range(len(feature_names)) if j not in fixed_scalars]
+    if not free_idx:
+        raise ValueError("All features are fixed; nothing to plot.")
 
     # helper to test if a feature is log on axis
     def _is_log_feature(j: int) -> bool:
         return (transforms[j] == "log10")
 
     # 1D / 2D sweep ranges for *all* features (we'll index by free_idx)
-    ranges_1d_std = [
-        np.linspace(*np.percentile(Xn_train[:, j], [1, 99]), n_points_1d)
-        for j in range(p)
-    ]
-    ranges_2d_std = [
-        np.linspace(*np.percentile(Xn_train[:, j], [1, 99]), n_points_2d)
-        for j in range(p)
-    ]
+    p01p99 = [np.percentile(Xn_train[:, j], [1, 99]) for j in range(len(feature_names))]
+
+    def _grid_1d(j: int, n: int) -> np.ndarray:
+        p01, p99 = p01p99[j]
+        if j in choice_values:
+            # keep only within empirical bounds
+            vals = np.asarray(choice_values[j], dtype=float)
+            vals = vals[(vals >= p01) & (vals <= p99)]
+            return np.unique(np.sort(vals))
+        lo, hi = (p01, p99)
+        if j in range_windows:
+            cw_lo, cw_hi = range_windows[j]
+            lo, hi = max(lo, cw_lo), min(hi, cw_hi)
+        if hi <= lo:
+            hi = lo + 1e-9
+        return np.linspace(lo, hi, n)
+
+    ranges_1d_std = [_grid_1d(j, n_points_1d) for j in range(len(feature_names))]
+    ranges_2d_std = [_grid_1d(j, n_points_2d) for j in range(len(feature_names))]
 
     # ---------- diagonal payload over FREE features ----------
     diag_payload: dict[int, dict] = {}
@@ -397,9 +450,21 @@ def make_pairplot(
         fig.update_yaxes(title_text=name, row=r+1, col=1)
 
 
-    title = "2D Partial Dependence of Expected Target."
-    for key,value in kw_fixed.items():
-        title += f" {key}={value}"
+    def _fmt_c(v):
+        if isinstance(v, slice):
+            a = f"{v.start:g}" if v.start is not None else ""
+            b = f"{v.stop:g}"  if v.stop  is not None else ""
+            return f"[{a},{b}]"
+        if isinstance(v, (list, tuple, np.ndarray)):
+            return "[" + ",".join(f"{x:g}" for x in np.asarray(v).tolist()) + "]"
+        return f"{v:g}"
+
+    title = "2D Partial Dependence of Expected Target"
+    if kwargs:
+        # show original kwargs (as passed) in title
+        # re-use kw_fixed_raw so we show feature names canonically
+        parts = [f"{k}={_fmt_c(kw_fixed_raw[k])}" for k in kw_fixed_raw]
+        title += " — " + ", ".join(parts)
 
     # layout
     cell = 250
@@ -416,7 +481,10 @@ def make_pairplot(
         legend_title_text=""
     )
 
-    fig.write_html(str(output), include_plotlyjs="cdn")
+    if output:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.write_html(str(output), include_plotlyjs="cdn")
     if show:
         fig.show("browser")
 
@@ -444,10 +512,6 @@ def make_partial_dependence1D(
       - experimental points: successes (black); failures (red w/ black outline)
     Any feature passed via kwargs (e.g. --epochs 20) is clamped in the slice and not plotted.
     """
-    import numpy as np
-    import pandas as pd
-    import xarray as xr
-
     optimal_df = find_optimal(model, count=1, **kwargs) if optimal else None
     suggest_df = suggest_candidates(model, count=suggest, **kwargs) if suggest and suggest > 0 else None
 
