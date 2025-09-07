@@ -57,8 +57,8 @@ def df_to_table(
 
 
 def suggest_candidates(
-    model_path: Path,
-    output_path: Path | None = None,
+    model: xr.Dataset | Path | str,
+    output: Path | str | None = None,
     count: int = 12,
     p_success_threshold: float = 0.8,
     explore_fraction: float = 0.34,
@@ -75,7 +75,8 @@ def suggest_candidates(
       - list/tuple: finite choices (e.g. batch_size=(16, 20, 24)).
       - range(...): converted to tuple of ints, then treated as choices.
     """
-    ds = xr.load_dataset(model_path)
+    ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
+        
     pred_success, pred_loss = _build_predictors(ds)
 
     feature_names = list(map(str, ds["feature"].values.tolist()))
@@ -189,10 +190,10 @@ def suggest_candidates(
     out["direction"]        = direction
     out["conditioned_on"]   = _fixed_as_string(fixed_norm)
 
-    if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        out.to_csv(output_path, index=False)
+    if output:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        out.to_csv(output, index=False)
 
     console.print(df_to_table(out))
 
@@ -200,8 +201,8 @@ def suggest_candidates(
 
 
 def find_optimal(
-    model_path: Path,
-    output_path: Path|None = None,
+    model: xr.Dataset | Path | str,
+    output: Path|None = None,
     count: int = 10,
     n_draws: int = 2000,
     min_success_probability: float = 0.5,
@@ -212,12 +213,12 @@ def find_optimal(
     Rank candidates by probability of being the best feasible optimum (min/max),
     optionally conditioned on fixed variables.
     """
-    ds = xr.load_dataset(model_path)
+    ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
 
-    if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
 
     feature_names = list(map(str, ds["feature"].values.tolist()))
     transforms = list(map(str, ds["feature_transform"].values.tolist()))
@@ -270,8 +271,8 @@ def find_optimal(
         ).reset_index(drop=True)
         result_sorted["rank_prob_best"] = np.arange(1, len(result_sorted) + 1)
         top = result_sorted.head(count).reset_index(drop=True)
-        if output_path:
-            top.to_csv(output_path, index=False)
+        if output:
+            top.to_csv(output, index=False)
         return top
 
     Z_eff = flip * Z
@@ -300,8 +301,8 @@ def find_optimal(
     result_sorted["rank_prob_best"] = np.arange(1, len(result_sorted) + 1)
 
     top = result_sorted.head(count).reset_index(drop=True)
-    if output_path:
-        top.to_csv(output_path, index=False)
+    if output:
+        top.to_csv(output, index=False)
 
     console.print(df_to_table(top))
 

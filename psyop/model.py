@@ -29,7 +29,7 @@ def run_model(
     success_column: str | None = None,
     random_seed: int = 42,
     compress: bool = True,
-) -> None:
+) -> xr.Dataset:
     """
     Fit two-head GP (success prob + conditional loss) and save a single NetCDF artifact.
     """
