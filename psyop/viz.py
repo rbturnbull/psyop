@@ -97,9 +97,9 @@ def make_pairplot(
     output: Path| None = None,
     n_points_1d: int = 300,
     n_points_2d: int = 70,
-    use_log_scale_for_target: bool = False,   # log10 colours for heatmaps
+    use_log_scale_for_target: bool = False,   # log10 colors for heatmaps
     log_shift_epsilon: float = 1e-9,
-    colourscale: str = "RdBu",
+    colorscale: str = "RdBu",
     show: bool = False,
     n_contours: int = 12,
     optimal:bool = True,
@@ -242,7 +242,7 @@ def make_pairplot(
                 "Zp":  p_flat.reshape(YY.shape),
             }
 
-    # ---------- colour transform (global bounds over plotted cells only) ----------
+    # ---------- color transform (global bounds over plotted cells only) ----------
     def color_transform(z_raw: np.ndarray) -> tuple[np.ndarray, float]:
         if not use_log_scale_for_target:
             return z_raw, 0.0
@@ -257,7 +257,7 @@ def make_pairplot(
     cmin_t = float(np.nanmin(z_all_t))
     cmax_t = float(np.nanmax(z_all_t))
 
-    cs = get_colorscale(colourscale)
+    cs = get_colorscale(colorscale)
 
     def contour_line_color(level_raw: float) -> str:
         zt = np.log10(max(level_raw + global_shift, log_shift_epsilon)) if use_log_scale_for_target else level_raw
@@ -472,7 +472,7 @@ def make_pairplot(
     if use_log_scale_for_target and global_shift > 0:
         colorbar_title += f" (shift Δ={global_shift:.3g})"
     fig.update_layout(
-        coloraxis=dict(colorscale=colourscale, cmin=cmin_t, cmax=cmax_t,
+        coloraxis=dict(colorscale=colorscale, cmin=cmin_t, cmax=cmax_t,
                        colorbar=dict(title=colorbar_title)),
         template="simple_white",
         width=cell * len(free_idx),
