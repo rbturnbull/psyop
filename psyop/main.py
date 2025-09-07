@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Optional
 import xarray as xr
 import typer
-import pandas as pd
 from rich.console import Console
 
 from .model import run_model
@@ -207,12 +206,12 @@ def _parse_unknown_cli_kv_text(args: list[str]) -> dict[str, str]:
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
-def _canonicalize_feature_keys(model_path: Path, raw_map: dict[str, object]) -> tuple[dict[str, object], dict[str, str]]:
+def _canonicalize_feature_keys(model: xr.Dataset|Path, raw_map: dict[str, object]) -> tuple[dict[str, object], dict[str, str]]:
     """
     Map user keys (any style) to dataset feature names by normalization.
     Returns (mapped, alias). Unmatched keys are dropped with a warning.
     """
-    ds = xr.load_dataset(model_path)
+    ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
     features = [str(x) for x in ds["feature"].values.tolist()]
     index = {_norm(f): f for f in features}
     feature_set = set(features)
@@ -234,13 +233,13 @@ def _canonicalize_feature_keys(model_path: Path, raw_map: dict[str, object]) -> 
             console.print(f":warning: [yellow]Ignoring unknown feature key[/]: '{k}'")
     return mapped, alias
 
-def parse_constraints_from_ctx(ctx: typer.Context, model_path: Path) -> dict[str, object]:
+def parse_constraints_from_ctx(ctx: typer.Context, model: xr.Dataset|Path) -> dict[str, object]:
     """
     End-to-end: ctx.args → {feature: constraint_object} using the rules above.
     """
     raw_kv = _parse_unknown_cli_kv_text(ctx.args)
     parsed: dict[str, object] = {k: _parse_constraint_value(v) for k, v in raw_kv.items()}
-    constraints, _ = _canonicalize_feature_keys(model_path, parsed)
+    constraints, _ = _canonicalize_feature_keys(model, parsed)
 
     # Normalize: convert range objects to tuples of ints (choices)
     for k, v in list(constraints.items()):
@@ -323,14 +322,13 @@ def suggest(
 ):
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
-    if model.suffix.lower() not in {".nc", ".netcdf"}:
-        console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
+    model = xr.load_dataset(model)
     constraints = parse_constraints_from_ctx(ctx, model)
 
     suggest_candidates(
-        model_path=model,
-        output_path=output,
+        model=model,
+        output=output,
         count=count,
         p_success_threshold=p_success_threshold,
         explore_fraction=explore_fraction,
@@ -357,14 +355,13 @@ def optimal(
 ):
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
-    if model.suffix.lower() not in {".nc", ".netcdf"}:
-        console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
+    model = xr.load_dataset(model)
     constraints = parse_constraints_from_ctx(ctx, model)
 
     find_optimal(
-        model_path=model,
-        output_path=output,
+        model=model,
+        output=output,
         count=count,
         n_draws=draws,
         min_success_probability=min_success_probability,
@@ -393,9 +390,8 @@ def plot2d(
 ):
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
-    if model.suffix.lower() not in {".nc", ".netcdf"}:
-        console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
+    model = xr.load_dataset(model)
     constraints = parse_constraints_from_ctx(ctx, model)
 
     make_pairplot(
@@ -433,9 +429,8 @@ def plot1d(
 ):
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
-    if model.suffix.lower() not in {".nc", ".netcdf"}:
-        console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
+    model = xr.load_dataset(model)
     constraints = parse_constraints_from_ctx(ctx, model)
 
     make_partial_dependence1D(

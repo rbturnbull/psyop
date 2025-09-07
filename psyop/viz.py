@@ -41,7 +41,6 @@ def _orig_to_std(j: int, vals, transforms, X_mean, X_std):
     return (raw - X_mean[j]) / X_std[j]
 
 
-
 def _edges_from_centers(vals: np.ndarray, is_log: bool) -> tuple[float, float]:
     """Return (min_edge, max_edge) that tightly bound a heatmap with given center coords."""
     v = np.asarray(vals, float)
@@ -94,7 +93,7 @@ def _update_axis_type_and_range(
 
 
 def make_pairplot(
-    model: Path,
+    model: xr.Dataset | Path | str,
     output: Path| None = None,
     n_points_1d: int = 300,
     n_points_2d: int = 70,
@@ -105,15 +104,16 @@ def make_pairplot(
     n_contours: int = 12,
     optimal:bool = True,
     **kwargs,
-) -> None:
+) -> go.Figure:
     """
     2D Partial Dependence of E[target|success] (pairwise features), optionally
     conditioned on fixed variables passed as kwargs, e.g. --epochs 20.
     Fixed variables are clamped in the slice and **not plotted** as axes.
     """
-    optimal_df = find_optimal(model, count=1, **kwargs) if optimal else None
+    ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
 
-    ds = xr.load_dataset(model)
+    optimal_df = find_optimal(ds, count=1, **kwargs) if optimal else None
+
     pred_success, pred_loss = _build_predictors(ds)
 
     # --- features & transforms
@@ -488,9 +488,11 @@ def make_pairplot(
     if show:
         fig.show("browser")
 
+    return fig
+
 
 def make_partial_dependence1D(
-    model: Path,
+    model: xr.Dataset | Path | str,
     output: Path | None = None,
     csv_out: Path | None = None,
     n_points_1d: int = 300,
@@ -503,18 +505,12 @@ def make_partial_dependence1D(
     optimal: bool = True,
     suggest: int = 0,
     **kwargs,
-) -> None:
+) -> go.Figure:
     """
     Vertical 1D PD panels of E[target|success] vs each *free* feature.
     Scalars (fix & hide), slices (restrict sweep & x-range), lists/tuples (discrete grids).
     """
-    import numpy as np
-    import pandas as pd
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-    import xarray as xr
-
-    ds = xr.load_dataset(model)
+    ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
 
     feature_names = [str(n) for n in ds["feature"].values.tolist()]
@@ -807,6 +803,8 @@ def make_partial_dependence1D(
         pd.DataFrame(tidy_rows).to_csv(str(csv_out), index=False)
     if show_figure:
         fig.show("browser")
+
+    return fig
 
 # =============================================================================
 # Helpers: dataset → predictors & featurization
