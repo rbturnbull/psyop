@@ -1,15 +1,15 @@
-from psyop.viz import make_pairplot, make_partial_dependence1D
+from psyop.viz import plot2d, plot1d
 
 from .test_opt import TEST_XARRAY
 
 
-def test_make_pairplot(tmpdir):
+def test_plot2d(tmpdir):
     output_path = tmpdir/"output.png"
-    make_pairplot(TEST_XARRAY, output=output_path)
+    plot2d(TEST_XARRAY, output=output_path)
     assert output_path.exists()
 
 
-def test_make_partial_dependence1D(tmpdir):
+def test_plot1d(tmpdir):
     output_path = tmpdir/"output.png"
-    make_partial_dependence1D(TEST_XARRAY, output=output_path)
+    plot1d(TEST_XARRAY, output=output_path)
     assert output_path.exists()

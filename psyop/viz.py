@@ -92,58 +92,43 @@ def _update_axis_type_and_range(
             fig.update_yaxes(range=[lo, hi], row=row, col=col)
 
 
-def make_pairplot(
+def plot2d(
     model: xr.Dataset | Path | str,
-    output: Path| None = None,
-    n_points_1d: int = 300,
-    n_points_2d: int = 70,
+    output: Path | None = None,
+    grid_size: int = 70,
     use_log_scale_for_target: bool = False,   # log10 colors for heatmaps
     log_shift_epsilon: float = 1e-9,
     colorscale: str = "RdBu",
     show: bool = False,
     n_contours: int = 12,
-    optimal:bool = True,
+    optimal: bool = True,
     **kwargs,
 ) -> go.Figure:
     """
     2D Partial Dependence of E[target|success] (pairwise features), optionally
-    conditioned on fixed variables passed as kwargs, e.g. --epochs 20.
-    Fixed variables are clamped in the slice and **not plotted** as axes.
+    conditioned on fixed variables (kwargs). Fixed vars are clamped and not plotted.
+    All cells—including the diagonal—are evaluated as true 2D grids.
     """
     ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
+    pred_success, pred_loss = _build_predictors(ds)
+
+    feature_names = [str(x) for x in ds["feature"].values.tolist()]
+    transforms    = [str(t) for t in ds["feature_transform"].values.tolist()]
+    X_mean = ds["feature_mean"].values.astype(float)
+    X_std  = ds["feature_std"].values.astype(float)
 
     optimal_df = find_optimal(ds, count=1, **kwargs) if optimal else None
 
-    pred_success, pred_loss = _build_predictors(ds)
-
-    # --- features & transforms
-    feature_names = [str(n) for n in ds["feature"].values.tolist()]
-    transforms = [str(t) for t in ds["feature_transform"].values.tolist()]
-    X_mean = ds["feature_mean"].values.astype(float)
-    X_std = ds["feature_std"].values.astype(float)
-
-    # canonicalize kwargs keys to exact feature names
-    # (simple case-sensitive match; you can reuse your CLI canonicalizer if needed)
-    kw_fixed = {k: v for k, v in kwargs.items() if k in feature_names}
-
-    # raw DF for experimental points
-    df_raw = _raw_dataframe_from_dataset(ds)
-
-    # standardized training X for ranges/medians
-    Xn_train = ds["Xn_train"].values.astype(float)
-    p = Xn_train.shape[1]
-
-    # --- map kwargs keys to real feature names (accept hyphens/underscores/case)
+    # canonicalize kwargs keys to dataset features (accept hyphens/underscores/case)
     idx = _canon_key_set(ds)
-    kw_fixed_raw = {}
+    kw_fixed_raw: dict[str, object] = {}
     for k, v in kwargs.items():
         if k in idx: kw_fixed_raw[idx[k]] = v
         else:
             nk = re.sub(r"[^a-z0-9]+", "", k.lower())
             if nk in idx: kw_fixed_raw[idx[nk]] = v
 
-    # --- split constraints:
-    # scalars -> fix & hide axis; slice -> [lo,hi] window; list/tuple -> discrete grid
+    # split constraints: scalars -> fix/hide; slice -> window; list/tuple -> discrete choices
     fixed_scalars: dict[int, float] = {}
     range_windows: dict[int, tuple[float, float]] = {}
     choice_values: dict[int, np.ndarray] = {}
@@ -153,134 +138,59 @@ def make_pairplot(
             continue
         val = kw_fixed_raw[name]
         if isinstance(val, slice):
-            # endpoints are in ORIGINAL units → convert to standardized
             lo = _orig_to_std(j, val.start, transforms, X_mean, X_std)
             hi = _orig_to_std(j, val.stop,  transforms, X_mean, X_std)
-            lo, hi = (float(min(lo, hi)), float(max(lo, hi)))
+            lo, hi = float(min(lo, hi)), float(max(lo, hi))
             range_windows[j] = (lo, hi)
         elif isinstance(val, (list, tuple)):
-            # choices in ORIGINAL units → convert each to standardized
-            choice_values[j] = _orig_to_std(j, np.array(val, dtype=float), transforms, X_mean, X_std)
+            choice_values[j] = _orig_to_std(j, np.asarray(val, dtype=float), transforms, X_mean, X_std)
         else:
-            # scalar in ORIGINAL units → fix & hide axis
             fixed_scalars[j] = float(_orig_to_std(j, float(val), transforms, X_mean, X_std))
 
-    # --- base point in standardized space; apply fixed slice there
+    # base point (median in standardized space), apply scalar fixes
+    Xn_train = ds["Xn_train"].values.astype(float)
+    df_raw   = _raw_dataframe_from_dataset(ds)
     base_std = np.median(Xn_train, axis=0)
     for j, vstd in fixed_scalars.items():
         base_std[j] = vstd
 
-    free_idx = [j for j in range(len(feature_names)) if j not in fixed_scalars]
+    # free (plotted) features = everything except scalar-fixed
+    p = len(feature_names)
+    free_idx = [j for j in range(p) if j not in fixed_scalars]
     if not free_idx:
         raise ValueError("All features are fixed; nothing to plot.")
 
-    # helper to test if a feature is log on axis
-    def _is_log_feature(j: int) -> bool:
-        return (transforms[j] == "log10")
-
-    # 1D / 2D sweep ranges for *all* features (we'll index by free_idx)
-    p01p99 = [np.percentile(Xn_train[:, j], [1, 99]) for j in range(len(feature_names))]
-
-    def _grid_1d(j: int, n: int) -> np.ndarray:
+    # per-feature grids in standardized space (respect slices/choices + empirical 1–99%)
+    p01p99 = [np.percentile(Xn_train[:, j], [1, 99]) for j in range(p)]
+    def _grid_std(j: int) -> np.ndarray:
         p01, p99 = p01p99[j]
         if j in choice_values:
-            # keep only within empirical bounds
             vals = np.asarray(choice_values[j], dtype=float)
             vals = vals[(vals >= p01) & (vals <= p99)]
-            return np.unique(np.sort(vals))
-        lo, hi = (p01, p99)
+            return np.unique(np.sort(vals)) if vals.size else np.array([np.median(Xn_train[:, j])])
+        lo, hi = p01, p99
         if j in range_windows:
-            cw_lo, cw_hi = range_windows[j]
-            lo, hi = max(lo, cw_lo), min(hi, cw_hi)
-        if hi <= lo:
+            rlo, rhi = range_windows[j]
+            lo, hi = max(lo, rlo), min(hi, rhi)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             hi = lo + 1e-9
-        return np.linspace(lo, hi, n)
+        return np.linspace(lo, hi, grid_size)
 
-    ranges_1d_std = [_grid_1d(j, n_points_1d) for j in range(len(feature_names))]
-    ranges_2d_std = [_grid_1d(j, n_points_2d) for j in range(len(feature_names))]
+    grids_std = {j: _grid_std(j) for j in range(p)}
 
-    # ---------- diagonal payload over FREE features ----------
-    diag_payload: dict[int, dict] = {}
-    for pos, j in enumerate(free_idx):
-        grid = ranges_1d_std[j]
-        Xn_grid = np.repeat(base_std[None, :], len(grid), axis=0)
-        Xn_grid[:, j] = grid
+    # global color transform bounds (will compute gradually)
+    all_blocks: list[np.ndarray] = []
 
-        p_1d = pred_success(Xn_grid)
-        mu_1d, _ = pred_loss(Xn_grid, include_observation_noise=True)
-
-        x_orig = _denormalize_then_inverse_transform(j, grid, transforms, X_mean, X_std)
-        diag_payload[pos] = {
-            "j": j,              # real feature index
-            "x": x_orig,         # original units
-            "Zmu": 0.5 * (mu_1d[:, None] + mu_1d[None, :]),
-            "Zp":  np.minimum(p_1d[:, None], p_1d[None, :]),
-        }
-
-    # ---------- off-diagonal payload over FREE×FREE ----------
-    off_payload: dict[tuple[int, int], dict] = {}
-    for r, i in enumerate(free_idx):
-        for c, j in enumerate(free_idx):
-            if i == j:
-                continue
-            xg = ranges_2d_std[j]
-            yg = ranges_2d_std[i]
-            XX, YY = np.meshgrid(xg, yg)
-
-            Xn_grid = np.repeat(base_std[None, :], XX.size, axis=0)
-            Xn_grid[:, j] = XX.ravel()
-            Xn_grid[:, i] = YY.ravel()
-
-            mu_flat, _ = pred_loss(Xn_grid, include_observation_noise=True)
-            p_flat = pred_success(Xn_grid)
-
-            off_payload[(r, c)] = {
-                "i": i, "j": j,
-                "x": _denormalize_then_inverse_transform(j, xg, transforms, X_mean, X_std),
-                "y": _denormalize_then_inverse_transform(i, yg, transforms, X_mean, X_std),
-                "Zmu": mu_flat.reshape(YY.shape),
-                "Zp":  p_flat.reshape(YY.shape),
-            }
-
-    # ---------- color transform (global bounds over plotted cells only) ----------
-    def color_transform(z_raw: np.ndarray) -> tuple[np.ndarray, float]:
-        if not use_log_scale_for_target:
-            return z_raw, 0.0
-        zmin = float(np.nanmin(z_raw))
-        shift = 0.0 if zmin > 0 else -zmin + float(log_shift_epsilon)
-        return np.log10(np.maximum(z_raw + shift, log_shift_epsilon)), shift
-
-    blocks = [d["Zmu"].ravel() for d in diag_payload.values()] + \
-             [d["Zmu"].ravel() for d in off_payload.values()]
-    z_all = np.concatenate(blocks) if blocks else np.array([0.0, 1.0])
-    z_all_t, global_shift = color_transform(z_all)
-    cmin_t = float(np.nanmin(z_all_t))
-    cmax_t = float(np.nanmax(z_all_t))
-
-    cs = get_colorscale(colorscale)
-
-    def contour_line_color(level_raw: float) -> str:
-        zt = np.log10(max(level_raw + global_shift, log_shift_epsilon)) if use_log_scale_for_target else level_raw
-        t = 0.5 if cmax_t == cmin_t else (zt - cmin_t) / (cmax_t - cmin_t)
-        from_colorscale = sample_colorscale(cs, [float(np.clip(t, 0.0, 1.0))])[0]
-        r, g, b = _rgb_string_to_tuple(from_colorscale)
-        lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
-        inv = 1.0 - lum
-        grey = int(round(inv * 255))
-        return f"rgba({grey},{grey},{grey},0.9)"
-
-    # ---------- figure ----------
+    # figure
     k = len(free_idx)
     fig = make_subplots(
-        rows=k, cols=k,
-        shared_xaxes=False, shared_yaxes=False,
+        rows=k, cols=k, shared_xaxes=False, shared_yaxes=False,
         horizontal_spacing=0.03, vertical_spacing=0.03,
     )
 
-    # success/fail masks for experimental points
     tgt_col = str(ds.attrs["target_column"])
     success_mask = ~pd.isna(df_raw[tgt_col]).to_numpy()
-    fail_mask = ~success_mask
+    fail_mask    = ~success_mask
 
     def data_vals_for_feature(j_full: int) -> np.ndarray:
         name = feature_names[j_full]
@@ -288,22 +198,90 @@ def make_pairplot(
             return df_raw[name].to_numpy().astype(float)
         return feature_raw_from_artifact_or_reconstruct(ds, j_full, name, transforms[j_full]).astype(float)
 
-    # ---- off-diagonals (r,c) over FREE features only
-    for (r, c), PAY in off_payload.items():
+    # helper: color transform
+    def color_transform(z_raw: np.ndarray) -> tuple[np.ndarray, float]:
+        if not use_log_scale_for_target:
+            return z_raw, 0.0
+        zmin = float(np.nanmin(z_raw))
+        shift = 0.0 if zmin > 0 else -zmin + float(log_shift_epsilon)
+        return np.log10(np.maximum(z_raw + shift, log_shift_epsilon)), shift
+
+    # evaluate every cell (including diagonal) as a 2D grid
+    cell_payload: dict[tuple[int,int], dict] = {}
+    for r, i in enumerate(free_idx):
+        for c, j in enumerate(free_idx):
+            xg = grids_std[j]
+            yg = grids_std[i]
+
+            if i == j:
+                # --- diagonal: build from 1D PD and synthesize a symmetric 2D surface
+                grid = grids_std[j]
+                Xn_1d = np.repeat(base_std[None, :], len(grid), axis=0)
+                Xn_1d[:, j] = grid
+
+                mu_1d, _ = pred_loss(Xn_1d, include_observation_noise=True)  # (n,)
+                p_1d     = pred_success(Xn_1d)                               # (n,)
+
+                Zmu = 0.5 * (mu_1d[:, None] + mu_1d[None, :])               # (n,n)
+                Zp  = np.minimum(p_1d[:, None], p_1d[None, :])              # (n,n)
+
+                x_orig = _denormalize_then_inverse_transform(j, grid, transforms, X_mean, X_std)
+                y_orig = x_orig  # same feature
+            else:
+                # --- off-diagonal: true 2D grid
+                XX, YY = np.meshgrid(xg, yg)
+
+                Xn_grid = np.repeat(base_std[None, :], XX.size, axis=0)
+                Xn_grid[:, j] = XX.ravel()
+                Xn_grid[:, i] = YY.ravel()
+
+                mu_flat, _ = pred_loss(Xn_grid, include_observation_noise=True)
+                p_flat     = pred_success(Xn_grid)
+
+                Zmu = mu_flat.reshape(YY.shape)
+                Zp  = p_flat.reshape(YY.shape)
+
+                x_orig = _denormalize_then_inverse_transform(j, xg, transforms, X_mean, X_std)
+                y_orig = _denormalize_then_inverse_transform(i, yg, transforms, X_mean, X_std)
+
+            cell_payload[(r, c)] = {"i": i, "j": j, "x": x_orig, "y": y_orig, "Zmu": Zmu, "Zp": Zp}
+            all_blocks.append(Zmu.ravel())
+
+    # color bounds
+    z_all = np.concatenate(all_blocks) if all_blocks else np.array([0.0, 1.0])
+    z_all_t, global_shift = color_transform(z_all)
+    cmin_t = float(np.nanmin(z_all_t))
+    cmax_t = float(np.nanmax(z_all_t))
+    cs = get_colorscale(colorscale)
+
+    def contour_line_color(level_raw: float) -> str:
+        zt = np.log10(max(level_raw + global_shift, log_shift_epsilon)) if use_log_scale_for_target else level_raw
+        t = 0.5 if cmax_t == cmin_t else (zt - cmin_t) / (cmax_t - cmin_t)
+        rgb = sample_colorscale(cs, [float(np.clip(t, 0.0, 1.0))])[0]
+        r, g, b = _rgb_string_to_tuple(rgb)
+        lum = (0.2126*r + 0.7152*g + 0.0722*b)/255.0
+        grey = int(round((1.0 - lum) * 255))
+        return f"rgba({grey},{grey},{grey},0.9)"
+
+    # draw cells
+    def _is_log_feature(j: int) -> bool: return (transforms[j] == "log10")
+
+    for (r, c), PAY in cell_payload.items():
         i, j = PAY["i"], PAY["j"]
-        x_vals = PAY["x"]; y_vals = PAY["y"]; Zmu_raw = PAY["Zmu"]; Zp = PAY["Zp"]
+        x_vals, y_vals, Zmu_raw, Zp = PAY["x"], PAY["y"], PAY["Zmu"], PAY["Zp"]
         Z_t, _ = color_transform(Zmu_raw)
 
+        # heatmap
         fig.add_trace(go.Heatmap(
             x=x_vals, y=y_vals, z=Z_t,
             coloraxis="coloraxis", zsmooth=False, showscale=False,
-            hovertemplate=(
-                f"{feature_names[j]}: %{{x:.6g}}<br>{feature_names[i]}: %{{y:.6g}}"
-                "<br>E[target|success]: %{customdata:.3f}<extra></extra>"
-            ),
+            hovertemplate=(f"{feature_names[j]}: %{{x:.6g}}<br>"
+                           f"{feature_names[i]}: %{{y:.6g}}"
+                           "<br>E[target|success]: %{customdata:.3f}<extra></extra>"),
             customdata=Zmu_raw
         ), row=r+1, col=c+1)
 
+        # p(success) shading
         for thr, alpha in ((0.5, 0.25), (0.8, 0.40)):
             mask = np.where(Zp < thr, 1.0, np.nan)
             fig.add_trace(go.Heatmap(
@@ -312,6 +290,7 @@ def make_pairplot(
                 showscale=False, hoverinfo="skip"
             ), row=r+1, col=c+1)
 
+        # contours
         zmin_r, zmax_r = float(np.nanmin(Zmu_raw)), float(np.nanmax(Zmu_raw))
         levels = np.linspace(zmin_r, zmax_r, max(n_contours, 2))
         for lev in levels:
@@ -323,19 +302,18 @@ def make_pairplot(
                 showscale=False, hoverinfo="skip"
             ), row=r+1, col=c+1)
 
-        # experimental points for (i,j)
-        xd = data_vals_for_feature(j); yd = data_vals_for_feature(i)
+        # experimental points (x vs y) — for diagonal (i==j) this becomes (x,x)
+        xd = data_vals_for_feature(j)
+        yd = data_vals_for_feature(i)
+        show_leg = (r == 0 and c == 0)
         fig.add_trace(go.Scattergl(
             x=xd[success_mask], y=yd[success_mask], mode="markers",
             marker=dict(size=4, color="black", line=dict(width=0)),
-            name="data (success)", legendgroup="data_succ",
-            showlegend=(r == 0 and c == 0),
-            hovertemplate=(
-                "trial_id: %{customdata[0]}<br>"
-                f"{feature_names[j]}: %{{x:.6g}}<br>"
-                f"{feature_names[i]}: %{{y:.6g}}<br>"
-                f"{tgt_col}: %{{customdata[1]:.4f}}<extra></extra>"
-            ),
+            name="data (success)", legendgroup="data_succ", showlegend=show_leg,
+            hovertemplate=("trial_id: %{customdata[0]}<br>"
+                           f"{feature_names[j]}: %{{x:.6g}}<br>"
+                           f"{feature_names[i]}: %{{y:.6g}}<br>"
+                           f"{tgt_col}: %{{customdata[1]:.4f}}<extra></extra>"),
             customdata=np.column_stack([
                 df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask],
                 df_raw[tgt_col].to_numpy()[success_mask],
@@ -344,112 +322,47 @@ def make_pairplot(
         fig.add_trace(go.Scattergl(
             x=xd[fail_mask], y=yd[fail_mask], mode="markers",
             marker=dict(size=5, color="red", line=dict(color="black", width=0.8)),
-            name="data (failed)", legendgroup="data_fail",
-            showlegend=(r == 0 and c == 0),
-            hovertemplate=(
-                "trial_id: %{customdata}<br>"
-                f"{feature_names[j]}: %{{x:.6g}}<br>"
-                f"{feature_names[i]}: %{{y:.6g}}<br>"
-                "status: failed (NaN target)<extra></extra>"
-            ),
+            name="data (failed)", legendgroup="data_fail", showlegend=show_leg,
+            hovertemplate=("trial_id: %{customdata}<br>"
+                           f"{feature_names[j]}: %{{x:.6g}}<br>"
+                           f"{feature_names[i]}: %{{y:.6g}}<br>"
+                           "status: failed (NaN target)<extra></extra>"),
             customdata=df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
         ), row=r+1, col=c+1)
 
-        if optimal:
-            opt_x = optimal_df[feature_names[j]].values
-            opt_y = optimal_df[feature_names[i]].values
-            pred_target_mean = optimal_df["pred_target_mean"].values[0]
-            fig.add_trace(go.Scattergl(
-                x=opt_x, y=opt_y, mode="markers",
-                marker=dict(size=10, color="yellow", line=dict(color="black", width=1.5), symbol="x"),
-                name="optimal", legendgroup="optimal",
-                showlegend=(r == 0 and c == 0),
-                hovertemplate=(
-                    f"predicted: {pred_target_mean:.2g} ± {optimal_df['pred_target_sd'].values[0]:.2g}<br>"
-                    f"{feature_names[j]}: %{{x:.6g}}<br>"
-                    f"{feature_names[i]}: %{{y:.6g}}<extra></extra>"
-                ),
-            ), row=r+1, col=c+1)
+        opt_x = opt_y = None
+        if optimal_df is not None:
+            # only plot if the columns exist (and not NaN)
+            if feature_names[j] in optimal_df.columns and feature_names[i] in optimal_df.columns:
+                opt_x = np.asarray(optimal_df[feature_names[j]].values, dtype=float)
+                opt_y = np.asarray(optimal_df[feature_names[i]].values, dtype=float)
+                if opt_x.size and opt_y.size and np.all(np.isfinite(opt_x)) and np.all(np.isfinite(opt_y)):
+                    pred_m  = float(optimal_df["pred_target_mean"].values[0])
+                    pred_sd = float(optimal_df["pred_target_sd"].values[0])
+                    fig.add_trace(go.Scattergl(
+                        x=opt_x, y=opt_y, mode="markers",
+                        marker=dict(size=10, color="yellow", line=dict(color="black", width=1.5), symbol="x"),
+                        name="optimal", legendgroup="optimal",
+                        showlegend=(r == 0 and c == 0),
+                        hovertemplate=(
+                            f"predicted: {pred_m:.2g} ± {pred_sd:.2g}<br>"
+                            f"{feature_names[j]}: %{{x:.6g}}<br>"
+                            f"{feature_names[i]}: %{{y:.6g}}<extra></extra>"
+                        ),
+                    ), row=r+1, col=c+1)
 
+        # axes (log + tight ranges if constrained via slice/choices)
         _update_axis_type_and_range(fig, row=r+1, col=c+1, axis="x", centers=x_vals, is_log=_is_log_feature(j))
         _update_axis_type_and_range(fig, row=r+1, col=c+1, axis="y", centers=y_vals, is_log=_is_log_feature(i))
 
-    # ---- diagonals over FREE features only
-    for pos, PAY in diag_payload.items():
-        j = PAY["j"]
-        axis = PAY["x"]; Zmu_raw = PAY["Zmu"]; Zp = PAY["Zp"]
-        Z_t, _ = color_transform(Zmu_raw)
-
-        fig.add_trace(go.Heatmap(
-            x=axis, y=axis, z=Z_t,
-            coloraxis="coloraxis", zsmooth=False, showscale=False,
-            hovertemplate=(
-                f"{feature_names[j]}: %{{x:.6g}} / %{{y:.6g}}"
-                "<br>E[target|success]: %{customdata:.3f}<extra></extra>"
-            ),
-            customdata=Zmu_raw
-        ), row=pos+1, col=pos+1)
-
-        for thr, alpha in ((0.5, 0.25), (0.8, 0.40)):
-            mask = np.where(Zp < thr, 1.0, np.nan)
-            fig.add_trace(go.Heatmap(
-                x=axis, y=axis, z=mask, zmin=0, zmax=1,
-                colorscale=[[0, "rgba(0,0,0,0)"], [1, f"rgba(128,128,128,{alpha})"]],
-                showscale=False, hoverinfo="skip"
-            ), row=pos+1, col=pos+1)
-
-        zmin_r, zmax_r = float(np.nanmin(Zmu_raw)), float(np.nanmax(Zmu_raw))
-        levels = np.linspace(zmin_r, zmax_r, max(n_contours, 2))
-        for lev in levels:
-            fig.add_trace(go.Contour(
-                x=axis, y=axis, z=Zmu_raw,
-                autocontour=False,
-                contours=dict(coloring="lines", showlabels=False, start=lev, end=lev, size=1e-9),
-                line=dict(width=1, color=contour_line_color(lev)),
-                showscale=False, hoverinfo="skip"
-            ), row=pos+1, col=pos+1)
-
-        # experimental points (x=y) for this feature
-        xd = data_vals_for_feature(j)
-        fig.add_trace(go.Scattergl(
-            x=xd[success_mask], y=xd[success_mask], mode="markers",
-            marker=dict(size=4, color="black", line=dict(width=0)),
-            name="data (success)", legendgroup="data_succ",
-            showlegend=False,
-            hovertemplate=(
-                "trial_id: %{customdata[0]}<br>"
-                f"{feature_names[j]}: %{{x:.6g}}<br>"
-                f"{tgt_col}: %{{customdata[1]:.4f}}<extra></extra>"
-            ),
-            customdata=np.column_stack([
-                df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask],
-                df_raw[tgt_col].to_numpy()[success_mask],
-            ])
-        ), row=pos+1, col=pos+1)
-        fig.add_trace(go.Scattergl(
-            x=xd[fail_mask], y=xd[fail_mask], mode="markers",
-            marker=dict(size=5, color="red", line=dict(color="black", width=0.8)),
-            name="data (failed)", legendgroup="data_fail",
-            showlegend=False,
-            hovertemplate=(
-                "trial_id: %{customdata}<br>"
-                f"{feature_names[j]}: %{{x:.6g}}<br>"
-                "status: failed (NaN target)<extra></extra>"
-            ),
-            customdata=df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
-        ), row=pos+1, col=pos+1)
-
-        _update_axis_type_and_range(fig, row=pos+1, col=pos+1, axis="x", centers=axis, is_log=_is_log_feature(j))
-        _update_axis_type_and_range(fig, row=pos+1, col=pos+1, axis="y", centers=axis, is_log=_is_log_feature(j))
-
-    # axis titles (free only)
+    # labels
     free_names = [feature_names[j] for j in free_idx]
-    for c, name in enumerate(free_names):
-        fig.update_xaxes(title_text=name, row=len(free_idx), col=c+1)
-    for r, name in enumerate(free_names):
-        fig.update_yaxes(title_text=name, row=r+1, col=1)
+    for c, nm in enumerate(free_names):
+        fig.update_xaxes(title_text=nm, row=k, col=c+1)
+    for r, nm in enumerate(free_names):
+        fig.update_yaxes(title_text=nm, row=r+1, col=1)
 
-
+    # title
     def _fmt_c(v):
         if isinstance(v, slice):
             a = f"{v.start:g}" if v.start is not None else ""
@@ -460,23 +373,20 @@ def make_pairplot(
         return f"{v:g}"
 
     title = "2D Partial Dependence of Expected Target"
-    if kwargs:
-        # show original kwargs (as passed) in title
-        # re-use kw_fixed_raw so we show feature names canonically
-        parts = [f"{k}={_fmt_c(kw_fixed_raw[k])}" for k in kw_fixed_raw]
-        title += " — " + ", ".join(parts)
+    if kw_fixed_raw:
+        title += " — " + ", ".join(f"{k}={_fmt_c(kw_fixed_raw[k])}" for k in kw_fixed_raw)
 
     # layout
     cell = 250
-    colorbar_title = "E[target|success]" + (" (log10)" if use_log_scale_for_target else "")
+    z_title = "E[target|success]" + (" (log10)" if use_log_scale_for_target else "")
     if use_log_scale_for_target and global_shift > 0:
-        colorbar_title += f" (shift Δ={global_shift:.3g})"
+        z_title += f" (shift Δ={global_shift:.3g})"
     fig.update_layout(
         coloraxis=dict(colorscale=colorscale, cmin=cmin_t, cmax=cmax_t,
-                       colorbar=dict(title=colorbar_title)),
+                       colorbar=dict(title=z_title)),
         template="simple_white",
-        width=cell * len(free_idx),
-        height=cell * len(free_idx),
+        width=cell * k,
+        height=cell * k,
         title=title,
         legend_title_text=""
     )
@@ -487,11 +397,10 @@ def make_pairplot(
         fig.write_html(str(output), include_plotlyjs="cdn")
     if show:
         fig.show("browser")
-
     return fig
 
 
-def make_partial_dependence1D(
+def plot1d(
     model: xr.Dataset | Path | str,
     output: Path | None = None,
     csv_out: Path | None = None,

@@ -21,7 +21,7 @@ import typer
 from rich.console import Console
 
 from .model import run_model
-from .viz import make_pairplot, make_partial_dependence1D
+from . import viz
 from .opt import suggest_candidates, find_optimal
 
 __version__ = "0.1.0"
@@ -394,7 +394,7 @@ def plot2d(
     model = xr.load_dataset(model)
     constraints = parse_constraints_from_ctx(ctx, model)
 
-    make_pairplot(
+    viz.plot2d(
         model=model,
         output=output,
         n_points_1d=n_points_1d,
@@ -433,7 +433,7 @@ def plot1d(
     model = xr.load_dataset(model)
     constraints = parse_constraints_from_ctx(ctx, model)
 
-    make_partial_dependence1D(
+    viz.plot1d(
         model=model,
         output=output,
         csv_out=csv_out,
