@@ -6,7 +6,7 @@ TEST_DATA_DIR = Path(__file__).parent / "test-data"
 TEST_CSV = TEST_DATA_DIR / "trials.csv"
 
 def test_run_model(tmpdir):
-    output_path = tmpdir/"output.nc"
-    run_model(TEST_CSV, output_path=output_path, target_column="loss", exclude_columns="trial_id")
-    assert output_path.exists()
+    output = tmpdir/"output.nc"
+    run_model(TEST_CSV, target_column="loss", output=output, exclude_columns="trial_id")
+    assert output.exists()
 

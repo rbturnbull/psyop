@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 import xarray as xr
 import typer
+import pandas as pd
 from rich.console import Console
 
 from .model import run_model
@@ -260,23 +261,6 @@ def parse_constraints_from_ctx(ctx: typer.Context, model_path: Path) -> dict[str
 
     return constraints
 
-def _ensure_parent_dir(path: Path) -> None:
-    if path.suffix and path.parent:
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-
-def _force_netcdf_suffix(path: Path) -> Path:
-    """Ensure path ends with .nc (normalize .netcdf to .nc)."""
-    if path.suffix.lower() in {".nc", ".netcdf"}:
-        return path.with_suffix(".nc")
-    return path.with_suffix(".nc")
-
-
-def _default_out_for(model_path: Path, stem_suffix: str, ext: str) -> Path:
-    """model_path='foo.nc', stem_suffix='__pairplot', ext='.html' -> 'foo__pairplot.html'"""
-    base = model_path.with_suffix("")  # strip .nc
-    return base.with_name(base.name + stem_suffix).with_suffix(ext)
-
 
 @app.callback()
 def main(
@@ -310,13 +294,10 @@ def model(
     if input.suffix.lower() != ".csv":
         console.print(":warning: [yellow]Input does not end with .csv[/]")
 
-    output = _force_netcdf_suffix(output)
-    _ensure_parent_dir(output)
-
     run_model(
-        input_path=input,
-        output_path=output,
+        input=input,
         target_column=target,
+        output=output,
         exclude_columns=exclude,
         direction=direction.value,
         success_column=success_column,
@@ -345,11 +326,10 @@ def suggest(
     if model.suffix.lower() not in {".nc", ".netcdf"}:
         console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
-    model_nc = _force_netcdf_suffix(model)
-    constraints = parse_constraints_from_ctx(ctx, model_nc)
+    constraints = parse_constraints_from_ctx(ctx, model)
 
     suggest_candidates(
-        model_path=model_nc,
+        model_path=model,
         output_path=output,
         count=count,
         p_success_threshold=p_success_threshold,
@@ -380,12 +360,10 @@ def optimal(
     if model.suffix.lower() not in {".nc", ".netcdf"}:
         console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
-    model_nc = _force_netcdf_suffix(model)
-
-    constraints = parse_constraints_from_ctx(ctx, model_nc)
+    constraints = parse_constraints_from_ctx(ctx, model)
 
     find_optimal(
-        model_path=_force_netcdf_suffix(model),
+        model_path=model,
         output_path=output,
         count=count,
         n_draws=draws,
@@ -418,9 +396,7 @@ def plot2d(
     if model.suffix.lower() not in {".nc", ".netcdf"}:
         console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
-    model_nc = _force_netcdf_suffix(model)
-
-    constraints = parse_constraints_from_ctx(ctx, model_nc)
+    constraints = parse_constraints_from_ctx(ctx, model)
 
     make_pairplot(
         model=model,
@@ -460,12 +436,10 @@ def plot1d(
     if model.suffix.lower() not in {".nc", ".netcdf"}:
         console.print(":warning: [yellow]Model path does not end with .nc[/]")
 
-    model_nc = _force_netcdf_suffix(model)
-
-    constraints = parse_constraints_from_ctx(ctx, model_nc)
+    constraints = parse_constraints_from_ctx(ctx, model)
 
     make_partial_dependence1D(
-        model=model_nc,
+        model=model,
         output=output,
         csv_out=csv_out,
         n_points_1d=n_points_1d,

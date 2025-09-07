@@ -21,9 +21,9 @@ import xarray as xr
 
 
 def run_model(
-    input_path: Path,
-    output_path: Path,
+    input: pd.DataFrame|Path|str,
     target_column: str,
+    output: Path | str | None = None,
     exclude_columns: list[str] | None = None,
     direction: str = "auto",
     success_column: str | None = None,
@@ -33,14 +33,14 @@ def run_model(
     """
     Fit two-head GP (success prob + conditional loss) and save a single NetCDF artifact.
     """
-    # -----------------------
-    # Load CSV & basic checks
-    # -----------------------
-    input_path = Path(input_path)
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input CSV not found: {input_path.resolve()}")
+    if isinstance(input, pd.DataFrame):
+        df = input
+    else:
+        input_path = Path(input)
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input CSV not found: {input_path.resolve()}")
+        df = pd.read_csv(input_path)
 
-    df: pd.DataFrame = pd.read_csv(input_path)
     if target_column not in df.columns:
         raise ValueError(f"Target column '{target_column}' not found in CSV.")
 
@@ -249,9 +249,13 @@ def run_model(
                 encoding[name] = {"zlib": True, "complevel": 4}
 
     # Save
-    output_path = Path(output_path)
-    engine, encoding = _select_netcdf_engine_and_encoding(ds, compress=compress)
-    ds.to_netcdf(output_path, engine=engine, encoding=encoding)
+    if output:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        engine, encoding = _select_netcdf_engine_and_encoding(ds, compress=compress)
+        ds.to_netcdf(output, engine=engine, encoding=encoding)
+
+    return ds
 
 
 def kernel_diag_m52(XA: np.ndarray, ls: np.ndarray, eta: float) -> np.ndarray:
