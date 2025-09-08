@@ -21,6 +21,13 @@ def test_app_suggest(tmpdir):
     assert output.exists()
 
 
+def test_app_suggest_constraints(tmpdir):
+    output = tmpdir/"output.csv"
+    result = runner.invoke(app, ["suggest", str(TEST_XARRAY), "--output", str(output), "--learning_rate", "0.001", "--batch_size", "16", "--dropout", "0.1:0.2"])
+    assert result.exit_code == 0
+    assert output.exists()
+
+
 def test_app_optimal(tmpdir):
     output = tmpdir/"output.csv"
     result = runner.invoke(app, ["optimal", str(TEST_XARRAY), "--output", str(output)])
