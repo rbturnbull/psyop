@@ -658,7 +658,7 @@ def _postfilter_numeric_constraints(
 
 def optimal(
     model: xr.Dataset | Path | str,
-    output: Path|None = None,
+    output: Path | None = None,
     count: int = 10,
     n_draws: int = 2000,
     min_success_probability: float = 0.5,
@@ -667,7 +667,15 @@ def optimal(
 ) -> pd.DataFrame:
     """
     Rank candidates by probability of being the best feasible optimum (min/max),
-    optionally conditioned on fixed variables.
+    honoring numeric *and* categorical constraints.
+
+    Constraints (original units):
+      - number (int/float): fixed value, e.g. epochs=20
+      - slice(lo, hi): inclusive float range, e.g. learning_rate=slice(1e-5, 1e-3)
+      - list/tuple: finite numeric choices, e.g. batch_size=(16, 32, 64)
+      - range(...): converted to tuple of ints (choices)
+      - categorical base, e.g. language="Linear B" or language=("Linear A","Linear B")
+        (use the *base* name; model stores one-hot members internally)
     """
     ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
@@ -676,24 +684,75 @@ def optimal(
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
 
+    # --- model metadata
     feature_names = list(map(str, ds["feature"].values.tolist()))
-    transforms = list(map(str, ds["feature_transform"].values.tolist()))
-    feat_mean = ds["feature_mean"].values.astype(float)
-    feat_std = ds["feature_std"].values.astype(float)
+    transforms    = list(map(str, ds["feature_transform"].values.tolist()))
+    feat_mean     = ds["feature_mean"].values.astype(float)
+    feat_std      = ds["feature_std"].values.astype(float)
 
-    # Candidate pool with conditioning
-    search_specs = _infer_search_specs(ds, feature_names, transforms)
-    fixed_norm = _normalize_fixed(kwargs or {}, search_specs)
+    # --- detect categorical one-hot groups from feature names
+    groups = _onehot_groups(feature_names)  # { base: {"labels":[...], "name_by_label":{label->member}, "members":[...]} }
+
+    # --- infer numeric search specs from data (includes one-hot members but we’ll drop them below)
+    specs_full = _infer_search_specs(ds, feature_names, transforms)
+
+    # --- split user kwargs into numeric vs categorical constraints
+    (groups,              # same structure as above (returned for convenience)
+     user_fixed_num,      # {numeric_feature: value}
+     user_ranges_num,     # {numeric_feature: (lo, hi)}
+     user_choices_num,    # {numeric_feature: [choices]}
+     cat_fixed_label,     # {base: "Label"}  (fixed single label)
+     cat_allowed) = _split_constraints_for_numeric_and_categorical(feature_names, kwargs)
+
+    # numeric fixed beats numeric ranges/choices
+    for k in list(user_fixed_num.keys()):
+        user_ranges_num.pop(k, None)
+        user_choices_num.pop(k, None)
+
+    # --- keep only *numeric* specs (drop one-hot members)
+    numeric_specs = _numeric_specs_only(specs_full, groups)
+
+    # apply numeric bounds/choices, normalize numeric fixed
+    _apply_user_bounds(numeric_specs, user_ranges_num, user_choices_num)
+    fixed_norm_num = _normalize_fixed(user_fixed_num, numeric_specs)
+
+    # --- EI baseline: best feasible observed target
+    direction = str(ds.attrs.get("direction", "min"))
+    best_feasible = _best_feasible_observed(ds, direction)
+    flip = -1.0 if direction == "max" else 1.0
+
+    # --- sample candidate pool
     rng = np.random.default_rng(random_seed)
-    cand_df = _sample_candidates(search_specs, n=4000, rng=rng, fixed=fixed_norm)
-    Xn_cands = _original_df_to_standardized(cand_df, feature_names, transforms, feat_mean, feat_std)
+    target_pool = max(4000, count * 200)  # make sure MC has enough variety
 
-    # Predictions
-    p = pred_success(Xn_cands)
+    def _sample_pool(n: int) -> pd.DataFrame:
+        # sample numerics
+        base_num = _sample_candidates(numeric_specs, n=n, rng=rng, fixed=fixed_norm_num)
+        # inject legal one-hot blocks for categoricals
+        with_cats = _inject_onehot_groups(base_num, groups, rng, cat_fixed_label, cat_allowed)
+        # hard filter numerics (ranges/choices/fixed)
+        filtered = _postfilter_numeric_constraints(with_cats, user_fixed_num, user_ranges_num, user_choices_num)
+        return filtered
+
+    cand_df = _sample_pool(target_pool)
+    # if tight constraints reduce pool too much, try a few refills
+    attempts = 0
+    while len(cand_df) < max(count * 50, 1000) and attempts < 6:
+        extra = _sample_pool(target_pool)
+        if not extra.empty:
+            cand_df = pd.concat([cand_df, extra], ignore_index=True).drop_duplicates()
+        attempts += 1
+
+    if cand_df.empty:
+        raise ValueError("No candidates satisfy the provided constraints; relax the ranges or choices.")
+
+    # --- predictions in model space (use full feature order incl. one-hot members)
+    Xn_cands = _original_df_to_standardized(cand_df[feature_names], feature_names, transforms, feat_mean, feat_std)
+    p  = pred_success(Xn_cands)
     mu, sd = pred_loss(Xn_cands, include_observation_noise=True)
     sd = np.maximum(sd, 1e-12)
 
-    # Optional feasibility filter
+    # --- optional feasibility filter
     keep = p >= float(min_success_probability)
     if not np.any(keep):
         keep = np.ones_like(p, dtype=bool)
@@ -702,16 +761,15 @@ def optimal(
     Xn_cands = Xn_cands[keep]
     p = p[keep]; mu = mu[keep]; sd = sd[keep]
     N = len(cand_df)
+    if N == 0:
+        raise ValueError("All sampled candidates were filtered out by min_success_probability.")
 
-    direction = str(ds.attrs.get("direction", "min"))
-    flip = -1.0 if direction == "max" else 1.0
-
-    # Monte Carlo winner-take-all
-    rng = np.random.default_rng(random_seed)
+    # --- Monte Carlo winner-take-all over feasible draws
     Z = mu[:, None] + sd[:, None] * rng.standard_normal((N, n_draws))
     success_mask = rng.random((N, n_draws)) < p[:, None]
     feasible_draw = success_mask.any(axis=0)
     if not feasible_draw.any():
+        # fallback: deterministic sort (rare)
         result = cand_df.copy()
         result["pred_p_success"] = p
         result["pred_target_mean"] = mu
@@ -719,7 +777,11 @@ def optimal(
         result["prob_best_feasible"] = 0.0
         result["wins"] = 0
         result["n_draws_effective"] = 0
-        result["conditioned_on"] = _fixed_as_string(fixed_norm)
+        # prettify conditioning (numeric fixed + categorical fixed)
+        result["conditioned_on"] = _pretty_conditioned_on(
+            fixed_norm_numeric=fixed_norm_num,
+            cat_fixed_label=cat_fixed_label,
+        )
         result_sorted = result.sort_values(
             ["pred_target_mean", "pred_target_sd", "pred_p_success"],
             ascending=[True, True, False],
@@ -727,12 +789,14 @@ def optimal(
         ).reset_index(drop=True)
         result_sorted["rank_prob_best"] = np.arange(1, len(result_sorted) + 1)
         top = result_sorted.head(count).reset_index(drop=True)
+        # collapse one-hot → single categorical columns for output
+        top_view = _collapse_onehot_to_categorical(top, groups)
         if output:
-            top.to_csv(output, index=False)
-        return top
+            top_view.to_csv(output, index=False)
+        console.print(df_to_table(top_view))
+        return top_view
 
-    Z_eff = flip * Z
-    Z_eff = np.where(success_mask, Z_eff, np.inf)
+    Z_eff = flip * np.where(success_mask, Z, np.inf)
     Zf = Z_eff[:, feasible_draw]
 
     winner_idx = np.argmin(Zf, axis=0)
@@ -747,7 +811,10 @@ def optimal(
     result["wins"] = counts
     result["n_draws_effective"] = n_eff
     result["prob_best_feasible"] = prob_best
-    result["conditioned_on"] = _fixed_as_string(fixed_norm)
+    result["conditioned_on"] = _pretty_conditioned_on(
+        fixed_norm_numeric=fixed_norm_num,
+        cat_fixed_label=cat_fixed_label,
+    )
 
     result_sorted = result.sort_values(
         ["prob_best_feasible", "pred_p_success", "pred_target_mean", "pred_target_sd"],
@@ -757,12 +824,15 @@ def optimal(
     result_sorted["rank_prob_best"] = np.arange(1, len(result_sorted) + 1)
 
     top = result_sorted.head(count).reset_index(drop=True)
+    # collapse one-hot → single categorical columns (e.g. 'language')
+    top_view = _collapse_onehot_to_categorical(top, groups)
+
     if output:
-        top.to_csv(output, index=False)
+        top_view.to_csv(output, index=False)
 
-    console.print(df_to_table(top))
+    console.print(df_to_table(top_view))
+    return top_view
 
-    return top
 
 
 # =============================================================================
