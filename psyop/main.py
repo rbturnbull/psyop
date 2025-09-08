@@ -205,39 +205,77 @@ def _parse_unknown_cli_kv_text(args: list[str]) -> dict[str, str]:
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
-def _canonicalize_feature_keys(model: xr.Dataset|Path, raw_map: dict[str, object]) -> tuple[dict[str, object], dict[str, str]]:
+
+def _canonicalize_feature_keys(
+    model: xr.Dataset | Path, raw_map: dict[str, object]
+) -> tuple[dict[str, object], dict[str, str]]:
     """
-    Map user keys (any style) to dataset feature names by normalization.
+    Map user keys (any style) to either:
+      - dataset *feature* names (numeric, including one-hot *member* names), OR
+      - *categorical base* names (e.g., 'language') detected from one-hot blocks.
+
     Returns (mapped, alias). Unmatched keys are dropped with a warning.
+
+    Notes:
+      - Exact matches win.
+      - Then normalized matches for full feature names.
+      - Then normalized matches for categorical bases (so '--language "Linear A"' is preserved as 'language': 'Linear A').
     """
     ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
     features = [str(x) for x in ds["feature"].values.tolist()]
-    index = {_norm(f): f for f in features}
+
+    # Indexes for feature names and categorical bases
+    feature_norm_index = {_norm(f): f for f in features}
     feature_set = set(features)
+    bases, base_norm_index = _categorical_bases_from_features(features)
 
     mapped: dict[str, object] = {}
     alias: dict[str, str] = {}
 
     for k, v in (raw_map or {}).items():
+        # 1) Exact feature match
         if k in feature_set:
             mapped[k] = v
             alias[k] = k
             continue
+
         nk = _norm(k)
-        if nk in index:
-            canonical = index[nk]
+
+        # 2) Normalized feature match (full feature/member name)
+        if nk in feature_norm_index:
+            canonical = feature_norm_index[nk]
             mapped[canonical] = v
             alias[k] = canonical
-        else:
-            console.print(f":warning: [yellow]Ignoring unknown feature key[/]: '{k}'")
+            continue
+
+        # 3) Categorical base match (exact or normalized)
+        if (k in bases) or (nk in base_norm_index):
+            base = k if k in bases else base_norm_index[nk]
+            mapped[base] = v
+            alias[k] = base
+            continue
+
+        console.print(f":warning: [yellow]Ignoring unknown feature key[/]: '{k}'")
+
     return mapped, alias
 
-def parse_constraints_from_ctx(ctx: typer.Context, model: xr.Dataset|Path) -> dict[str, object]:
+
+
+def parse_constraints_from_ctx(ctx: typer.Context, model: xr.Dataset | Path) -> dict[str, object]:
     """
-    End-to-end: ctx.args → {feature: constraint_object} using the rules above.
+    End-to-end: ctx.args → {key: constraint_object}.
+
+    Values can be:
+      - number (int/float)   -> fixed
+      - slice(lo, hi)        -> float range (inclusive ends)
+      - list/tuple           -> finite choices
+      - tuple from range(...) (int choices)
+      - string               -> categorical label (e.g., --language "Linear A")
     """
     raw_kv = _parse_unknown_cli_kv_text(ctx.args)
     parsed: dict[str, object] = {k: _parse_constraint_value(v) for k, v in raw_kv.items()}
+
+    # Canonicalize keys to either feature names OR categorical bases
     constraints, _ = _canonicalize_feature_keys(model, parsed)
 
     # Normalize: convert range objects to tuples of ints (choices)
@@ -245,16 +283,24 @@ def parse_constraints_from_ctx(ctx: typer.Context, model: xr.Dataset|Path) -> di
         if isinstance(v, range):
             constraints[k] = tuple(v)
 
+    # Pretty print constraints
     if constraints:
-        pretty = ", ".join(
-            f"{k}="
-            + (
-                f"[{constraints[k].start},{constraints[k].stop}]" if isinstance(constraints[k], slice)
-                else f"{tuple(constraints[k])}" if isinstance(constraints[k], (list, tuple, range))
-                else f"{constraints[k]}"
-            )
-            for k in constraints
-        )
+        def _fmt_value(val: object) -> str:
+            if isinstance(val, slice):
+                # show start:stop (ignore step in preview)
+                lo = getattr(val, "start", None)
+                hi = getattr(val, "stop", None)
+                return f"[{lo},{hi}]"
+            if isinstance(val, (list, tuple, range)):
+                return f"{tuple(val)}"
+            if isinstance(val, str):
+                # quote strings if they have spaces or special chars
+                if re.search(r'\s|[,=:\.]', val):
+                    return f'"{val}"'
+                return val
+            return str(val)
+
+        pretty = ", ".join(f"{k}={_fmt_value(constraints[k])}" for k in constraints)
         console.print(f"[cyan]Constraints:[/] {pretty}")
 
     return constraints
@@ -465,6 +511,24 @@ def plot1d(
         console.print(f"[green]Wrote PD HTML →[/] {output}")
     if csv_out:
         console.print(f"[green]Wrote PD CSV  →[/] {csv_out}")
+
+
+def _categorical_bases_from_features(features: list[str]) -> tuple[set[str], dict[str, str]]:
+    """
+    Given model feature names (which may include one-hot members like 'language=Linear A'),
+    return:
+      - bases: a set of base names, e.g. {'language'}
+      - base_norm_index: mapping from normalized base name -> canonical base string
+    """
+    bases: set[str] = set()
+    for f in features:
+        if "=" in f:
+            base = f.split("=", 1)[0].strip()
+            if base:
+                bases.add(base)
+    # normalized index for lookup
+    base_norm_index = {_norm(b): b for b in bases}
+    return bases, base_norm_index
 
 
 if __name__ == "__main__":
