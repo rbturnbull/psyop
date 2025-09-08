@@ -779,7 +779,8 @@ def plot2d(
                 return "[" + ",".join(map(str, v)) + "]"
         return str(v)
 
-    title_parts = ["2D Partial Dependence of Expected Target"]
+    title_parts = [f"2D partial dependence of expected {tgt_col}"]
+
     # numeric constraints shown
     for name, val in kw_num.items():
         title_parts.append(f"{name}={_fmt_c(val)}")
@@ -800,13 +801,30 @@ def plot2d(
     height = max(height, 400)
 
     fig.update_layout(
-        coloraxis=dict(colorscale=colorscale, cmin=cmin_t, cmax=cmax_t,
-                       colorbar=dict(title=z_title)),
         template="simple_white",
         width=width,
         height=height,
         title=title,
-        legend_title_text=""
+        legend_title_text="",
+        coloraxis=dict(
+            colorscale=colorscale,
+            cmin=cmin_t, cmax=cmax_t,
+            colorbar=dict(
+                title=z_title,
+                thickness=10,          # thinner bar
+                len=0.55,              # shorter bar (fraction of plot height)
+                lenmode="fraction",
+                x=1.02, y=0.5,         # just right of plot, vertically centered
+                xanchor="left", yanchor="middle",
+            ),
+        ),
+        legend=dict(
+            orientation="v",
+            x=1.02, xanchor="left",   # to the right of the colorbar
+            y=1.0,  yanchor="top",
+            bgcolor="rgba(255,255,255,0.85)"
+        ),
+        margin=dict(t=90, r=100),       # room for title + legend + colorbar
     )
 
     if output:
