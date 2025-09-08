@@ -2,7 +2,10 @@
 
 .. start-badges
 
-|testing badge| |coverage badge| |docs badge| |black badge|
+|pypi badge| |testing badge| |coverage badge| |docs badge| |black badge|
+
+.. |pypi badge| image:: https://img.shields.io/pypi/v/psyop.svg?color=blue
+    :target: https://pypi.org/project/psyop/
 
 .. |testing badge| image:: https://github.com/rbturnbull/psyop/actions/workflows/testing.yml/badge.svg
     :target: https://github.com/rbturnbull/psyop/actions
