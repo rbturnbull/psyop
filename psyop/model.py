@@ -75,25 +75,40 @@ def build_model(
     if success_column:
         excluded.add(success_column)
 
-    # Candidate features: numeric columns not excluded
     numeric_cols = [
         c for c in df.columns
         if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
     ]
-    if not numeric_cols:
-        raise RuntimeError("No numeric feature columns found after exclusions.")
 
-    # -----------------------
-    # Per-feature transforms (auto)
-    # -----------------------
-    feature_names = list(numeric_cols)
+    # OPTIONAL: include categoricals via one-hot encoding
+    cat_cols = [
+        c for c in df.columns
+        if c not in excluded
+        and (pd.api.types.is_string_dtype(df[c]) or pd.api.types.is_categorical_dtype(df[c]))
+    ]
+
+    feature_names = []
     transforms = []
     X_raw_cols = []
-    for name in feature_names:
+
+    # numeric features (as before)
+    for name in numeric_cols:
         col = df[name].to_numpy().astype(float)
         tr = _choose_transform(name, col)
         transforms.append(tr)
+        feature_names.append(name)
         X_raw_cols.append(_apply_transform(tr, col))
+
+    # one-hot for categoricals (all levels; set drop_first=True if you prefer)
+    for name in cat_cols:
+        # normalize to pandas StringDtype, handle missing
+        s_cat = pd.Categorical(df[name].astype("string").fillna("<NA>"))
+        # get_dummies returns float if dtype=float
+        H = pd.get_dummies(s_cat, prefix=name, prefix_sep="=", dtype=float)  # e.g., language=en
+        for new_col in H.columns:
+            feature_names.append(new_col)          # e.g., "language=en"
+            transforms.append("identity")          # 0/1 indicators; no log
+            X_raw_cols.append(H[new_col].to_numpy(dtype=float))
 
     X_raw = np.column_stack(X_raw_cols).astype(float)
     n, p = X_raw.shape
@@ -173,11 +188,20 @@ def build_model(
     # Raw columns (strings and numerics) — from df_raw (no __success__ ever added)
     raw_vars = {}
     for col in df_raw.columns:
-        vals = df_raw[col].to_numpy()
-        if pd.api.types.is_integer_dtype(vals) or pd.api.types.is_float_dtype(vals) or pd.api.types.is_bool_dtype(vals):
-            raw_vars[col] = (("row",), vals)
+        s = df_raw[col]
+        if (
+            pd.api.types.is_integer_dtype(s)
+            or pd.api.types.is_float_dtype(s)
+            or pd.api.types.is_bool_dtype(s)
+        ):
+            # numeric-like: store as-is
+            raw_vars[col] = (("row",), s.to_numpy())
         else:
-            raw_vars[col] = (("row",), vals.astype("string"))
+            # text-like: normalize to pandas StringDtype, then to NumPy unicode
+            # fill missing with a sentinel to avoid None/<NA> in Unicode arrays
+            s_str = s.astype("string").fillna("<NA>")
+            vals = s_str.to_numpy(dtype="U")  # fixed-width Unicode, NetCDF-safe
+            raw_vars[col] = (("row",), vals)
 
     ds = xr.Dataset(
         data_vars={

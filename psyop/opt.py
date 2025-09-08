@@ -3,6 +3,7 @@
 
 from pathlib import Path
 from typing import Callable, Any
+import re
 
 import numpy as np
 import pandas as pd
@@ -16,11 +17,170 @@ from .model import (
     solve_chol,
     solve_lower,
 )
+from .model import feature_raw_from_artifact_or_reconstruct
 
 from rich.console import Console
 from rich.table import Table
 
 console = Console()
+
+_ONEHOT_RE = re.compile(r"^(?P<base>[^=]+)=(?P<label>.+)$")
+
+
+def _pretty_conditioned_on(
+    fixed_norm_numeric: dict | None = None,
+    cat_fixed_label: dict | None = None,
+) -> str:
+    """
+    Combine numeric fixed constraints (already normalized to model space)
+    with categorical fixed choices into a single human-readable string.
+
+    Examples:
+      - fixed_norm_numeric = {"epochs": 12.0, "batch_size": 32}
+      - cat_fixed_label    = {"language": "Linear B"}
+
+    Returns:
+      "epochs=12, batch_size=32, language=Linear B"
+      (ordering is deterministic: keys sorted within each group)
+    """
+    fixed_norm_numeric = fixed_norm_numeric or {}
+    cat_fixed_label = cat_fixed_label or {}
+
+    parts = []
+
+    # Prefer the project-standard formatter if present.
+    try:
+        if fixed_norm_numeric:
+            txt = _fixed_as_string(fixed_norm_numeric)  # e.g. "epochs=12, batch_size=32"
+            if txt:
+                parts.append(txt)
+    except Exception:
+        # Fallback: simple k=v with general formatting.
+        if fixed_norm_numeric:
+            items = []
+            for k, v in sorted(fixed_norm_numeric.items()):
+                try:
+                    items.append(f"{k}={float(v):.6g}")
+                except Exception:
+                    items.append(f"{k}={v}")
+            parts.append(", ".join(items))
+
+    # Append categorical fixed choices as "base=Label"
+    if cat_fixed_label:
+        cat_txt = ", ".join(f"{b}={lab}" for b, lab in sorted(cat_fixed_label.items()))
+        if cat_txt:
+            parts.append(cat_txt)
+
+    return ", ".join(p for p in parts if p)
+
+
+def _split_constraints_for_numeric_and_categorical(
+    feature_names: list[str],
+    kwargs: dict[str, object],
+):
+    """
+    Split user constraints into:
+      - numeric: user_fixed, user_ranges, user_choices_num (by feature name)
+      - categorical: cat_fixed_label (base->label), cat_allowed (base->set(labels))
+      - and return one-hot groups
+
+    Interp rules:
+      * For a categorical base key (e.g. 'language'):
+          - str  -> fixed single label
+          - list/tuple of str -> allowed label set
+      * For a numeric feature key (non one-hot member):
+          - number -> fixed
+          - slice(lo,hi[,step]) -> range (lo,hi) inclusive on ends in post-filter
+          - list/tuple of numbers -> finite choices
+          - range(...) (python range) -> tuple of ints (choices)
+    """
+    groups = _onehot_groups(feature_names)
+    bases = set(groups.keys())
+    feature_set = set(feature_names)
+
+    user_fixed: dict[str, float] = {}
+    user_ranges: dict[str, tuple[float, float]] = {}
+    user_choices_num: dict[str, list[int | float]] = {}
+
+    cat_fixed_label: dict[str, str] = {}
+    cat_allowed: dict[str, set[str]] = {}
+
+    # helper
+    def _is_intlike(x) -> bool:
+        try:
+            return float(int(round(float(x)))) == float(x)
+        except Exception:
+            return False
+
+    for key, raw in (kwargs or {}).items():
+        # --- CATEGORICAL (by base key, not member name) ---
+        if key in bases:
+            labels = groups[key]["labels"]
+            # fixed single label
+            if isinstance(raw, str):
+                if raw not in labels:
+                    raise ValueError(f"Unknown category for {key!r}: {raw!r}. Choices: {labels}")
+                cat_fixed_label[key] = raw
+                cat_allowed[key] = {raw}
+                continue
+            # list/tuple of labels (choices restriction)
+            if isinstance(raw, (list, tuple, set)):
+                chosen = [v for v in raw if isinstance(v, str) and (v in labels)]
+                if not chosen:
+                    raise ValueError(f"No valid categories for {key!r} in {raw!r}. Choices: {labels}")
+                cat_allowed[key] = set(chosen)
+                continue
+            # anything else -> ignore for cats
+            continue
+
+        # --- NUMERIC (by feature name; skip one-hot member names) ---
+        # If user accidentally passes member name 'language=Linear A', ignore here
+        if key not in feature_set or _ONEHOT_RE.match(key):
+            # Unknown or member-level keys are ignored at this stage
+            continue
+
+        # python range -> tuple of ints
+        if isinstance(raw, range):
+            raw = tuple(raw)
+
+        # number -> fixed
+        if isinstance(raw, (int, float, np.number)):
+            val = float(raw)
+            if np.isfinite(val):
+                user_fixed[key] = val
+            continue
+
+        # slice -> float range
+        if isinstance(raw, slice):
+            if raw.start is None or raw.stop is None:
+                continue
+            lo = float(raw.start); hi = float(raw.stop)
+            if not (np.isfinite(lo) and np.isfinite(hi)):
+                continue
+            if lo > hi:
+                lo, hi = hi, lo
+            user_ranges[key] = (lo, hi)
+            continue
+
+        # list/tuple -> numeric choices
+        if isinstance(raw, (list, tuple)):
+            if len(raw) == 0:
+                continue
+            # preserve ints if all int-like, else floats
+            if all(_is_intlike(v) for v in raw):
+                user_choices_num[key] = [int(round(float(v))) for v in raw]
+            else:
+                user_choices_num[key] = [float(v) for v in raw]
+            continue
+
+        # otherwise: ignore
+
+    # Numeric fixed wins over its own range/choices
+    for k in list(user_fixed.keys()):
+        user_ranges.pop(k, None)
+        user_choices_num.pop(k, None)
+
+    return groups, user_fixed, user_ranges, user_choices_num, cat_fixed_label, cat_allowed
 
 
 def df_to_table(
@@ -55,6 +215,151 @@ def df_to_table(
     return rich_table
 
 
+def _detect_categorical_groups(feature_names: list[str]) -> dict[str, list[tuple[str, str]]]:
+    """
+    Detect one-hot groups: {"language": [("language=Linear A","Linear A"), ("language=Linear B","Linear B"), ...]}
+    """
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for name in feature_names:
+        m = _ONEHOT_RE.match(name)
+        if not m:
+            continue
+        base = m.group("base")
+        lab  = m.group("label")
+        groups.setdefault(base, []).append((name, lab))
+    # deterministic order
+    for base in groups:
+        groups[base].sort(key=lambda t: t[1])
+    return groups
+
+def _project_categoricals_to_valid_onehot(df: pd.DataFrame, groups: dict[str, list[tuple[str, str]]]) -> pd.DataFrame:
+    """
+    For each categorical group ensure exactly one column is 1 and the rest 0 (argmax projection).
+    Works whether columns are 0/1 already or arbitrary scores in [0,1].
+    """
+    for base, pairs in groups.items():
+        cols = [name for name, _ in pairs if name in df.columns]
+        if len(cols) <= 1:
+            continue
+        sub = df[cols].to_numpy(dtype=float)
+        # treat NaNs as -inf so they never win
+        sub = np.where(np.isfinite(sub), sub, -np.inf)
+        if sub.size == 0:
+            continue
+        idx = np.argmax(sub, axis=1)
+        new = np.zeros_like(sub)
+        new[np.arange(sub.shape[0]), idx] = 1.0
+        df.loc[:, cols] = new
+    return df
+
+
+def _apply_categorical_constraints(df: pd.DataFrame,
+                                   groups: dict[str, list[tuple[str, str]]],
+                                   fixed_str: dict[str, str],
+                                   allowed_strs: dict[str, list[str]]) -> pd.DataFrame:
+    """
+    Filter rows by categorical constraints expressed on the base names, e.g.
+      fixed_str = {"language": "Linear B"}
+      allowed_strs = {"language": ["Linear A", "Linear B"]}
+    Operates on one-hot columns, so call BEFORE collapsing to string columns.
+    """
+    mask = np.ones(len(df), dtype=bool)
+    for base, val in (fixed_str or {}).items():
+        if base not in groups:
+            continue
+        cols = {label: name for name, label in groups[base] if name in df.columns}
+        want = cols.get(val)
+        if want is None:
+            # no matching one-hot column — drop all rows
+            mask &= False
+        else:
+            mask &= (df[want] >= 0.5)  # after projection, exactly 1 column is 1
+    for base, vals in (allowed_strs or {}).items():
+        if base not in groups:
+            continue
+        cols = {label: name for name, label in groups[base] if name in df.columns}
+        want_cols = [cols[v] for v in vals if v in cols]
+        if want_cols:
+            mask &= (df[want_cols].sum(axis=1) >= 0.5)
+        else:
+            mask &= False
+    return df.loc[mask].reset_index(drop=True)
+
+
+def _onehot_groups(feature_names: list[str]) -> dict[str, dict]:
+    """
+    Detect one-hot groups among feature names like 'language=Linear A'.
+    Returns:
+      {
+        base: {
+          "labels": [label1, ...],
+          "members": [(feat_name, label), ...],
+          "name_by_label": {label: feat_name}
+        },
+        ...
+      }
+    """
+    groups: dict[str, dict] = {}
+    for name in feature_names:
+        m = _ONEHOT_RE.match(name)
+        if not m:
+            continue
+        base = m.group("base")
+        label = m.group("label")
+        g = groups.setdefault(base, {"labels": [], "members": [], "name_by_label": {}})
+        g["labels"].append(label)
+        g["members"].append((name, label))
+        g["name_by_label"][label] = name
+    # stable order for labels
+    for g in groups.values():
+        # keep insertion order from feature_names, but ensure uniqueness
+        seen = set()
+        uniq = []
+        for lab in g["labels"]:
+            if lab not in seen:
+                uniq.append(lab); seen.add(lab)
+        g["labels"] = uniq
+    return groups
+
+
+
+def _numeric_specs_only(search_specs: dict, groups: dict) -> dict:
+    """
+    Return a copy of search_specs with one-hot member feature names removed.
+    `groups` is the output of _onehot_groups(feature_names).
+    """
+    if not groups:
+        return dict(search_specs)
+
+    onehot_member_names = set()
+    for g in groups.values():
+        onehot_member_names.update(g["name_by_label"].values())
+
+    return {k: v for k, v in search_specs.items() if k not in onehot_member_names}
+
+
+def _assert_valid_onehot(df: pd.DataFrame, groups: dict[str, dict], where: str = "") -> None:
+    """
+    Assert every one-hot block has exactly one '1' per row (no NaNs).
+    Prints a small diagnostic if not.
+    """
+    for base, g in groups.items():
+        member_cols = [g["name_by_label"][lab] for lab in g["labels"] if g["name_by_label"][lab] in df.columns]
+        if not member_cols:
+            print(f"[onehot] {where}: base={base} has no member columns present")
+            continue
+
+        block = df[member_cols].to_numpy()
+        nonfinite_mask = ~np.isfinite(block)
+        sums = np.nan_to_num(block, nan=0.0, posinf=0.0, neginf=0.0).sum(axis=1)
+
+        bad = np.where(nonfinite_mask.any(axis=1) | (sums != 1))[0]
+        if bad.size:
+            print(f"[BUG onehot] {where}: base={base}, rows with invalid one-hot: {bad[:20].tolist()} (showing first 20)")
+            print("member_cols:", member_cols)
+            print(df.iloc[bad[:5]][member_cols])  # show a few bad rows
+            raise RuntimeError(f"Invalid one-hot block for base={base} at {where}")
+
 
 def suggest(
     model: xr.Dataset | Path | str,
@@ -64,16 +369,18 @@ def suggest(
     explore: float = 0.34,
     candidates_pool: int = 5000,
     random_seed: int = 0,
-    **kwargs,  # feature constraints: number (fixed), slice (float range), list/tuple (choices); range->tuple
+    **kwargs,  # feature constraints: number, slice(lo:hi), list/tuple (choices), range->tuple, categorical
 ) -> pd.DataFrame:
     """
-    Propose candidates via constrained EI + exploration.
+    Propose candidates via constrained EI + exploration (numeric + categorical).
 
-    kwargs semantics (ORIGINAL units):
-      - number (int/float): fixed value (e.g. epochs=20).
-      - slice(start, stop): inclusive float range (e.g. x=slice(0.0, 2.0)).
-      - list/tuple: finite choices (e.g. batch_size=(16, 20, 24)).
-      - range(...): converted to tuple of ints, then treated as choices.
+    Constraints (original units):
+      - number (int/float): fixed value, e.g. epochs=20
+      - slice(lo, hi): inclusive float range, e.g. learning_rate=slice(1e-5, 1e-3)
+      - list/tuple: finite numeric choices, e.g. batch_size=(16, 32, 64)
+      - range(...): converted to tuple of ints (choices)
+      - categorical base, e.g. language="Linear B" or language=("Linear A","Linear B")
+        (uses one-hot blocks inside the model; pass the *base* name on CLI/code)
     """
     ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
@@ -84,104 +391,66 @@ def suggest(
     feat_std  = ds["feature_std"].values.astype(float)
     Xn_train  = ds["Xn_train"].values.astype(float)
 
-    # 1) Defaults from data
+    # Detect one-hot groups from model feature names
+    groups = _onehot_groups(feature_names)
+
+    # 1) Defaults from data (numeric bounds/choices inferred per feature)
     search_specs = _infer_search_specs(ds, feature_names, transforms)
 
-    # 2) Normalize user constraints according to the convention
-    user_fixed: dict[str, float] = {}
-    user_ranges: dict[str, tuple[float, float]] = {}   # slice → (lo, hi) inclusive
-    user_choices: dict[str, list[float | int]] = {}
+    # 2) Split user kwargs into numeric vs categorical constraints
+    groups2, user_fixed_num, user_ranges_num, user_choices_num, cat_fixed_label, cat_allowed = (
+        _split_constraints_for_numeric_and_categorical(feature_names, kwargs)
+    )
+    # Use the groups we computed first (same structure); groups2 is identical—kept for clarity
+    groups = groups or groups2
 
-    for key, raw_val in (kwargs or {}).items():
-        if key not in feature_names:
-            console.print(f"[yellow]Warning: ignoring unknown feature constraint '{key}'[/yellow]")
-            continue
+    # 3) Apply numeric bounds/choices to search space & normalize numeric fixed values
+    _apply_user_bounds(search_specs, user_ranges_num, user_choices_num)
+    fixed_norm = _normalize_fixed(user_fixed_num, search_specs)
 
-        # range -> tuple of ints (choices)
-        if isinstance(raw_val, range):
-            raw_val = tuple(raw_val)
+    # Numeric subset (for sampling), excluding one-hot member features
+    numeric_specs = _numeric_specs_only(search_specs, groups)
+    fixed_norm_numeric = {k: v for k, v in fixed_norm.items() if k in numeric_specs}
 
-        # number -> fixed
-        if isinstance(raw_val, (int, float, np.number)):
-            val = float(raw_val)
-            if np.isfinite(val):
-                user_fixed[key] = val
-            continue
-
-        # slice -> (lo, hi) inclusive
-        if isinstance(raw_val, slice):
-            if raw_val.start is None or raw_val.stop is None:
-                continue
-            lo = float(raw_val.start); hi = float(raw_val.stop)
-            if not (np.isfinite(lo) and np.isfinite(hi)):
-                continue
-            if lo > hi:
-                lo, hi = hi, lo
-            user_ranges[key] = (lo, hi)
-            continue
-
-        # list/tuple -> choices
-        if isinstance(raw_val, (list, tuple)):
-            if len(raw_val) == 0:
-                continue
-            if all(isinstance(v, (int, np.integer)) or abs(float(v) - round(float(v))) < 1e-12 for v in raw_val):
-                user_choices[key] = [int(round(float(v))) for v in raw_val]
-            else:
-                user_choices[key] = [float(v) for v in raw_val]
-            continue
-
-    # Fixed wins over range/choices for the same key
-    for k in list(user_fixed.keys()):
-        user_ranges.pop(k, None)
-        user_choices.pop(k, None)
-
-    # 3) Apply user bounds/choices to search space & normalize fixed values
-    _apply_user_bounds(search_specs, user_ranges, user_choices)
-    fixed_norm = _normalize_fixed(user_fixed, search_specs)
-
-    # 4) Best feasible observed target for EI baseline
+    # 4) Baseline for EI (best feasible observed target)
     direction = str(ds.attrs.get("direction", "min"))
     best_feasible = _best_feasible_observed(ds, direction)
 
-    # --- Helper: strict post-filter in ORIGINAL units -----------------------
-    def _filter_to_constraints(df: pd.DataFrame) -> pd.DataFrame:
-        mask = np.ones(len(df), dtype=bool)
-        # inclusive [lo, hi]
-        for k, (lo, hi) in user_ranges.items():
-            mask &= (df[k] >= lo) & (df[k] <= hi)
-        # finite choices
-        for k, vals in user_choices.items():
-            mask &= df[k].isin(vals)
-        # fixed values (tolerate tiny float error)
-        for k, val in user_fixed.items():
-            if pd.api.types.is_integer_dtype(df[k].dtype):
-                mask &= (df[k] == int(round(val)))
-            else:
-                mask &= np.isfinite(df[k]) & (np.abs(df[k] - float(val)) <= 1e-12)
-        return df.loc[mask].reset_index(drop=True)
-    # -----------------------------------------------------------------------
-
-    # 5) Sample candidate pool (respecting bounds + fixed), then hard-filter.
+    # 5) Sample candidate pool:
     rng = np.random.default_rng(random_seed)
-    cand_df = _sample_candidates(search_specs, n=candidates_pool, rng=rng, fixed=fixed_norm)
-    cand_df = _filter_to_constraints(cand_df)
 
-    # If constraints are tight, top-up by resampling a few times.
+    # (a) numeric-only specs
+    numeric_specs = _numeric_specs_only(search_specs, groups)
+    fixed_norm_numeric = {k: v for k, v in fixed_norm.items() if k in numeric_specs}
+
+    cand_num = _sample_candidates(numeric_specs, n=candidates_pool, rng=rng, fixed=fixed_norm_numeric)
+
+    # (b) inject one-hot blocks
+    cand_df = _inject_onehot_groups(cand_num, groups, rng, cat_fixed_label, cat_allowed)
+    _assert_valid_onehot(cand_df, groups, where="after inject")
+
+    # (c) filter numerics
+    cand_df = _postfilter_numeric_constraints(cand_df, user_fixed_num, user_ranges_num, user_choices_num)
+    _assert_valid_onehot(cand_df, groups, where="after post-filter")
+
+    # Top-up if constraints are tight
     target_pool = max(candidates_pool // 2, count * 20)
     attempts = 0
     while len(cand_df) < target_pool and attempts < 8:
-        extra = _sample_candidates(search_specs, n=candidates_pool, rng=rng, fixed=fixed_norm)
-        extra = _filter_to_constraints(extra)
+        extra_num = _sample_candidates(numeric_specs, n=candidates_pool, rng=rng, fixed=fixed_norm_numeric)
+        extra = _inject_onehot_groups(extra_num, groups, rng, cat_fixed_label, cat_allowed)
+        extra = _postfilter_numeric_constraints(extra, user_fixed_num, user_ranges_num, user_choices_num)
         if not extra.empty:
-            cand_df = pd.concat([cand_df, extra], ignore_index=True)
-            cand_df = cand_df.drop_duplicates()
+            cand_df = pd.concat([cand_df, extra], ignore_index=True).drop_duplicates()
+            _assert_valid_onehot(cand_df, groups, where="after top-up concat")
+
         attempts += 1
 
     if cand_df.empty:
         raise ValueError("No candidates satisfy the provided constraints; relax the ranges or choices.")
 
-    # 6) Predict in model space
-    Xn_cands = _original_df_to_standardized(cand_df, feature_names, transforms, feat_mean, feat_std)
+    # 6) Predictions in model space (respect feature order)
+    Xn_cands = _original_df_to_standardized(cand_df[feature_names], feature_names, transforms, feat_mean, feat_std)
     p = pred_success(Xn_cands)
     mu, sd = pred_loss(Xn_cands, include_observation_noise=True)
     sd = np.maximum(sd, 1e-12)
@@ -217,15 +486,174 @@ def suggest(
     out["acq_explore"]      = expl[chosen_idx]
     out["novelty_norm"]     = nov_norm[chosen_idx]
     out["direction"]        = direction
-    out["conditioned_on"]   = _fixed_as_string(fixed_norm)  # fixed only; bounds/choices are enforced above
+
+    out["conditioned_on"] = _pretty_conditioned_on(
+        fixed_norm_numeric=fixed_norm_numeric,
+        cat_fixed_label=cat_fixed_label
+    )
+
+    # Collapse one-hot columns to a single categorical base column
+    out["conditioned_on"] = _pretty_conditioned_on(
+        fixed_norm_numeric=fixed_norm_numeric,
+        cat_fixed_label=cat_fixed_label
+    )
+
+    breakpoint()
+
+    out = _collapse_onehot_to_categorical(out, groups)
+
+    # Optional: reorder columns to show features first, then metrics
+    member_names = {name for g in groups.values() for (name, _lab) in g["members"]}
+    # numeric features = original model features that are not one-hot members
+    numeric_feature_names = [fn for fn in feature_names if fn not in member_names]
+    base_names = list(groups.keys())  # e.g., ["language", ...]
+    metrics = [
+        "pred_p_success", "pred_target_mean", "pred_target_sd",
+        "acq_cEI", "acq_explore", "novelty_norm", "direction", "conditioned_on",
+    ]
+    # Keep only those that exist
+    ordered_cols = (
+        ["rank"]
+        + [c for c in numeric_feature_names if c in out.columns]
+        + [c for c in base_names if c in out.columns]
+        + [c for c in metrics if c in out.columns]
+    )
+    # add any leftover columns at the end (safe)
+    leftovers = [c for c in out.columns if c not in ordered_cols]
+    out = out[ordered_cols + leftovers]
 
     if output:
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
         out.to_csv(output, index=False)
 
-    console.print(df_to_table(out))
+    try:
+        console  # type: ignore[name-defined]
+        console.print(df_to_table(out))  # type: ignore[arg-type]
+    except Exception:
+        pass
+
     return out
+
+
+def _collapse_onehot_to_categorical(df: pd.DataFrame, groups: dict[str, dict]) -> pd.DataFrame:
+    """
+    Collapse one-hot blocks (e.g. language=Linear A, language=Linear B) into a single
+    categorical column 'language'. Leaves <NA> only if a row is ambiguous (sum!=1).
+    """
+    out = df.copy()
+
+    for base, g in groups.items():
+        # column order must match label order
+        labels = list(g["labels"])
+        member_cols = [g["name_by_label"][lab] for lab in labels if g["name_by_label"][lab] in out.columns]
+        if not member_cols:
+            continue
+
+        # robust numeric block: NaN→0, float for safe sums/argmax
+        block = out[member_cols].to_numpy(dtype=float)
+        block = np.nan_to_num(block, nan=0.0, posinf=0.0, neginf=0.0)
+
+        row_sums = block.sum(axis=1)
+        argmax   = np.argmax(block, axis=1)
+
+        # exactly-one-hot per row (tolerant to tiny fp wiggle)
+        valid = np.isfinite(row_sums) & (np.abs(row_sums - 1.0) <= 1e-9)
+
+        chosen = np.full(len(out), None, dtype=object)
+        if valid.any():
+            lab_arr = np.array(labels, dtype=object)
+            chosen[valid] = lab_arr[argmax[valid]]
+
+        # write the categorical column with proper alignment
+        out[base] = pd.Series(chosen, index=out.index, dtype="string")
+
+        # drop the one-hot members
+        out.drop(columns=[c for c in member_cols if c in out.columns], inplace=True)
+
+    return out
+
+
+
+def _inject_onehot_groups(
+    cand_df: pd.DataFrame,
+    groups: dict[str, dict],
+    rng: np.random.Generator,
+    cat_fixed_label: dict[str, str],
+    cat_allowed: dict[str, set[str]],
+) -> pd.DataFrame:
+    """
+    Ensure each one-hot block has exactly one '1' per row (or a fixed label),
+    by initializing member columns to 0 then writing the chosen label as 1.
+    """
+    out = cand_df.copy()
+    n = len(out)
+
+    for base, g in groups.items():
+        labels = g["labels"]
+        member_cols = [g["name_by_label"][lab] for lab in labels]
+
+        # Create/overwrite member columns with zeros to avoid NaNs
+        for col in member_cols:
+            out[col] = 0
+
+        # Allowed labels for this base
+        allowed = list(cat_allowed.get(base, set(labels)))
+        if not allowed:
+            allowed = labels
+
+        # Choose a label per row
+        if base in cat_fixed_label:
+            chosen = np.full(n, cat_fixed_label[base], dtype=object)
+        else:
+            idx = rng.integers(0, len(allowed), size=n)
+            chosen = np.array([allowed[i] for i in idx], dtype=object)
+
+        # Set one-hot = 1 for the chosen label, keep others at 0
+        for lab, col in zip(labels, member_cols):
+            out.loc[chosen == lab, col] = 1
+
+        # Enforce integer dtype (clean)
+        out[member_cols] = out[member_cols].astype(int)
+
+    return out
+
+
+def _postfilter_numeric_constraints(
+    df: pd.DataFrame,
+    user_fixed_num: dict,
+    user_ranges_num: dict,
+    user_choices_num: dict,
+) -> pd.DataFrame:
+    """
+    Keep rows satisfying numeric constraints (fixed / ranges / choices).
+    Nonexistent columns are ignored.
+    """
+    if df.empty:
+        return df
+
+    mask = np.ones(len(df), dtype=bool)
+
+    # ranges: inclusive
+    for k, (lo, hi) in user_ranges_num.items():
+        if k in df.columns:
+            mask &= (df[k] >= lo) & (df[k] <= hi)
+
+    # finite numeric choices
+    for k, vals in user_choices_num.items():
+        if k in df.columns:
+            mask &= df[k].isin(vals)
+
+    # fixed values (tolerate tiny float error)
+    for k, val in user_fixed_num.items():
+        if k in df.columns:
+            col = df[k]
+            if pd.api.types.is_integer_dtype(col.dtype):
+                mask &= (col == int(round(val)))
+            else:
+                mask &= np.isfinite(col) & (np.abs(col - float(val)) <= 1e-12)
+
+    return df.loc[mask].reset_index(drop=True)
 
 
 def optimal(
@@ -414,13 +842,21 @@ def _infer_search_specs(
 
     df_raw = pd.DataFrame({k: ds[k].values for k in ds.data_vars if ds[k].dims == ("row",)})
     # prefer top-level columns if present
-    for name in feature_names:
+    for j, name in enumerate(feature_names):
         if name in df_raw.columns:
             vals = pd.to_numeric(pd.Series(df_raw[name]), errors="coerce").dropna().to_numpy()
         else:
             # fallback: reconstruct original units from standardized arrays if needed
             # (in your artifact, raw columns are stored; so this path is rarely used)
-            vals = pd.to_numeric(pd.Series(ds[name].values), errors="coerce").dropna().to_numpy()
+            try:
+                base_vals = ds[name].values  # raw per-row column, if present
+            except KeyError:
+                # Not stored as a data_var (e.g., one-hot feature); reconstruct from Xn_train
+                # j is the feature index in feature_names; transforms[j] is 'identity' or 'log10'
+                base_vals = feature_raw_from_artifact_or_reconstruct(ds, j, name, transforms[j])
+
+            vals = pd.to_numeric(pd.Series(base_vals), errors="coerce").dropna().to_numpy()
+            
 
         if vals.size == 0:
             # degenerate column; fall back to [0,1]
