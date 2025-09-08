@@ -411,12 +411,7 @@ def _infer_search_specs(
         if intish:
             lo_i = int(np.floor(lo))
             hi_i = int(np.ceil(hi))
-            uniq = np.unique(vals.astype(int))
-            # if small finite set, treat as choices
-            if uniq.size <= 20:
-                specs[name] = {"type": "choice", "choices": uniq.tolist(), "dtype": "int"}
-            else:
-                specs[name] = {"type": "int", "lo": lo_i, "hi": hi_i}
+            specs[name] = {"type": "int", "lo": lo_i, "hi": hi_i}
         else:
             specs[name] = {"type": "float", "lo": float(lo), "hi": float(hi)}
     return specs
