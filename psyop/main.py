@@ -255,7 +255,7 @@ def _canonicalize_feature_keys(
             alias[k] = base
             continue
 
-        console.print(f":warning: [yellow]Ignoring unknown feature key[/]: '{k}'")
+        raise typer.BadParameter(f"Unknown feature key: {k}")
 
     return mapped, alias
 

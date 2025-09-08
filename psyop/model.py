@@ -80,7 +80,7 @@ def build_model(
         if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
     ]
 
-    # OPTIONAL: include categoricals via one-hot encoding
+    # include categoricals via one-hot encoding
     cat_cols = [
         c for c in df.columns
         if c not in excluded
