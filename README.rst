@@ -27,8 +27,17 @@ Install using pip:
 
 .. code-block:: bash
 
+    pip install psyop
+
+Or
+
+.. code-block:: bash
+
     pip install git+https://github.com/rbturnbull/psyop.git
 
+.. warning::
+
+    Psyop is currently in alpha testing phase. More updates are coming soon.
 
 Quick help
 ----------
@@ -297,6 +306,154 @@ Examples at a glance
 
     # 1D PD with CSV export
     psyop plot1d output/trials.nc --csv-out output/pd.csv -o output/pd.html
+
+
+Programmatic API
+================
+
+All functionality is also exposed as Python functions. You can work directly with
+``xarray.Dataset`` objects or file paths.
+
+Import paths:
+
+.. code-block:: python
+
+    import xarray as xr
+    from pathlib import Path
+    from psyop import build_model, optimal, suggest, plot1d, plot2d
+
+Build a model
+-------------
+
+.. code-block:: python
+
+    build_model(
+        input=Path("runs.csv"),
+        output=Path("output/trials.nc"),
+        target_column="loss",
+        exclude_columns=["run_id", "notes"],
+        direction="auto",          # "min", "max", or "auto"
+        success_column=None,       # infer success as ~isna(target)
+        random_seed=42,
+        compress=True,             # compress numeric arrays within the .nc
+    )
+
+Load a model
+------------
+
+.. code-block:: python
+
+    ds = xr.load_dataset("output/trials.nc")
+
+Suggest candidates
+------------------
+
+.. code-block:: python
+
+    # Constraints are passed as kwargs in ORIGINAL units:
+    # - fixed: number
+    # - range: slice(lo, hi)          (inclusive semantics for the endpoints)
+    # - choices: list/tuple (finite)  (e.g. tuple(range(...)))
+    suggestions = suggest(
+        model=ds,                    # or "output/trials.nc"
+        output=None,                 # optional CSV path; None to return only the DataFrame
+        count=12,
+        p_success_threshold=0.8,
+        explore_fraction=0.34,
+        candidates_pool=5000,
+        random_seed=0,
+        epochs=20,                   # fixed
+        dropout=slice(0.0, 0.2),     # range
+        batch_size=(16, 32, 64),     # choices
+    )
+    print(suggestions.head())
+
+Rank probable optima
+--------------------
+
+.. code-block:: python
+
+    top = optimal(
+        model=ds,                    # or "output/trials.nc"
+        output=None,                 # optional CSV path
+        count=10,
+        n_draws=2000,
+        min_success_probability=0.5, # 0.0 disables the hard cutoff
+        random_seed=0,
+        epochs=12,
+        dropout=slice(0.0, 0.2),
+    )
+    print(top[["prob_best_feasible", "pred_target_mean"]].head())
+
+2D Partial Dependence (HTML)
+----------------------------
+
+.. code-block:: python
+
+    # Fixed features are clamped and removed from axes.
+    # Ranges clip the sweep domain even if historical points exist outside the range.
+    plot2d(
+        model=ds,                    # xarray.Dataset
+        output=Path("pairplot.html"),
+        n_points_1d=300,
+        n_points_2d=70,
+        use_log_scale_for_target=False,
+        log_shift_epsilon=1e-9,
+        colorscale="RdBu",
+        show=False,
+        n_contours=12,
+        optimal=True,                # overlay current best-probable optimum
+        suggest=5,                   # overlay top-N suggestions
+        width=None,
+        height=None,
+        epochs=20,
+        dropout=slice(0.0, 0.2),
+    )
+
+1D Partial Dependence (HTML + tidy CSV)
+---------------------------------------
+
+.. code-block:: python
+
+    plot1d(
+        model=ds,
+        output=Path("pd.html"),
+        csv_out=Path("pd.csv"),
+        n_points_1d=300,
+        line_color="rgb(31,119,180)",
+        band_alpha=0.25,
+        figure_height_per_row_px=320,
+        show=False,
+        use_log_scale_for_target_y=True,
+        log_y_epsilon=1e-9,
+        optimal=True,
+        suggest=3,
+        width=None,
+        height=None,
+        epochs=20,
+        dropout=slice(0.0, 0.2),
+    )
+
+Return types and side effects
+-----------------------------
+
+- ``build_model(...)`` → ``None`` (writes a ``.nc`` file).
+- ``suggest(...)`` → ``pandas.DataFrame`` (and optionally writes a CSV if ``output`` is provided).
+- ``optimal(...)`` → ``pandas.DataFrame`` (and optionally writes a CSV if ``output`` is provided).
+- ``plot2d(...)`` → ``None`` (writes HTML if ``output`` is provided; may open a browser if ``show=True``).
+- ``plot1d(...)`` → ``None`` (writes HTML/CSV if paths are provided; may open a browser if ``show=True``).
+
+Constraint objects in Python
+----------------------------
+
+- **Fixed**: ``epochs=20`` or ``learning_rate=1e-3``.
+- **Range**: ``dropout=slice(0.0, 0.2)`` (inclusive ends).
+- **Choices**: ``batch_size=(16, 32, 64)`` (tuple/list of finite values).
+- **Integer grids**: ``layers=tuple(range(2, 9, 2))``  → ``(2, 4, 6, 8)``.
+
+All constraints are interpreted in **original units** of your data. Bounds are enforced
+for candidate sampling and sweep ranges; fixed values remove the feature from PD axes.
+
 
 .. end-quickstart
 
