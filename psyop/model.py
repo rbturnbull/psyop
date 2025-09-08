@@ -70,6 +70,7 @@ def build_model(
     # -----------------------
     # Exclude user-specified + target + success column + INTERNALS like "__success__"
     reserved_internals = {"__success__", "__fail__", "__status__"}
+    exclude_columns = exclude_columns or []
     excluded = set(exclude_columns) | {target_column} | reserved_internals
     if success_column:
         excluded.add(success_column)
@@ -232,7 +233,6 @@ def build_model(
             "random_seed": int(random_seed),
             "n_rows": int(n),
             "n_features": int(p),
-            "input_csv": str(input_path),
         },
     )
 

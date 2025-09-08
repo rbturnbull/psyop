@@ -59,9 +59,9 @@ def df_to_table(
 def suggest(
     model: xr.Dataset | Path | str,
     output: Path | str | None = None,
-    count: int = 12,
+    count: int = 10,
     p_success_threshold: float = 0.8,
-    explore_fraction: float = 0.34,
+    explore: float = 0.34,
     candidates_pool: int = 5000,
     random_seed: int = 0,
     **kwargs,  # feature constraints: number (fixed), slice (float range), list/tuple (choices); range->tuple
@@ -71,12 +71,11 @@ def suggest(
 
     kwargs semantics (ORIGINAL units):
       - number (int/float): fixed value (e.g. epochs=20).
-      - slice(start, stop): inclusive float range (e.g. learning_rate=slice(1e-5, 1e-3)).
+      - slice(start, stop): inclusive float range (e.g. x=slice(0.0, 2.0)).
       - list/tuple: finite choices (e.g. batch_size=(16, 20, 24)).
       - range(...): converted to tuple of ints, then treated as choices.
     """
     ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
-        
     pred_success, pred_loss = _build_predictors(ds)
 
     feature_names = list(map(str, ds["feature"].values.tolist()))
@@ -88,17 +87,17 @@ def suggest(
     # 1) Defaults from data
     search_specs = _infer_search_specs(ds, feature_names, transforms)
 
-    # 2) Normalize user constraints according to the new convention
+    # 2) Normalize user constraints according to the convention
     user_fixed: dict[str, float] = {}
-    user_ranges: dict[str, tuple[float, float]] = {}   # slice → (low, high) inclusive
+    user_ranges: dict[str, tuple[float, float]] = {}   # slice → (lo, hi) inclusive
     user_choices: dict[str, list[float | int]] = {}
 
     for key, raw_val in (kwargs or {}).items():
         if key not in feature_names:
-            # silently ignore unknown keys
+            console.print(f"[yellow]Warning: ignoring unknown feature constraint '{key}'[/yellow]")
             continue
 
-        # Convert range -> tuple of ints (then handled as choices)
+        # range -> tuple of ints (choices)
         if isinstance(raw_val, range):
             raw_val = tuple(raw_val)
 
@@ -109,30 +108,27 @@ def suggest(
                 user_fixed[key] = val
             continue
 
-        # slice -> float range (inclusive)
+        # slice -> (lo, hi) inclusive
         if isinstance(raw_val, slice):
             if raw_val.start is None or raw_val.stop is None:
-                continue  # require closed interval
-            lo = float(raw_val.start)
-            hi = float(raw_val.stop)
-            if np.isfinite(lo) and np.isfinite(hi):
-                if lo > hi:
-                    lo, hi = hi, lo
-                user_ranges[key] = (lo, hi)
+                continue
+            lo = float(raw_val.start); hi = float(raw_val.stop)
+            if not (np.isfinite(lo) and np.isfinite(hi)):
+                continue
+            if lo > hi:
+                lo, hi = hi, lo
+            user_ranges[key] = (lo, hi)
             continue
 
         # list/tuple -> choices
         if isinstance(raw_val, (list, tuple)):
             if len(raw_val) == 0:
                 continue
-            # Keep ints as ints if all entries are integer-like
             if all(isinstance(v, (int, np.integer)) or abs(float(v) - round(float(v))) < 1e-12 for v in raw_val):
                 user_choices[key] = [int(round(float(v))) for v in raw_val]
             else:
                 user_choices[key] = [float(v) for v in raw_val]
             continue
-
-        # anything else → ignore
 
     # Fixed wins over range/choices for the same key
     for k in list(user_fixed.keys()):
@@ -147,9 +143,42 @@ def suggest(
     direction = str(ds.attrs.get("direction", "min"))
     best_feasible = _best_feasible_observed(ds, direction)
 
-    # 5) Sample candidate pool (respecting bounds + fixed)
+    # --- Helper: strict post-filter in ORIGINAL units -----------------------
+    def _filter_to_constraints(df: pd.DataFrame) -> pd.DataFrame:
+        mask = np.ones(len(df), dtype=bool)
+        # inclusive [lo, hi]
+        for k, (lo, hi) in user_ranges.items():
+            mask &= (df[k] >= lo) & (df[k] <= hi)
+        # finite choices
+        for k, vals in user_choices.items():
+            mask &= df[k].isin(vals)
+        # fixed values (tolerate tiny float error)
+        for k, val in user_fixed.items():
+            if pd.api.types.is_integer_dtype(df[k].dtype):
+                mask &= (df[k] == int(round(val)))
+            else:
+                mask &= np.isfinite(df[k]) & (np.abs(df[k] - float(val)) <= 1e-12)
+        return df.loc[mask].reset_index(drop=True)
+    # -----------------------------------------------------------------------
+
+    # 5) Sample candidate pool (respecting bounds + fixed), then hard-filter.
     rng = np.random.default_rng(random_seed)
     cand_df = _sample_candidates(search_specs, n=candidates_pool, rng=rng, fixed=fixed_norm)
+    cand_df = _filter_to_constraints(cand_df)
+
+    # If constraints are tight, top-up by resampling a few times.
+    target_pool = max(candidates_pool // 2, count * 20)
+    attempts = 0
+    while len(cand_df) < target_pool and attempts < 8:
+        extra = _sample_candidates(search_specs, n=candidates_pool, rng=rng, fixed=fixed_norm)
+        extra = _filter_to_constraints(extra)
+        if not extra.empty:
+            cand_df = pd.concat([cand_df, extra], ignore_index=True)
+            cand_df = cand_df.drop_duplicates()
+        attempts += 1
+
+    if cand_df.empty:
+        raise ValueError("No candidates satisfy the provided constraints; relax the ranges or choices.")
 
     # 6) Predict in model space
     Xn_cands = _original_df_to_standardized(cand_df, feature_names, transforms, feat_mean, feat_std)
@@ -163,7 +192,7 @@ def suggest(
     expl = _exploration_score(sd, p, w_sd=1.0, w_boundary=0.5)
     nov  = _novelty_score(Xn_cands, Xn_train)
 
-    n_explore = int(np.ceil(count * explore_fraction))
+    n_explore = int(np.ceil(count * explore))
     n_exploit = max(0, count - n_explore)
 
     idx_exploit = np.argsort(-c_ei)[:n_exploit]
@@ -188,7 +217,7 @@ def suggest(
     out["acq_explore"]      = expl[chosen_idx]
     out["novelty_norm"]     = nov_norm[chosen_idx]
     out["direction"]        = direction
-    out["conditioned_on"]   = _fixed_as_string(fixed_norm)
+    out["conditioned_on"]   = _fixed_as_string(fixed_norm)  # fixed only; bounds/choices are enforced above
 
     if output:
         output = Path(output)
@@ -196,7 +225,6 @@ def suggest(
         out.to_csv(output, index=False)
 
     console.print(df_to_table(out))
-
     return out
 
 

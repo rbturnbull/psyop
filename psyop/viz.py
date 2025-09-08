@@ -100,6 +100,8 @@ def plot2d(
     n_contours: int = 12,
     optimal: bool = True,
     suggest: int = 0,
+    width:int|None = None,
+    height:int|None = None,
     **kwargs,
 ) -> go.Figure:
     """
@@ -423,12 +425,18 @@ def plot2d(
     z_title = "E[target|success]" + (" (log10)" if use_log_scale_for_target else "")
     if use_log_scale_for_target and global_shift > 0:
         z_title += f" (shift Δ={global_shift:.3g})"
+
+    width = width if (width and width > 0) else cell * k
+    width = max(width, 400)
+    height = height if (height and height > 0) else cell * k
+    height = max(height, 400)
+    
     fig.update_layout(
         coloraxis=dict(colorscale=colorscale, cmin=cmin_t, cmax=cmax_t,
                        colorbar=dict(title=z_title)),
         template="simple_white",
-        width=cell * k,
-        height=cell * k,
+        width=width,
+        height=height,
         title=title,
         legend_title_text=""
     )
@@ -450,11 +458,13 @@ def plot1d(
     line_color: str = "rgb(31,119,180)",
     band_alpha: float = 0.25,
     figure_height_per_row_px: int = 320,
-    show_figure: bool = False,
+    show: bool = False,
     use_log_scale_for_target_y: bool = True,   # log-y for target
     log_y_epsilon: float = 1e-9,
     optimal: bool = True,
     suggest: int = 0,
+    width:int|None = None,
+    height:int|None = None,
     **kwargs,
 ) -> go.Figure:
     """
@@ -737,8 +747,12 @@ def plot1d(
     if kw_fixed_raw:
         title += " — " + ", ".join(f"{k}={_fmt_c(kw_fixed_raw[k])}" for k in kw_fixed_raw)
 
+    width = width if (width and width > 0) else 700
+    height = height if (height and height > 0) else figure_height_per_row_px * len(free_idx)
+
     fig.update_layout(
-        height=figure_height_per_row_px * len(free_idx),
+        height=height,
+        width=width,
         template="simple_white",
         title=title,
         legend_title_text=""
@@ -752,7 +766,7 @@ def plot1d(
         csv_out = Path(csv_out)
         csv_out.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(tidy_rows).to_csv(str(csv_out), index=False)
-    if show_figure:
+    if show:
         fig.show("browser")
 
     return fig
