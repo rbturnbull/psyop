@@ -105,84 +105,161 @@ def plot2d(
     **kwargs,
 ) -> go.Figure:
     """
-    2D Partial Dependence of E[target|success] (pairwise features), optionally
-    conditioned on fixed variables (kwargs). Fixed vars are clamped and not plotted.
-    All cells—including the diagonal—are evaluated as true 2D grids.
+    2D Partial Dependence of E[target|success] (pairwise *numeric* features),
+    optionally conditioned on:
+      - numeric constraints via kwargs (fixed / slice / list/tuple)
+      - categorical base constraints via kwargs, e.g. language="Linear A"
+
+    Categorical constraints are enforced by:
+      (a) filtering training rows to the chosen label(s) for medians/percentiles
+      (b) fixing the corresponding one-hot features in standardized space
+      (c) excluding one-hot member features from plotted axes
     """
     ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
 
+    # --- features & transforms
     feature_names = [str(x) for x in ds["feature"].values.tolist()]
     transforms    = [str(t) for t in ds["feature_transform"].values.tolist()]
     X_mean = ds["feature_mean"].values.astype(float)
     X_std  = ds["feature_std"].values.astype(float)
 
-    optimal_df = opt.optimal(ds, count=1, **kwargs) if optimal else None
-    suggest_df = opt.suggest(ds, count=suggest, **kwargs) if (suggest and suggest > 0) else None
+    # One-hot categorical groups (reuse opt helper)
+    groups = opt._onehot_groups(feature_names)  # { base: {"labels":[...], "name_by_label":{label->member}, "members":[...]} }
+    bases  = set(groups.keys())
+    name_to_idx = {name: j for j, name in enumerate(feature_names)}
 
-    # canonicalize kwargs keys to dataset features (accept hyphens/underscores/case)
-    idx = _canon_key_set(ds)
-    kw_fixed_raw: dict[str, object] = {}
-    for k, v in kwargs.items():
-        if k in idx: kw_fixed_raw[idx[k]] = v
-        else:
-            nk = re.sub(r"[^a-z0-9]+", "", k.lower())
-            if nk in idx: kw_fixed_raw[idx[nk]] = v
-
-    # split constraints: scalars -> fix/hide; slice -> window; list/tuple -> discrete choices
-    fixed_scalars: dict[int, float] = {}
-    range_windows: dict[int, tuple[float, float]] = {}
-    choice_values: dict[int, np.ndarray] = {}
-
-    for j, name in enumerate(feature_names):
-        if name not in kw_fixed_raw: 
-            continue
-        val = kw_fixed_raw[name]
-        if isinstance(val, slice):
-            lo = _orig_to_std(j, val.start, transforms, X_mean, X_std)
-            hi = _orig_to_std(j, val.stop,  transforms, X_mean, X_std)
-            lo, hi = float(min(lo, hi)), float(max(lo, hi))
-            range_windows[j] = (lo, hi)
-        elif isinstance(val, (list, tuple)):
-            choice_values[j] = _orig_to_std(j, np.asarray(val, dtype=float), transforms, X_mean, X_std)
-        else:
-            fixed_scalars[j] = float(_orig_to_std(j, float(val), transforms, X_mean, X_std))
-
-    # base point (median in standardized space), apply scalar fixes
-    Xn_train = ds["Xn_train"].values.astype(float)
+    # Raw DF (for overlay) and standardized training X (for medians/percentiles)
     df_raw   = _raw_dataframe_from_dataset(ds)
-    base_std = np.median(Xn_train, axis=0)
-    for j, vstd in fixed_scalars.items():
+    Xn_train = ds["Xn_train"].values.astype(float)
+    n_rows   = Xn_train.shape[0]
+
+    # --- split kwargs into numeric vs categorical (keys are already canonical from main.py)
+    kw_num: dict[str, object] = {}
+    kw_cat: dict[str, object] = {}
+    for k, v in (kwargs or {}).items():
+        if k in bases:
+            kw_cat[k] = v
+        elif k in name_to_idx:
+            kw_num[k] = v
+        else:
+            # unknown key; silently ignore (main.py already warned if needed)
+            pass
+
+    # --- resolve categorical constraints to a fixed single label per base (warn if multiple; pick first)
+    cat_fixed: dict[str, str] = {}
+    for base, val in kw_cat.items():
+        labels = groups[base]["labels"]
+        if isinstance(val, str):
+            if val not in labels:
+                raise ValueError(f"Unknown category for {base!r}: {val!r}. Choices: {labels}")
+            cat_fixed[base] = val
+        elif isinstance(val, (list, tuple, set)):
+            chosen = [x for x in val if isinstance(x, str) and x in labels]
+            if not chosen:
+                raise ValueError(f"No valid categories for {base!r} in {val!r}. Choices: {labels}")
+            if len(chosen) > 1:
+                console.print(f"[yellow]Warning: multiple categories for {base!r} supplied; using {chosen[0]!r}[/yellow]")
+            cat_fixed[base] = chosen[0]
+        else:
+            raise ValueError(f"Categorical constraint for {base!r} must be a string or list/tuple of strings.")
+
+    # --- filter rows to categorical selection (for medians/percentiles and data overlays)
+    row_mask = np.ones(n_rows, dtype=bool)
+    for base, label in cat_fixed.items():
+        # Prefer raw string column if present; else fall back to the member one-hot feature
+        if base in df_raw.columns:
+            row_mask &= (df_raw[base].astype("string") == pd.Series([label]*len(df_raw), dtype="string")).to_numpy()
+        else:
+            member_name = groups[base]["name_by_label"][label]
+            j = name_to_idx[member_name]
+            # reconstruct per-row raw (0/1) for the member feature
+            raw_j = feature_raw_from_artifact_or_reconstruct(ds, j, member_name, transforms[j]).astype(float)
+            row_mask &= (raw_j >= 0.5)
+
+    # Apply filtering (if any categorical fixed present)
+    if cat_fixed:
+        df_raw_f = df_raw.loc[row_mask].reset_index(drop=True)
+        Xn_train_f = Xn_train[row_mask, :]
+    else:
+        df_raw_f = df_raw
+        Xn_train_f = Xn_train
+
+    # --- numeric constraints (fixed scalars, ranges, choices) → standardized
+    def _orig_to_std(j: int, x, transforms, mu, sd):
+        x = np.asarray(x, dtype=float)
+        if transforms[j] == "log10":
+            x = np.where(x <= 0, np.nan, x)
+            x = np.log10(x)
+        return (x - mu[j]) / sd[j]
+
+    fixed_scalars_std: dict[int, float] = {}
+    range_windows_std: dict[int, tuple[float, float]] = {}
+    choice_values_std: dict[int, np.ndarray] = {}
+
+    for name, val in kw_num.items():
+        j = name_to_idx[name]
+        if isinstance(val, slice):
+            lo = _orig_to_std(j, float(val.start), transforms, X_mean, X_std)
+            hi = _orig_to_std(j, float(val.stop),  transforms, X_mean, X_std)
+            lo, hi = float(min(lo, hi)), float(max(lo, hi))
+            range_windows_std[j] = (lo, hi)
+        elif isinstance(val, (list, tuple, np.ndarray)):
+            arr = _orig_to_std(j, np.asarray(val, dtype=float), transforms, X_mean, X_std)
+            choice_values_std[j] = np.asarray(arr, dtype=float)
+        else:
+            fixed_scalars_std[j] = float(_orig_to_std(j, float(val), transforms, X_mean, X_std))
+
+    # --- apply categorical fixed as standardized scalar fixes on their member features
+    for base, label in cat_fixed.items():
+        labels = groups[base]["labels"]
+        for lab in labels:
+            member_name = groups[base]["name_by_label"][lab]
+            j = name_to_idx[member_name]
+            raw_val = 1.0 if lab == label else 0.0
+            # convert to standardized
+            x_std = _orig_to_std(j, raw_val, transforms, X_mean, X_std)
+            fixed_scalars_std[j] = float(x_std)
+
+    # --- choose FREE (plotted) feature indices: exclude scalar-fixed AND all one-hot members
+    onehot_members = set()
+    for base, g in groups.items():
+        onehot_members.update(g["members"])
+    free_idx = [
+        j for j in range(len(feature_names))
+        if (j not in fixed_scalars_std) and (feature_names[j] not in onehot_members)
+    ]
+    if not free_idx:
+        raise ValueError("All features are fixed (or categorical only); nothing to plot.")
+
+    # --- base point (median in standardized space of the filtered rows), then apply scalar fixes
+    base_std = np.median(Xn_train_f, axis=0)
+    for j, vstd in fixed_scalars_std.items():
         base_std[j] = vstd
 
-    # free (plotted) features = everything except scalar-fixed
-    p = len(feature_names)
-    free_idx = [j for j in range(p) if j not in fixed_scalars]
-    if not free_idx:
-        raise ValueError("All features are fixed; nothing to plot.")
-
-    # per-feature grids in standardized space (respect slices/choices + empirical 1–99%)
-    p01p99 = [np.percentile(Xn_train[:, j], [1, 99]) for j in range(p)]
-    def _grid_std(j: int) -> np.ndarray:
+    # --- per-feature grids (respect numeric slices/choices + filtered 1–99% range)
+    p01p99 = [np.percentile(Xn_train_f[:, j], [1, 99]) for j in range(len(feature_names))]
+    def _grid_std_for(j: int) -> np.ndarray:
         p01, p99 = p01p99[j]
-        if j in choice_values:
-            vals = np.asarray(choice_values[j], dtype=float)
+        if j in choice_values_std:
+            vals = np.asarray(choice_values_std[j], dtype=float)
             vals = vals[(vals >= p01) & (vals <= p99)]
-            return np.unique(np.sort(vals)) if vals.size else np.array([np.median(Xn_train[:, j])])
+            return np.unique(np.sort(vals)) if vals.size else np.array([np.median(Xn_train_f[:, j])])
         lo, hi = p01, p99
-        if j in range_windows:
-            rlo, rhi = range_windows[j]
+        if j in range_windows_std:
+            rlo, rhi = range_windows_std[j]
             lo, hi = max(lo, rlo), min(hi, rhi)
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             hi = lo + 1e-9
         return np.linspace(lo, hi, grid_size)
 
-    grids_std = {j: _grid_std(j) for j in range(p)}
+    grids_std = {j: _grid_std_for(j) for j in range(len(feature_names))}
 
-    # global color transform bounds (will compute gradually)
-    all_blocks: list[np.ndarray] = []
+    # --- candidate optimal/suggest under the same constraints (pass original kwargs through)
+    optimal_df = opt.optimal(ds, count=1, **kwargs) if optimal else None
+    suggest_df = opt.suggest(ds, count=suggest, **kwargs) if (suggest and suggest > 0) else None
 
-    # figure
+    # --- figure scaffolding
     k = len(free_idx)
     fig = make_subplots(
         rows=k, cols=k, shared_xaxes=False, shared_yaxes=False,
@@ -190,16 +267,51 @@ def plot2d(
     )
 
     tgt_col = str(ds.attrs["target_column"])
-    success_mask = ~pd.isna(df_raw[tgt_col]).to_numpy()
+    success_mask = ~pd.isna(df_raw_f[tgt_col]).to_numpy()
     fail_mask    = ~success_mask
 
     def data_vals_for_feature(j_full: int) -> np.ndarray:
         name = feature_names[j_full]
-        if name in df_raw.columns:
-            return df_raw[name].to_numpy().astype(float)
-        return feature_raw_from_artifact_or_reconstruct(ds, j_full, name, transforms[j_full]).astype(float)
+        if name in df_raw_f.columns:
+            return df_raw_f[name].to_numpy().astype(float)
+        return feature_raw_from_artifact_or_reconstruct(ds, j_full, name, transforms[j_full]).astype(float)[row_mask] \
+               if cat_fixed else \
+               feature_raw_from_artifact_or_reconstruct(ds, j_full, name, transforms[j_full]).astype(float)
 
-    # helper: color transform
+    # --- evaluate all cells
+    all_blocks: list[np.ndarray] = []
+    cell_payload: dict[tuple[int,int], dict] = {}
+
+    for r, i in enumerate(free_idx):
+        for c, j in enumerate(free_idx):
+            xg = grids_std[j]; yg = grids_std[i]
+            if i == j:
+                # diagonal: synthesize symmetric 2D from 1D sweep
+                grid = grids_std[j]
+                Xn_1d = np.repeat(base_std[None, :], len(grid), axis=0)
+                Xn_1d[:, j] = grid
+                mu_1d, _ = pred_loss(Xn_1d, include_observation_noise=True)
+                p_1d     = pred_success(Xn_1d)
+                Zmu = 0.5 * (mu_1d[:, None] + mu_1d[None, :])
+                Zp  = np.minimum(p_1d[:, None], p_1d[None, :])
+                x_orig = _denormalize_then_inverse_transform(j, grid, transforms, X_mean, X_std)
+                y_orig = x_orig
+            else:
+                XX, YY = np.meshgrid(xg, yg)
+                Xn_grid = np.repeat(base_std[None, :], XX.size, axis=0)
+                Xn_grid[:, j] = XX.ravel()
+                Xn_grid[:, i] = YY.ravel()
+                mu_flat, _ = pred_loss(Xn_grid, include_observation_noise=True)
+                p_flat     = pred_success(Xn_grid)
+                Zmu = mu_flat.reshape(YY.shape)
+                Zp  = p_flat.reshape(YY.shape)
+                x_orig = _denormalize_then_inverse_transform(j, xg, transforms, X_mean, X_std)
+                y_orig = _denormalize_then_inverse_transform(i, yg, transforms, X_mean, X_std)
+
+            cell_payload[(r, c)] = {"i": i, "j": j, "x": x_orig, "y": y_orig, "Zmu": Zmu, "Zp": Zp}
+            all_blocks.append(Zmu.ravel())
+
+    # --- color transform bounds
     def color_transform(z_raw: np.ndarray) -> tuple[np.ndarray, float]:
         if not use_log_scale_for_target:
             return z_raw, 0.0
@@ -207,48 +319,6 @@ def plot2d(
         shift = 0.0 if zmin > 0 else -zmin + float(log_shift_epsilon)
         return np.log10(np.maximum(z_raw + shift, log_shift_epsilon)), shift
 
-    # evaluate every cell (including diagonal) as a 2D grid
-    cell_payload: dict[tuple[int,int], dict] = {}
-    for r, i in enumerate(free_idx):
-        for c, j in enumerate(free_idx):
-            xg = grids_std[j]
-            yg = grids_std[i]
-
-            if i == j:
-                # --- diagonal: build from 1D PD and synthesize a symmetric 2D surface
-                grid = grids_std[j]
-                Xn_1d = np.repeat(base_std[None, :], len(grid), axis=0)
-                Xn_1d[:, j] = grid
-
-                mu_1d, _ = pred_loss(Xn_1d, include_observation_noise=True)  # (n,)
-                p_1d     = pred_success(Xn_1d)                               # (n,)
-
-                Zmu = 0.5 * (mu_1d[:, None] + mu_1d[None, :])               # (n,n)
-                Zp  = np.minimum(p_1d[:, None], p_1d[None, :])              # (n,n)
-
-                x_orig = _denormalize_then_inverse_transform(j, grid, transforms, X_mean, X_std)
-                y_orig = x_orig  # same feature
-            else:
-                # --- off-diagonal: true 2D grid
-                XX, YY = np.meshgrid(xg, yg)
-
-                Xn_grid = np.repeat(base_std[None, :], XX.size, axis=0)
-                Xn_grid[:, j] = XX.ravel()
-                Xn_grid[:, i] = YY.ravel()
-
-                mu_flat, _ = pred_loss(Xn_grid, include_observation_noise=True)
-                p_flat     = pred_success(Xn_grid)
-
-                Zmu = mu_flat.reshape(YY.shape)
-                Zp  = p_flat.reshape(YY.shape)
-
-                x_orig = _denormalize_then_inverse_transform(j, xg, transforms, X_mean, X_std)
-                y_orig = _denormalize_then_inverse_transform(i, yg, transforms, X_mean, X_std)
-
-            cell_payload[(r, c)] = {"i": i, "j": j, "x": x_orig, "y": y_orig, "Zmu": Zmu, "Zp": Zp}
-            all_blocks.append(Zmu.ravel())
-
-    # color bounds
     z_all = np.concatenate(all_blocks) if all_blocks else np.array([0.0, 1.0])
     z_all_t, global_shift = color_transform(z_all)
     cmin_t = float(np.nanmin(z_all_t))
@@ -264,7 +334,7 @@ def plot2d(
         grey = int(round((1.0 - lum) * 255))
         return f"rgba({grey},{grey},{grey},0.9)"
 
-    # draw cells
+    # --- render cells
     def _is_log_feature(j: int) -> bool: return (transforms[j] == "log10")
 
     for (r, c), PAY in cell_payload.items():
@@ -272,7 +342,6 @@ def plot2d(
         x_vals, y_vals, Zmu_raw, Zp = PAY["x"], PAY["y"], PAY["Zmu"], PAY["Zp"]
         Z_t, _ = color_transform(Zmu_raw)
 
-        # heatmap
         fig.add_trace(go.Heatmap(
             x=x_vals, y=y_vals, z=Z_t,
             coloraxis="coloraxis", zsmooth=False, showscale=False,
@@ -282,7 +351,6 @@ def plot2d(
             customdata=Zmu_raw
         ), row=r+1, col=c+1)
 
-        # p(success) shading
         for thr, alpha in ((0.5, 0.25), (0.8, 0.40)):
             mask = np.where(Zp < thr, 1.0, np.nan)
             fig.add_trace(go.Heatmap(
@@ -303,10 +371,11 @@ def plot2d(
                 showscale=False, hoverinfo="skip"
             ), row=r+1, col=c+1)
 
-        # experimental points (x vs y) — for diagonal (i==j) this becomes (x,x)
+        # overlay data (filtered)
         xd = data_vals_for_feature(j)
         yd = data_vals_for_feature(i)
         show_leg = (r == 0 and c == 0)
+        tgt_col = str(ds.attrs["target_column"])
         fig.add_trace(go.Scattergl(
             x=xd[success_mask], y=yd[success_mask], mode="markers",
             marker=dict(size=4, color="black", line=dict(width=0)),
@@ -316,24 +385,23 @@ def plot2d(
                            f"{feature_names[i]}: %{{y:.6g}}<br>"
                            f"{tgt_col}: %{{customdata[1]:.4f}}<extra></extra>"),
             customdata=np.column_stack([
-                df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask],
-                df_raw[tgt_col].to_numpy()[success_mask],
+                df_raw_f.get("trial_id", pd.Series(np.arange(len(df_raw_f)))).to_numpy()[success_mask],
+                df_raw_f[tgt_col].to_numpy()[success_mask],
             ])
         ), row=r+1, col=c+1)
         fig.add_trace(go.Scattergl(
-            x=xd[fail_mask], y=yd[fail_mask], mode="markers",
+            x=xd[~success_mask], y=yd[~success_mask], mode="markers",
             marker=dict(size=5, color="red", line=dict(color="black", width=0.8)),
             name="data (failed)", legendgroup="data_fail", showlegend=show_leg,
             hovertemplate=("trial_id: %{customdata}<br>"
                            f"{feature_names[j]}: %{{x:.6g}}<br>"
                            f"{feature_names[i]}: %{{y:.6g}}<br>"
                            "status: failed (NaN target)<extra></extra>"),
-            customdata=df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
+            customdata=df_raw_f.get("trial_id", pd.Series(np.arange(len(df_raw_f)))).to_numpy()[~success_mask]
         ), row=r+1, col=c+1)
 
-        opt_x = opt_y = None
-        if optimal_df is not None:
-            # only plot if the columns exist (and not NaN)
+        # optional overlays (optimal/suggest) — only numeric axes are plotted
+        if optimal and (optimal_df is not None):
             if feature_names[j] in optimal_df.columns and feature_names[i] in optimal_df.columns:
                 opt_x = np.asarray(optimal_df[feature_names[j]].values, dtype=float)
                 opt_y = np.asarray(optimal_df[feature_names[i]].values, dtype=float)
@@ -352,50 +420,43 @@ def plot2d(
                         ),
                     ), row=r+1, col=c+1)
 
-        have_suggest = (
-            (suggest_df is not None)
-            and (feature_names[j] in suggest_df.columns)
-            and (feature_names[i] in suggest_df.columns)
-        )
-        x_sug = y_sug = None
-        if have_suggest:
-            x_sug = np.asarray(suggest_df[feature_names[j]].values, dtype=float)
-            y_sug = np.asarray(suggest_df[feature_names[i]].values, dtype=float)
-            keep_s = np.isfinite(x_sug) & np.isfinite(y_sug)
-            x_sug = x_sug[keep_s]
-            y_sug = y_sug[keep_s]
+        if suggest and (suggest_df is not None):
+            have = (
+                (feature_names[j] in suggest_df.columns)
+                and (feature_names[i] in suggest_df.columns)
+            )
+            if have:
+                x_sug = np.asarray(suggest_df[feature_names[j]].values, dtype=float)
+                y_sug = np.asarray(suggest_df[feature_names[i]].values, dtype=float)
+                keep_s = np.isfinite(x_sug) & np.isfinite(y_sug)
+                x_sug = x_sug[keep_s]
+                y_sug = y_sug[keep_s]
+                if x_sug.size:
+                    mu_s = suggest_df.loc[keep_s, "pred_target_mean"].values if "pred_target_mean" in suggest_df else None
+                    sd_s = suggest_df.loc[keep_s, "pred_target_sd"].values   if "pred_target_sd"   in suggest_df else None
+                    ps_s = suggest_df.loc[keep_s, "pred_p_success"].values   if "pred_p_success"   in suggest_df else None
+                    if (mu_s is not None) and (sd_s is not None) and (ps_s is not None):
+                        custom_s = np.column_stack([mu_s, sd_s, ps_s])
+                        hover_s = (
+                            f"{feature_names[j]}: %{{x:.6g}}<br>"
+                            f"{feature_names[i]}: %{{y:.6g}}<br>"
+                            "pred: %{customdata[0]:.3g} ± %{customdata[1]:.3g}<br>"
+                            "p(success): %{customdata[2]:.2f}<extra>suggested</extra>"
+                        )
+                    else:
+                        custom_s = None
+                        hover_s = (
+                            f"{feature_names[j]}: %{{x:.6g}}<br>"
+                            f"{feature_names[i]}: %{{y:.6g}}<extra>suggested</extra>"
+                        )
+                    fig.add_trace(go.Scattergl(
+                        x=x_sug, y=y_sug, mode="markers",
+                        marker=dict(size=9, color="cyan", line=dict(color="black", width=1.2), symbol="star"),
+                        name="suggested", legendgroup="suggested",
+                        showlegend=(r == 0 and c == 0),
+                        customdata=custom_s, hovertemplate=hover_s
+                    ), row=r+1, col=c+1)
 
-            # optional hover: use columns if present
-            mu_s = suggest_df.loc[keep_s, "pred_target_mean"].values if "pred_target_mean" in suggest_df else None
-            sd_s = suggest_df.loc[keep_s, "pred_target_sd"].values   if "pred_target_sd"   in suggest_df else None
-            ps_s = suggest_df.loc[keep_s, "pred_p_success"].values   if "pred_p_success"   in suggest_df else None
-
-            if x_sug.size:
-                if (mu_s is not None) and (sd_s is not None) and (ps_s is not None):
-                    custom_s = np.column_stack([mu_s, sd_s, ps_s])
-                    hover_s = (
-                        f"{feature_names[j]}: %{{x:.6g}}<br>"
-                        f"{feature_names[i]}: %{{y:.6g}}<br>"
-                        "pred: %{customdata[0]:.3g} ± %{customdata[1]:.3g}<br>"
-                        "p(success): %{customdata[2]:.2f}<extra>suggested</extra>"
-                    )
-                else:
-                    custom_s = None
-                    hover_s = (
-                        f"{feature_names[j]}: %{{x:.6g}}<br>"
-                        f"{feature_names[i]}: %{{y:.6g}}<extra>suggested</extra>"
-                    )
-
-                fig.add_trace(go.Scattergl(
-                    x=x_sug, y=y_sug, mode="markers",
-                    marker=dict(size=9, color="cyan", line=dict(color="black", width=1.2), symbol="star"),
-                    name="suggested", legendgroup="suggested",
-                    showlegend=(r == 0 and c == 0),
-                    customdata=custom_s, hovertemplate=hover_s
-                ), row=r+1, col=c+1)
-
-
-        # axes (log + tight ranges if constrained via slice/choices)
         _update_axis_type_and_range(fig, row=r+1, col=c+1, axis="x", centers=x_vals, is_log=_is_log_feature(j))
         _update_axis_type_and_range(fig, row=r+1, col=c+1, axis="y", centers=y_vals, is_log=_is_log_feature(i))
 
@@ -413,12 +474,20 @@ def plot2d(
             b = f"{v.stop:g}"  if v.stop  is not None else ""
             return f"[{a},{b}]"
         if isinstance(v, (list, tuple, np.ndarray)):
-            return "[" + ",".join(f"{x:g}" for x in np.asarray(v).tolist()) + "]"
-        return f"{v:g}"
+            try:
+                return "[" + ",".join(f"{float(x):g}" for x in np.asarray(v).tolist()) + "]"
+            except Exception:
+                return "[" + ",".join(map(str, v)) + "]"
+        return str(v)
 
-    title = "2D Partial Dependence of Expected Target"
-    if kw_fixed_raw:
-        title += " — " + ", ".join(f"{k}={_fmt_c(kw_fixed_raw[k])}" for k in kw_fixed_raw)
+    title_parts = ["2D Partial Dependence of Expected Target"]
+    # numeric constraints for display (keys already canonical)
+    for name, val in kw_num.items():
+        title_parts.append(f"{name}={_fmt_c(val)}")
+    # categorical fixed
+    for base, lab in cat_fixed.items():
+        title_parts.append(f"{base}={lab}")
+    title = " — ".join([title_parts[0], ", ".join(title_parts[1:])]) if len(title_parts) > 1 else title_parts[0]
 
     # layout
     cell = 250
@@ -430,7 +499,7 @@ def plot2d(
     width = max(width, 400)
     height = height if (height and height > 0) else cell * k
     height = max(height, 400)
-    
+
     fig.update_layout(
         coloraxis=dict(colorscale=colorscale, cmin=cmin_t, cmax=cmax_t,
                        colorbar=dict(title=z_title)),
@@ -468,8 +537,9 @@ def plot1d(
     **kwargs,
 ) -> go.Figure:
     """
-    Vertical 1D PD panels of E[target|success] vs each *free* feature.
+    Vertical 1D PD panels of E[target|success] vs each *free* numeric feature.
     Scalars (fix & hide), slices (restrict sweep & x-range), lists/tuples (discrete grids).
+    Categorical constraints use the base name, e.g. language="Linear A".
     """
     ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
     pred_success, pred_loss = _build_predictors(ds)
@@ -479,64 +549,133 @@ def plot1d(
     X_mean = ds["feature_mean"].values.astype(float)
     X_std  = ds["feature_std"].values.astype(float)
 
+    # Detect one-hot categorical groups from model features
+    groups = opt._onehot_groups(feature_names)   # { base: {"labels":[...], "name_by_label":{label:member}, "members":[...]} }
+    bases  = set(groups.keys())
+    name_to_idx = {name: j for j, name in enumerate(feature_names)}
+
+    # Raw dataframe + training X (we may filter these by categorical selection)
     df_raw   = _raw_dataframe_from_dataset(ds)
     Xn_train = ds["Xn_train"].values.astype(float)
-    p = Xn_train.shape[1]
+    n_rows   = Xn_train.shape[0]
+    p        = Xn_train.shape[1]
 
-    # --- canonicalize kwargs -> real feature names (same as plot2d) ---
+    # --- canonicalize numeric kwargs to real feature names; collect categorical kwargs by base ---
     idx_map = _canon_key_set(ds)
-    kw_fixed_raw: dict[str, object] = {}
-    for k, v in kwargs.items():
-        if k in idx_map:
-            kw_fixed_raw[idx_map[k]] = v
-        else:
-            import re
-            nk = re.sub(r"[^a-z0-9]+", "", str(k).lower())
-            if nk in idx_map:
-                kw_fixed_raw[idx_map[nk]] = v
 
-    # --- split constraints into scalar fixes, ranges (slices), choices (lists/tuples) in STANDARDIZED space ---
+    kw_num_raw: dict[str, object] = {}
+    kw_cat_raw: dict[str, object] = {}
+    for k, v in kwargs.items():
+        if k in bases:
+            kw_cat_raw[k] = v
+            continue
+        if k in idx_map:
+            kw_num_raw[idx_map[k]] = v
+            continue
+        import re as _re
+        nk = _re.sub(r"[^a-z0-9]+", "", str(k).lower())
+        if nk in idx_map:
+            kw_num_raw[idx_map[nk]] = v
+
+    # --- resolve categorical constraints to a single fixed label per base ---
+    cat_fixed: dict[str, str] = {}
+    for base, val in kw_cat_raw.items():
+        labels = groups[base]["labels"]
+        if isinstance(val, str):
+            if val not in labels:
+                raise ValueError(f"Unknown category for {base!r}: {val!r}. Choices: {labels}")
+            cat_fixed[base] = val
+        elif isinstance(val, (list, tuple, set)):
+            chosen = [x for x in val if isinstance(x, str) and x in labels]
+            if not chosen:
+                raise ValueError(f"No valid categories for {base!r} in {val!r}. Choices: {labels}")
+            if len(chosen) > 1:
+                console.print(f"[yellow]Warning: multiple categories for {base!r} supplied; using {chosen[0]!r}[/yellow]")
+            cat_fixed[base] = chosen[0]
+        else:
+            raise ValueError(f"Categorical constraint for {base!r} must be a string or list/tuple of strings.")
+
+    # --- filter rows to chosen categories (affects medians/percentiles & overlay points) ---
+    row_mask = np.ones(n_rows, dtype=bool)
+    for base, label in cat_fixed.items():
+        if base in df_raw.columns:  # prefer stored raw string column
+            row_mask &= (df_raw[base].astype("string") == pd.Series([label]*len(df_raw), dtype="string")).to_numpy()
+        else:
+            member_name = groups[base]["name_by_label"][label]
+            j = name_to_idx[member_name]
+            raw_j = feature_raw_from_artifact_or_reconstruct(ds, j, member_name, transforms[j]).astype(float)
+            row_mask &= (raw_j >= 0.5)
+
+    if cat_fixed:
+        df_raw_f = df_raw.loc[row_mask].reset_index(drop=True)
+        Xn_train_f = Xn_train[row_mask, :]
+    else:
+        df_raw_f = df_raw
+        Xn_train_f = Xn_train
+
+    # --- helpers to move between original and standardized for a given feature j ---
+    def _orig_to_std(j: int, x, transforms, mu, sd):
+        x = np.asarray(x, dtype=float)
+        if transforms[j] == "log10":
+            x = np.where(x <= 0, np.nan, x)
+            x = np.log10(x)
+        return (x - mu[j]) / sd[j]
+
+    # --- split numeric constraints into scalar fixes, range windows, discrete choices (STANDARDIZED) ---
     fixed_scalars: dict[int, float] = {}
     range_windows: dict[int, tuple[float, float]] = {}
     choice_values: dict[int, np.ndarray] = {}
 
-    for j, name in enumerate(feature_names):
-        if name not in kw_fixed_raw:
+    for name, val in kw_num_raw.items():
+        if name not in name_to_idx:
             continue
-        val = kw_fixed_raw[name]
+        j = name_to_idx[name]
         if isinstance(val, slice):
-            lo = _orig_to_std(j, val.start, transforms, X_mean, X_std)
-            hi = _orig_to_std(j, val.stop,  transforms, X_mean, X_std)
+            lo = _orig_to_std(j, float(val.start), transforms, X_mean, X_std)
+            hi = _orig_to_std(j, float(val.stop),  transforms, X_mean, X_std)
             lo, hi = float(min(lo, hi)), float(max(lo, hi))
             range_windows[j] = (lo, hi)
-        elif isinstance(val, (list, tuple)):
-            choice_values[j] = _orig_to_std(j, np.asarray(val, dtype=float), transforms, X_mean, X_std)
+        elif isinstance(val, (list, tuple, np.ndarray)):
+            arr = _orig_to_std(j, np.asarray(val, dtype=float), transforms, X_mean, X_std)
+            choice_values[j] = np.asarray(arr, dtype=float)
         else:
             fixed_scalars[j] = float(_orig_to_std(j, float(val), transforms, X_mean, X_std))
 
-    # --- optional overlays (use the same canonical constraints) ---
-    optimal_df  = opt.optimal(model, count=1, **kw_fixed_raw) if optimal else None
-    suggest_df  = opt.suggest(model, count=suggest, **kw_fixed_raw) if (suggest and suggest > 0) else None
+    # --- apply categorical fixed as standardized scalar fixes on each one-hot member ---
+    for base, label in cat_fixed.items():
+        labels = groups[base]["labels"]
+        for lab in labels:
+            member_name = groups[base]["name_by_label"][lab]
+            j = name_to_idx[member_name]
+            raw_val = 1.0 if lab == label else 0.0
+            fixed_scalars[j] = float(_orig_to_std(j, raw_val, transforms, X_mean, X_std))
 
-    # --- base point (median) then apply scalar fixes ---
-    base_std = np.median(Xn_train, axis=0)
+    # --- overlays (pass original kwargs so optimal/suggest are conditioned the same way, incl. categorical) ---
+    optimal_df  = opt.optimal(model, count=1, **kwargs) if optimal else None
+    suggest_df  = opt.suggest(model, count=suggest, **kwargs) if (suggest and suggest > 0) else None
+
+    # --- base standardized point (median of filtered rows), then apply scalar fixes ---
+    base_std = np.median(Xn_train_f, axis=0)
     for j, vstd in fixed_scalars.items():
         base_std[j] = vstd
 
-    # --- features to plot (exclude only scalar-fixed) ---
-    free_idx = [j for j in range(p) if j not in fixed_scalars]
+    # --- features to PLOT: exclude scalar-fixed + all one-hot member features ---
+    onehot_members = set()
+    for base, g in groups.items():
+        onehot_members.update(g["members"])
+    free_idx = [j for j in range(p) if (j not in fixed_scalars) and (feature_names[j] not in onehot_members)]
     if not free_idx:
-        raise ValueError("All features are fixed; nothing to plot. Fix fewer variables.")
+        raise ValueError("All features are fixed (or categorical only); nothing to plot. Fix fewer variables.")
 
-    # empirical 1–99% for sane bounds
-    p01p99 = [np.percentile(Xn_train[:, j], [1, 99]) for j in range(p)]
+    # --- empirical 1–99% from filtered rows for sane bounds ---
+    p01p99 = [np.percentile(Xn_train_f[:, j], [1, 99]) for j in range(p)]
 
     def _grid_1d(j: int, n: int) -> np.ndarray:
         p01, p99 = p01p99[j]
         if j in choice_values:
             vals = np.asarray(choice_values[j], dtype=float)
             vals = vals[(vals >= p01) & (vals <= p99)]
-            return np.unique(np.sort(vals)) if vals.size else np.array([np.median(Xn_train[:, j])], dtype=float)
+            return np.unique(np.sort(vals)) if vals.size else np.array([np.median(Xn_train_f[:, j])], dtype=float)
         lo, hi = p01, p99
         if j in range_windows:
             rlo, rhi = range_windows[j]
@@ -548,13 +687,13 @@ def plot1d(
     # sweeps (standardized)
     sweeps_std = {j: _grid_1d(j, n_points_1d) for j in free_idx}
 
-    # masks/data
+    # --- overlay masks/data from filtered rows ---
     tgt_col = str(ds.attrs["target_column"])
-    success_mask = ~pd.isna(df_raw[tgt_col]).to_numpy()
+    success_mask = ~pd.isna(df_raw_f[tgt_col]).to_numpy()
     fail_mask    = ~success_mask
-    losses_success = df_raw.loc[success_mask, tgt_col].to_numpy().astype(float)
-    trial_ids_success = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask]
-    trial_ids_fail    = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
+    losses_success = df_raw_f.loc[success_mask, tgt_col].to_numpy().astype(float)
+    trial_ids_success = df_raw_f.get("trial_id", pd.Series(np.arange(len(df_raw_f)))).to_numpy()[success_mask]
+    trial_ids_fail    = df_raw_f.get("trial_id", pd.Series(np.arange(len(df_raw_f)))).to_numpy()[fail_mask]
 
     band_fill_rgba = _rgb_to_rgba(line_color, band_alpha)
 
@@ -622,11 +761,12 @@ def plot1d(
                                  hovertemplate=f"{feature_names[j]}: %{{x:.6g}}<br>E[target|success]: %{{y:.3f}}<extra></extra>"),
                       row=row_pos, col=1)
 
-        # experimental points
-        if feature_names[j] in df_raw.columns:
-            x_data_all = df_raw[feature_names[j]].to_numpy().astype(float)
+        # experimental points (filtered df)
+        if feature_names[j] in df_raw_f.columns:
+            x_data_all = df_raw_f[feature_names[j]].to_numpy().astype(float)
         else:
-            x_data_all = feature_raw_from_artifact_or_reconstruct(ds, j, feature_names[j], transforms[j]).astype(float)
+            full_vals = feature_raw_from_artifact_or_reconstruct(ds, j, feature_names[j], transforms[j]).astype(float)
+            x_data_all = full_vals[row_mask] if cat_fixed else full_vals
 
         x_succ = x_data_all[success_mask]
         if x_succ.size:
@@ -706,7 +846,6 @@ def plot1d(
             if is_log_x:
                 x0 = max(x_min_override, 1e-12)
                 x1 = max(x_max_override, x0 * (1 + 1e-9))
-                # small multiplicative pad
                 pad = (x1 / x0) ** 0.03
                 fig.update_xaxes(type="log",
                                  range=[np.log10(x0 / pad), np.log10(x1 * pad)],
@@ -730,24 +869,30 @@ def plot1d(
                 "success_probability": float(p_i),
             })
 
-    # title w/ constraints summary
+    # title w/ constraints summary (numeric + categorical)
     def _fmt_c(v):
         if isinstance(v, slice):
             a = "" if v.start is None else f"{v.start:g}"
             b = "" if v.stop  is None else f"{v.stop:g}"
             return f"[{a},{b}]"
         if isinstance(v, (list, tuple, np.ndarray)):
-            return "[" + ",".join(f"{x:g}" for x in np.asarray(v).tolist()) + "]"
+            try:
+                return "[" + ",".join(f"{float(x):g}" for x in np.asarray(v).tolist()) + "]"
+            except Exception:
+                return "[" + ",".join(map(str, v)) + "]"
         try:
             return f"{float(v):g}"
         except Exception:
             return str(v)
 
-    title = f"1D partial dependence of expected {tgt_col}"
-    if kw_fixed_raw:
-        title += " — " + ", ".join(f"{k}={_fmt_c(kw_fixed_raw[k])}" for k in kw_fixed_raw)
+    title_parts = [f"1D partial dependence of expected {tgt_col}"]
+    if kw_num_raw:
+        title_parts.append(", ".join(f"{k}={_fmt_c(v)}" for k, v in kw_num_raw.items()))
+    if cat_fixed:
+        title_parts.append(", ".join(f"{b}={lab}" for b, lab in cat_fixed.items()))
+    title = " — ".join(title_parts) if len(title_parts) > 1 else title_parts[0]
 
-    width = width if (width and width > 0) else 700
+    width = width if (width and width > 0) else 1200
     height = height if (height and height > 0) else figure_height_per_row_px * len(free_idx)
 
     fig.update_layout(
