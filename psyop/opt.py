@@ -56,7 +56,7 @@ def df_to_table(
 
 
 
-def suggest_candidates(
+def suggest(
     model: xr.Dataset | Path | str,
     output: Path | str | None = None,
     count: int = 12,
@@ -200,7 +200,7 @@ def suggest_candidates(
     return out
 
 
-def find_optimal(
+def optimal(
     model: xr.Dataset | Path | str,
     output: Path|None = None,
     count: int = 10,

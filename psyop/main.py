@@ -20,9 +20,8 @@ import xarray as xr
 import typer
 from rich.console import Console
 
-from .model import run_model
-from . import viz
-from .opt import suggest_candidates, find_optimal
+from .model import build_model
+from . import viz, opt
 
 __version__ = "0.1.0"
 
@@ -293,7 +292,7 @@ def model(
     if input.suffix.lower() != ".csv":
         console.print(":warning: [yellow]Input does not end with .csv[/]")
 
-    run_model(
+    build_model(
         input=input,
         target_column=target,
         output=output,
@@ -326,7 +325,7 @@ def suggest(
     model = xr.load_dataset(model)
     constraints = parse_constraints_from_ctx(ctx, model)
 
-    suggest_candidates(
+    opt.suggest(
         model=model,
         output=output,
         count=count,
@@ -359,7 +358,7 @@ def optimal(
     model = xr.load_dataset(model)
     constraints = parse_constraints_from_ctx(ctx, model)
 
-    find_optimal(
+    opt.optimal(
         model=model,
         output=output,
         count=count,
@@ -387,6 +386,8 @@ def plot2d(
     colorscale: str = typer.Option("RdBu", help="Colorscale name."),
     show: bool = typer.Option(False, help="Open the figure in a browser."),
     n_contours: int = typer.Option(12, help="Number of contour levels."),
+    optimal: bool = typer.Option(True, help="Include optimal points."),
+    suggest: int = typer.Option(0, help="Number of suggested points."),
 ):
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
@@ -404,6 +405,8 @@ def plot2d(
         colorscale=colorscale,
         show=show,
         n_contours=n_contours,
+        optimal=optimal,
+        suggest=suggest,
         **constraints,
     )
     if output:
@@ -426,6 +429,8 @@ def plot1d(
     show_figure: bool = typer.Option(False, "--show", help="Open the figure in a browser."),
     use_log_scale_for_target_y: bool = typer.Option(True, "--log-y/--no-log-y", help="Log scale for target (Y)."),
     log_y_epsilon: float = typer.Option(1e-9, "--log-y-eps", help="Clamp for log-Y."),
+    optimal: bool = typer.Option(True, help="Include optimal points."),
+    suggest: int = typer.Option(0, help="Number of suggested points."),
 ):
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
@@ -444,6 +449,8 @@ def plot1d(
         show_figure=show_figure,
         use_log_scale_for_target_y=use_log_scale_for_target_y,
         log_y_epsilon=log_y_epsilon,
+        optimal=optimal,
+        suggest=suggest,
         **constraints,
     )
     if output:

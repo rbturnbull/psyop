@@ -20,7 +20,7 @@ import pymc as pm
 import xarray as xr
 
 
-def run_model(
+def build_model(
     input: pd.DataFrame|Path|str,
     target_column: str,
     output: Path | str | None = None,

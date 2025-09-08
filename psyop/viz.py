@@ -17,10 +17,7 @@ from .model import (
     solve_lower,
     feature_raw_from_artifact_or_reconstruct,
 )
-from .opt import (
-    suggest_candidates,
-    find_optimal,
-)
+from . import opt
 
 
 def _canon_key_set(ds) -> dict[str, str]:
@@ -102,6 +99,7 @@ def plot2d(
     show: bool = False,
     n_contours: int = 12,
     optimal: bool = True,
+    suggest: int = 0,
     **kwargs,
 ) -> go.Figure:
     """
@@ -117,7 +115,8 @@ def plot2d(
     X_mean = ds["feature_mean"].values.astype(float)
     X_std  = ds["feature_std"].values.astype(float)
 
-    optimal_df = find_optimal(ds, count=1, **kwargs) if optimal else None
+    optimal_df = opt.optimal(ds, count=1, **kwargs) if optimal else None
+    suggest_df = opt.suggest(ds, count=suggest, **kwargs) if (suggest and suggest > 0) else None
 
     # canonicalize kwargs keys to dataset features (accept hyphens/underscores/case)
     idx = _canon_key_set(ds)
@@ -351,6 +350,49 @@ def plot2d(
                         ),
                     ), row=r+1, col=c+1)
 
+        have_suggest = (
+            (suggest_df is not None)
+            and (feature_names[j] in suggest_df.columns)
+            and (feature_names[i] in suggest_df.columns)
+        )
+        x_sug = y_sug = None
+        if have_suggest:
+            x_sug = np.asarray(suggest_df[feature_names[j]].values, dtype=float)
+            y_sug = np.asarray(suggest_df[feature_names[i]].values, dtype=float)
+            keep_s = np.isfinite(x_sug) & np.isfinite(y_sug)
+            x_sug = x_sug[keep_s]
+            y_sug = y_sug[keep_s]
+
+            # optional hover: use columns if present
+            mu_s = suggest_df.loc[keep_s, "pred_target_mean"].values if "pred_target_mean" in suggest_df else None
+            sd_s = suggest_df.loc[keep_s, "pred_target_sd"].values   if "pred_target_sd"   in suggest_df else None
+            ps_s = suggest_df.loc[keep_s, "pred_p_success"].values   if "pred_p_success"   in suggest_df else None
+
+            if x_sug.size:
+                if (mu_s is not None) and (sd_s is not None) and (ps_s is not None):
+                    custom_s = np.column_stack([mu_s, sd_s, ps_s])
+                    hover_s = (
+                        f"{feature_names[j]}: %{{x:.6g}}<br>"
+                        f"{feature_names[i]}: %{{y:.6g}}<br>"
+                        "pred: %{customdata[0]:.3g} ± %{customdata[1]:.3g}<br>"
+                        "p(success): %{customdata[2]:.2f}<extra>suggested</extra>"
+                    )
+                else:
+                    custom_s = None
+                    hover_s = (
+                        f"{feature_names[j]}: %{{x:.6g}}<br>"
+                        f"{feature_names[i]}: %{{y:.6g}}<extra>suggested</extra>"
+                    )
+
+                fig.add_trace(go.Scattergl(
+                    x=x_sug, y=y_sug, mode="markers",
+                    marker=dict(size=9, color="cyan", line=dict(color="black", width=1.2), symbol="star"),
+                    name="suggested", legendgroup="suggested",
+                    showlegend=(r == 0 and c == 0),
+                    customdata=custom_s, hovertemplate=hover_s
+                ), row=r+1, col=c+1)
+
+
         # axes (log + tight ranges if constrained via slice/choices)
         _update_axis_type_and_range(fig, row=r+1, col=c+1, axis="x", centers=x_vals, is_log=_is_log_feature(j))
         _update_axis_type_and_range(fig, row=r+1, col=c+1, axis="y", centers=y_vals, is_log=_is_log_feature(i))
@@ -463,8 +505,8 @@ def plot1d(
             fixed_scalars[j] = float(_orig_to_std(j, float(val), transforms, X_mean, X_std))
 
     # --- optional overlays (use the same canonical constraints) ---
-    optimal_df  = find_optimal(model, count=1, **kw_fixed_raw) if optimal else None
-    suggest_df  = suggest_candidates(model, count=suggest, **kw_fixed_raw) if (suggest and suggest > 0) else None
+    optimal_df  = opt.optimal(model, count=1, **kw_fixed_raw) if optimal else None
+    suggest_df  = opt.suggest(model, count=suggest, **kw_fixed_raw) if (suggest and suggest > 0) else None
 
     # --- base point (median) then apply scalar fixes ---
     base_std = np.median(Xn_train, axis=0)
@@ -509,7 +551,7 @@ def plot1d(
     free_names = [feature_names[j] for j in free_idx]
     fig = make_subplots(
         rows=len(free_idx), cols=1, shared_xaxes=False,
-        subplot_titles=[f"E[target|success] — {name}" for name in free_names]
+        subplot_titles=[f"{name}" for name in free_names]
     )
 
     tidy_rows: list[dict] = []
@@ -627,7 +669,7 @@ def plot1d(
 
         # axes
         _maybe_log_axis(fig, row_pos, 1, feature_names[j], axis="x", transforms=transforms, j=j)
-        fig.update_yaxes(title_text=f"{tgt_col} (E[target|success])", row=row_pos, col=1)
+        fig.update_yaxes(title_text=f"{tgt_col}", row=row_pos, col=1)
         _set_yaxis_range(fig, row=row_pos, col=1,
                          y0=y0_plot, y1=y1_plot,
                          log=use_log_scale_for_target_y, eps=log_y_epsilon)
@@ -691,7 +733,7 @@ def plot1d(
         except Exception:
             return str(v)
 
-    title = "1D Partial Dependence of Expected Target (conditioned slice)"
+    title = f"1D partial dependence of expected {tgt_col}"
     if kw_fixed_raw:
         title += " — " + ", ".join(f"{k}={_fmt_c(kw_fixed_raw[k])}" for k in kw_fixed_raw)
 
