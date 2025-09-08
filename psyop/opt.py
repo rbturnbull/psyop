@@ -498,8 +498,6 @@ def suggest(
         cat_fixed_label=cat_fixed_label
     )
 
-    breakpoint()
-
     out = _collapse_onehot_to_categorical(out, groups)
 
     # Optional: reorder columns to show features first, then metrics

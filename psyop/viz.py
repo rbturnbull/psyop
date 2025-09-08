@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
-import re
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -26,16 +25,6 @@ def _canon_key_set(ds) -> dict[str, str]:
         import re
         return re.sub(r"[^a-z0-9]+", "", s.lower())
     return {**{f: f for f in feats}, **{_norm(f): f for f in feats}}
-
-def _apply_transform_name(tr: str, x):
-    x = np.asarray(x, dtype=float)
-    if tr == "log10":
-        return np.log10(np.maximum(x, 1e-300))
-    return x
-
-def _orig_to_std(j: int, vals, transforms, X_mean, X_std):
-    raw = _apply_transform_name(transforms[j], np.asarray(vals, dtype=float))
-    return (raw - X_mean[j]) / X_std[j]
 
 
 def _edges_from_centers(vals: np.ndarray, is_log: bool) -> tuple[float, float]:
