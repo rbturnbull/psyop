@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "psyop"
-version = "0.1.0a4"
+version = "0.1.0a5"
 description = "Parameter Space Yield Optimizer"
 authors = ["Robert Turnbull <robert.turnbull@unimelb.edu.au>"]
 license = "Apache-2.0"
