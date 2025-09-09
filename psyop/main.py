@@ -325,11 +325,6 @@ def model(
         Direction.AUTO, "--direction", "-d",
         help="Optimization direction for the target."
     ),
-    success_column: Optional[str] = typer.Option(
-        None, "--success-column",
-        help="Optional boolean/int column for success (1) / fail (0). "
-             "If omitted, success is inferred as ~isna(target)."
-    ),
     seed: int = typer.Option(0, "--seed", help="Random seed for fitting/sampling."),
     compress: bool = typer.Option(True, help="Apply compression inside the artifact."),
 ):
@@ -340,12 +335,11 @@ def model(
 
     build_model(
         input=input,
-        target_column=target,
+        target=target,
         output=output,
-        exclude_columns=exclude,
+        exclude=exclude,
         direction=direction.value,
-        success_column=success_column,
-        random_seed=seed,
+        seed=seed,
         compress=compress,
     )
     console.print(f"[green]Wrote model artifact →[/] {output}")
@@ -362,7 +356,7 @@ def suggest(
     count: int = typer.Option(10, "--count", "-k", help="Number of candidates to propose."),
     p_success_threshold: float = typer.Option(0.8, help="Feasibility threshold for constrained EI."),
     explore: float = typer.Option(0.34, help="Fraction of suggestions reserved for exploration."),
-    candidates_pool: int = typer.Option(5000, help="Random candidate pool size to score."),
+    candidates: int = typer.Option(5000, help="Random candidate pool size to score."),
     seed: int = typer.Option(0, "--seed", help="Random seed for proposals."),
 ):
     if not model.exists():
@@ -377,7 +371,7 @@ def suggest(
         count=count,
         p_success_threshold=p_success_threshold,
         explore=explore,
-        candidates_pool=candidates_pool,
+        candidates=candidates,
         random_seed=seed,
         **constraints,
     )
@@ -424,13 +418,12 @@ def optimal(
 def plot2d(
     ctx: typer.Context,
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
-    output: Optional[Path] = typer.Option(None, help="Output HTML (defaults relative to model)."),
-    n_points_1d: int = typer.Option(300, help="Points along 1D sweeps (diagonal)."),
-    n_points_2d: int = typer.Option(70, help="Grid size per axis for 2D panels."),
+    output: Path|None = typer.Option(None, help="Output HTML (defaults relative to model)."),
+    grid_size: int = typer.Option(70, help="Grid size per axis for 2D panels."),
     use_log_scale_for_target: bool = typer.Option(False, help="Log10 colors for target."),
     log_shift_epsilon: float = typer.Option(1e-9, help="Epsilon shift for log colors."),
     colorscale: str = typer.Option("RdBu", help="Colorscale name."),
-    show: bool = typer.Option(False, help="Open the figure in a browser."),
+    show: bool|None = typer.Option(None, help="Open the figure in a browser."),
     n_contours: int = typer.Option(12, help="Number of contour levels."),
     optimal: bool = typer.Option(True, help="Include optimal points."),
     suggest: int = typer.Option(0, help="Number of suggested points."),
@@ -443,11 +436,12 @@ def plot2d(
     model = xr.load_dataset(model)
     constraints = parse_constraints_from_ctx(ctx, model)
 
+    show = show if show is not None else output is None  # default to True if no output file
+
     viz.plot2d(
         model=model,
         output=output,
-        n_points_1d=n_points_1d,
-        n_points_2d=n_points_2d,
+        grid_size=grid_size,
         use_log_scale_for_target=use_log_scale_for_target,
         log_shift_epsilon=log_shift_epsilon,
         colorscale=colorscale,
@@ -470,13 +464,13 @@ def plot2d(
 def plot1d(
     ctx: typer.Context,
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
-    output: Optional[Path] = typer.Option(None, help="Output HTML (defaults relative to model)."),
-    csv_out: Optional[Path] = typer.Option(None, help="Optional CSV export of tidy PD data."),
-    n_points_1d: int = typer.Option(300, help="Points along 1D sweep."),
+    output: Path|None = typer.Option(None, help="Output HTML (defaults relative to model)."),
+    csv_out: Path|None = typer.Option(None, help="Optional CSV export of tidy PD data."),
+    grid_size: int = typer.Option(300, help="Points along 1D sweep."),
     line_color: str = typer.Option("rgb(31,119,180)", help="Line/band color (consistent across variables)."),
     band_alpha: float = typer.Option(0.25, help="Fill alpha for ±2σ."),
     figure_height_per_row_px: int = typer.Option(320, help="Pixels per PD row."),
-    show: bool = typer.Option(False, "--show", help="Open the figure in a browser."),
+    show: bool|None = typer.Option(None, help="Open the figure in a browser."),
     use_log_scale_for_target_y: bool = typer.Option(True, "--log-y/--no-log-y", help="Log scale for target (Y)."),
     log_y_epsilon: float = typer.Option(1e-9, "--log-y-eps", help="Clamp for log-Y."),
     optimal: bool = typer.Option(True, help="Include optimal points."),
@@ -487,6 +481,8 @@ def plot1d(
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
 
+    show = show if show is not None else output is None  # default to True if no output file
+
     model = xr.load_dataset(model)
     constraints = parse_constraints_from_ctx(ctx, model)
 
@@ -494,7 +490,7 @@ def plot1d(
         model=model,
         output=output,
         csv_out=csv_out,
-        n_points_1d=n_points_1d,
+        grid_size=grid_size,
         line_color=line_color,
         band_alpha=band_alpha,
         figure_height_per_row_px=figure_height_per_row_px,

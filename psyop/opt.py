@@ -10,6 +10,7 @@ import pandas as pd
 import xarray as xr
 from scipy.special import ndtr  # Φ(z), vectorized
 
+from .util import get_rng
 from .model import (
     kernel_diag_m52, 
     kernel_m52_ard,
@@ -388,10 +389,10 @@ def suggest(
     model: xr.Dataset | Path | str,
     output: Path | str | None = None,
     count: int = 10,
-    p_success_threshold: float = 0.8,
+    success_threshold: float = 0.5,
     explore: float = 0.34,
-    candidates_pool: int = 5000,
-    random_seed: int = 0,
+    candidates: int = 5000,
+    seed: int | np.random.Generator | None = 42,
     **kwargs,  # feature constraints: number, slice(lo:hi), list/tuple (choices), range->tuple, categorical
 ) -> pd.DataFrame:
     """
@@ -402,7 +403,7 @@ def suggest(
       - slice(lo, hi): inclusive float range, e.g. learning_rate=slice(1e-5, 1e-3)
       - list/tuple: finite numeric choices, e.g. batch_size=(16, 32, 64)
       - range(...): converted to tuple of ints (choices)
-      - categorical base, e.g. language="Linear B" or language=("Linear A","Linear B")
+      - categorical base
         (uses one-hot blocks inside the model; pass the *base* name on CLI/code)
     """
     ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
@@ -440,13 +441,13 @@ def suggest(
     best_feasible = _best_feasible_observed(ds, direction)
 
     # 5) Sample candidate pool:
-    rng = np.random.default_rng(random_seed)
+    rng = get_rng(seed)
 
     # (a) numeric-only specs
     numeric_specs = _numeric_specs_only(search_specs, groups)
     fixed_norm_numeric = {k: v for k, v in fixed_norm.items() if k in numeric_specs}
 
-    cand_num = _sample_candidates(numeric_specs, n=candidates_pool, rng=rng, fixed=fixed_norm_numeric)
+    cand_num = _sample_candidates(numeric_specs, n=candidates, rng=rng, fixed=fixed_norm_numeric)
 
     # (b) inject one-hot blocks
     cand_df = _inject_onehot_groups(cand_num, groups, rng, cat_fixed_label, cat_allowed)
@@ -457,10 +458,10 @@ def suggest(
     _assert_valid_onehot(cand_df, groups, where="after post-filter")
 
     # Top-up if constraints are tight
-    target_pool = max(candidates_pool // 2, count * 20)
+    target_pool = max(candidates // 2, count * 20)
     attempts = 0
     while len(cand_df) < target_pool and attempts < 8:
-        extra_num = _sample_candidates(numeric_specs, n=candidates_pool, rng=rng, fixed=fixed_norm_numeric)
+        extra_num = _sample_candidates(numeric_specs, n=candidates, rng=rng, fixed=fixed_norm_numeric)
         extra = _inject_onehot_groups(extra_num, groups, rng, cat_fixed_label, cat_allowed)
         extra = _postfilter_numeric_constraints(extra, user_fixed_num, user_ranges_num, user_choices_num)
         if not extra.empty:
@@ -480,7 +481,7 @@ def suggest(
 
     # 7) Acquisition: cEI + exploration + novelty
     mu_ei, best_y_ei = _maybe_flip_for_direction(mu, best_feasible, direction)
-    c_ei = _constrained_EI(mu_ei, sd, p, best_y_ei, p_threshold=p_success_threshold, softness=0.05)
+    c_ei = _constrained_EI(mu_ei, sd, p, best_y_ei, p_threshold=success_threshold, softness=0.05)
     expl = _exploration_score(sd, p, w_sd=1.0, w_boundary=0.5)
     nov  = _novelty_score(Xn_cands, Xn_train)
 
@@ -682,8 +683,8 @@ def optimal(
     output: Path | None = None,
     count: int = 10,
     n_draws: int = 2000,
-    min_success_probability: float = 0.5,
-    random_seed: int = 0,
+    success_threshold: float = 0.8,
+    seed: int | np.random.Generator | None = 42,
     **kwargs,
 ) -> pd.DataFrame:
     """
@@ -743,7 +744,7 @@ def optimal(
     flip = -1.0 if direction == "max" else 1.0
 
     # --- sample candidate pool
-    rng = np.random.default_rng(random_seed)
+    rng = get_rng(seed)
     target_pool = max(4000, count * 200)  # make sure MC has enough variety
 
     def _sample_pool(n: int) -> pd.DataFrame:
@@ -774,7 +775,7 @@ def optimal(
     sd = np.maximum(sd, 1e-12)
 
     # --- optional feasibility filter
-    keep = p >= float(min_success_probability)
+    keep = p >= float(success_threshold)
     if not np.any(keep):
         keep = np.ones_like(p, dtype=bool)
 
@@ -783,7 +784,7 @@ def optimal(
     p = p[keep]; mu = mu[keep]; sd = sd[keep]
     N = len(cand_df)
     if N == 0:
-        raise ValueError("All sampled candidates were filtered out by min_success_probability.")
+        raise ValueError("All sampled candidates were filtered out by success_threshold.")
 
     # --- Monte Carlo winner-take-all over feasible draws
     Z = mu[:, None] + sd[:, None] * rng.standard_normal((N, n_draws))

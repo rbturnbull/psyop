@@ -14,7 +14,7 @@ def test_quadratic(tmpdir):
         "x": x,
         "y": y
     })
-    model = build_model(df, target_column="y", output=output)
+    model = build_model(df, target="y", output=output)
     assert output.exists()
 
     optimal_df = optimal(model)
@@ -53,7 +53,7 @@ def test_quadratic2D(tmpdir):
         "b": b,
         "target": target
     })
-    model = build_model(df, target_column="target", output=output)
+    model = build_model(df, target="target", output=output)
     assert output.exists()
 
     tolerance = 0.15

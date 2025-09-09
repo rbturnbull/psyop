@@ -7,6 +7,11 @@ TEST_CSV = TEST_DATA_DIR / "trials.csv"
 
 def test_build_model(tmpdir):
     output = tmpdir/"output.nc"
-    build_model(TEST_CSV, target_column="loss", output=output, exclude_columns="trial_id")
+    build_model(
+        TEST_CSV, 
+        target="loss", 
+        output=output, 
+        exclude="trial_id",
+    )
     assert output.exists()
 

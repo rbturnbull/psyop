@@ -333,10 +333,9 @@ Build a model
     build_model(
         input=Path("runs.csv"),
         output=Path("output/trials.nc"),
-        target_column="loss",
-        exclude_columns=["run_id", "notes"],
+        target="loss",
+        exclude=["run_id", "notes"],
         direction="auto",          # "min", "max", or "auto"
-        success_column=None,       # infer success as ~isna(target)
         random_seed=42,
         compress=True,             # compress numeric arrays within the .nc
     )
@@ -363,7 +362,7 @@ Suggest candidates
         count=12,
         p_success_threshold=0.8,
         explore_fraction=0.34,
-        candidates_pool=5000,
+        candidates=5000,
         random_seed=0,
         epochs=20,                   # fixed
         dropout=slice(0.0, 0.2),     # range
@@ -398,8 +397,6 @@ Rank probable optima
     plot2d(
         model=ds,                    # xarray.Dataset
         output=Path("pairplot.html"),
-        n_points_1d=300,
-        n_points_2d=70,
         use_log_scale_for_target=False,
         log_shift_epsilon=1e-9,
         colorscale="RdBu",
@@ -422,7 +419,7 @@ Rank probable optima
         model=ds,
         output=Path("pd.html"),
         csv_out=Path("pd.csv"),
-        n_points_1d=300,
+        grid_size=300,
         line_color="rgb(31,119,180)",
         band_alpha=0.25,
         figure_height_per_row_px=320,

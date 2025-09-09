@@ -19,15 +19,15 @@ import pandas as pd
 import pymc as pm
 import xarray as xr
 
+from .util import get_rng
 
 def build_model(
     input: pd.DataFrame|Path|str,
-    target_column: str,
+    target: str,
     output: Path | str | None = None,
-    exclude_columns: list[str] | None = None,
+    exclude: list[str] | str | None = None,
     direction: str = "auto",
-    success_column: str | None = None,
-    random_seed: int = 42,
+    seed: int | np.random.Generator | None = 42,
     compress: bool = True,
 ) -> xr.Dataset:
     """
@@ -41,8 +41,8 @@ def build_model(
             raise FileNotFoundError(f"Input CSV not found: {input_path.resolve()}")
         df = pd.read_csv(input_path)
 
-    if target_column not in df.columns:
-        raise ValueError(f"Target column '{target_column}' not found in CSV.")
+    if target not in df.columns:
+        raise ValueError(f"Target column '{target}' not found in CSV.")
 
     # Keep a raw copy for artifact (strings as pandas 'string' so NetCDF can handle them)
     df_raw = df.copy()
@@ -51,15 +51,9 @@ def build_model(
             df_raw[c] = df_raw[c].astype("string")
 
     # -----------------------
-    # Success inference/usage (NO __success__ column written)
+    # Success inference
     # -----------------------
-    if success_column is not None:
-        if success_column not in df.columns:
-            raise ValueError(f"success_column '{success_column}' not found in CSV.")
-        success = _to_bool01(df[success_column].to_numpy())
-    else:
-        # Infer success as ~isna(target)
-        success = (~df[target_column].isna()).to_numpy().astype(int)
+    success = (~df[target].isna()).to_numpy().astype(int)
 
     has_success = bool(np.any(success == 1))
     if not has_success:
@@ -70,10 +64,10 @@ def build_model(
     # -----------------------
     # Exclude user-specified + target + success column + INTERNALS like "__success__"
     reserved_internals = {"__success__", "__fail__", "__status__"}
-    exclude_columns = exclude_columns or []
-    excluded = set(exclude_columns) | {target_column} | reserved_internals
-    if success_column:
-        excluded.add(success_column)
+    exclude = exclude or []
+    if isinstance(exclude, str):
+        exclude = [exclude]
+    excluded = set(exclude) | {target} | reserved_internals
 
     numeric_cols = [
         c for c in df.columns
@@ -124,7 +118,7 @@ def build_model(
     # Targets
     y_success = success.astype(float)
     ok_mask = (success == 1)
-    y_loss_success = df.loc[ok_mask, target_column].to_numpy().astype(float)
+    y_loss_success = df.loc[ok_mask, target].to_numpy().astype(float)
 
     conditional_loss_mean = float(np.nanmean(y_loss_success)) if len(y_loss_success) else 0.0
     y_loss_centered = y_loss_success - conditional_loss_mean
@@ -134,7 +128,7 @@ def build_model(
     # -----------------------
     # Fit Head A: success LS-GP
     # -----------------------
-    rng = np.random.default_rng(random_seed)
+    rng = get_rng(seed)
     base_success_rate = float(y_success.mean())
 
     with pm.Model() as model_s:
@@ -251,10 +245,9 @@ def build_model(
         },
         attrs={
             "artifact_version": "0.1.1",  # bumped after removing __success__
-            "target_column": target_column,
+            "target": target,
             "direction": direction,
-            "success_column": success_column if success_column is not None else "__inferred__",
-            "random_seed": int(random_seed),
+            "seed": int(seed),
             "n_rows": int(n),
             "n_features": int(p),
         },

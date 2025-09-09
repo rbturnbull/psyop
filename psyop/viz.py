@@ -320,7 +320,7 @@ def plot2d(
     suggest_df = opt.suggest(ds, count=suggest, **kwargs) if (suggest and suggest > 0) else None
 
     # masks for data overlays (already filtered if cat_fixed)
-    tgt_col = str(ds.attrs["target_column"])
+    tgt_col = str(ds.attrs["target"])
     success_mask = ~pd.isna(df_raw_f[tgt_col]).to_numpy()
     fail_mask    = ~success_mask
 
@@ -840,7 +840,7 @@ def plot1d(
     model: xr.Dataset | Path | str,
     output: Path | None = None,
     csv_out: Path | None = None,
-    n_points_1d: int = 300,
+    grid_size: int = 300,
     line_color: str = "rgb(31,119,180)",
     band_alpha: float = 0.25,
     figure_height_per_row_px: int = 320,
@@ -1036,7 +1036,7 @@ def plot1d(
     )
 
     # --- masks/data from filtered rows ---
-    tgt_col = str(ds.attrs["target_column"])
+    tgt_col = str(ds.attrs["target"])
     success_mask = ~pd.isna(df_raw_f[tgt_col]).to_numpy()
     fail_mask    = ~success_mask
     losses_success = df_raw_f.loc[success_mask, tgt_col].to_numpy().astype(float)
@@ -1052,7 +1052,7 @@ def plot1d(
 
         if kind == "num":
             j = key
-            grid = _grid_1d(j, n_points_1d)
+            grid = _grid_1d(j, grid_size)
             Xn_grid = np.repeat(base_std[None, :], len(grid), axis=0)
             Xn_grid[:, j] = grid
 
