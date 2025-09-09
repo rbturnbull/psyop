@@ -583,6 +583,20 @@ class _GPMarginal:
         self.ell = ell; self.ls = self.ell
         self.m0 = float(mean_const); self.mean_const = self.m0
 
+    def sd_at(self, x: np.ndarray, include_observation_noise: bool = True) -> float:
+        """
+        Predictive standard deviation at a single standardized point x.
+        """
+        x = np.asarray(x, float).reshape(1, -1)  # (1, p)
+        Ks = kernel_m52_ard(x, self.Xtr, self.ls, self.eta)  # (1, N)
+        v  = solve_lower(self.L, Ks.T)                      # (N, 1)
+        kss = kernel_diag_m52(x, self.ls, self.eta)[0]      # scalar diag K(x,x) = eta^2
+        var = float(kss - np.sum(v * v))
+        if include_observation_noise:
+            var += float(self.sigma ** 2)
+        var = max(var, 1e-12)
+        return float(np.sqrt(var))
+
     def _k_and_grad(self, x):
         """k(x, X), ∂k/∂x (p-dimensional gradient aggregated over train points)."""
         x = np.asarray(x, float).reshape(1, -1)                     # (1,p)
@@ -1134,6 +1148,292 @@ def _postfilter_numeric_constraints(
 
 
 def optimal(
+    model: xr.Dataset | Path | str,
+    output: Path | None = None,
+    count: int = 10,                 # ignored (we always return 1)
+    n_draws: int = 0,                # ignored (mean-only optimizer)
+    success_threshold: float = 0.8,
+    seed: int | np.random.Generator | None = 42,
+    **kwargs,                        # constraints in ORIGINAL units
+) -> pd.DataFrame:
+    """
+    Best single candidate by optimizing the GP *mean* posterior under constraints,
+    using L-BFGS-B on standardized features. Like `suggest` but returns 1 row.
+
+    Objective (we minimize):
+        J(x) = flip * μ_loss(x) + λ * softplus( threshold - p_success(x) )
+
+    Notes:
+      • Categorical bases handled by enumeration over allowed labels.
+      • Numeric choices are projected to nearest allowed value after optimize.
+      • `count` and `n_draws` are ignored (kept for API compatibility).
+    """
+    ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
+
+    # --- metadata
+    feature_names = [str(n) for n in ds["feature"].values.tolist()]
+    transforms    = [str(t) for t in ds["feature_transform"].values.tolist()]
+    mu_f = ds["feature_mean"].values.astype(float)
+    sd_f = ds["feature_std"].values.astype(float)
+    p    = len(feature_names)
+    name_to_idx = {nm: j for j, nm in enumerate(feature_names)}
+    groups = _groups_from_feature_names(feature_names)  # {base:{labels, name_by_label, members}}
+
+    # --- GP heads (shared helper class)
+    gp_s = _GPMarginal(
+        Xtr=ds["Xn_train"].values.astype(float),
+        ytr=ds["y_success"].values.astype(float),
+        ell=ds["map_success_ell"].values.astype(float),
+        eta=float(ds["map_success_eta"].values),
+        sigma=float(ds["map_success_sigma"].values),
+        mean_const=float(ds["map_success_beta0"].values),
+    )
+    cond_mean = float(ds["conditional_loss_mean"].values) if "conditional_loss_mean" in ds else 0.0
+    gp_l = _GPMarginal(
+        Xtr=ds["Xn_success_only"].values.astype(float),
+        ytr=ds["y_loss_centered"].values.astype(float),
+        ell=ds["map_loss_ell"].values.astype(float),
+        eta=float(ds["map_loss_eta"].values),
+        sigma=float(ds["map_loss_sigma"].values),
+        mean_const=float(ds["map_loss_mean_const"].values),
+    )
+
+    # --- direction
+    direction = str(ds.attrs.get("direction", "min"))
+    flip = -1.0 if direction == "max" else 1.0
+
+    # --- parse constraints (numeric vs categorical)
+    cat_allowed: dict[str, list[str]] = {}
+    cat_fixed: dict[str, str] = {}
+    fixed_num_std: dict[int, float] = {}
+    range_num_std: dict[int, tuple[float, float]] = {}
+    choice_num: dict[int, np.ndarray] = {}
+
+    # default allowed = all labels for each base
+    for b, g in groups.items():
+        cat_allowed[b] = list(g["labels"])
+
+    import re
+    def canon_key(k: str) -> str:
+        raw = str(k)
+        stripped = re.sub(r"[^a-z0-9]+", "", raw.lower())
+        if raw in name_to_idx:
+            return raw
+        for base in groups.keys():
+            if stripped == re.sub(r"[^a-z0-9]+", "", base.lower()):
+                return base
+        return raw
+
+    for k, v in (kwargs or {}).items():
+        ck = canon_key(k)
+        if ck in groups:
+            labels = groups[ck]["labels"]
+            if isinstance(v, str):
+                if v not in labels:
+                    raise ValueError(f"Unknown category for {ck}: {v}. Choices: {labels}")
+                cat_fixed[ck] = v
+            else:
+                L = [x for x in (list(v) if isinstance(v, (list, tuple, set)) else [v])
+                     if isinstance(x, str) and x in labels]
+                if not L:
+                    raise ValueError(f"No valid categories for {ck} in {v}. Choices: {labels}")
+                if len(L) == 1:
+                    cat_fixed[ck] = L[0]
+                else:
+                    cat_allowed[ck] = L
+        elif ck in name_to_idx:
+            j = name_to_idx[ck]
+            if isinstance(v, slice):
+                lo = _orig_to_std(j, v.start, transforms, mu_f, sd_f)
+                hi = _orig_to_std(j, v.stop,  transforms, mu_f, sd_f)
+                lo, hi = float(np.nanmin([lo, hi])), float(np.nanmax([lo, hi]))
+                range_num_std[j] = (lo, hi)
+            elif isinstance(v, (list, tuple, np.ndarray)):
+                arr = _orig_to_std(j, np.asarray(v, float), transforms, mu_f, sd_f)
+                choice_num[j] = np.asarray(arr, float)
+            else:
+                fixed_num_std[j] = float(_orig_to_std(j, float(v), transforms, mu_f, sd_f))
+        else:
+            raise ValueError(f"Unknown constraint key: {k!r}")
+
+    # --- numeric bounds (std space); allow outside training range
+    Xn = ds["Xn_train"].values.astype(float)
+    p01 = np.percentile(Xn, 1, axis=0)
+    p99 = np.percentile(Xn, 99, axis=0)
+    wide_lo = np.minimum(p01 - 1.0, -3.0)
+    wide_hi = np.maximum(p99 + 1.0,  3.0)
+
+    bounds: list[tuple[float, float] | None] = [None]*p
+    for j in range(p):
+        if j in fixed_num_std:
+            v = fixed_num_std[j]
+            bounds[j] = (v, v)
+        elif j in range_num_std:
+            bounds[j] = range_num_std[j]
+        elif j in choice_num:
+            lo = float(np.nanmin(choice_num[j])); hi = float(np.nanmax(choice_num[j]))
+            bounds[j] = (lo, hi)
+        else:
+            bounds[j] = (float(wide_lo[j]), float(wide_hi[j]))
+
+    # --- helpers
+    def apply_onehot(vec_std: np.ndarray, base: str, label: str):
+        for lab in groups[base]["labels"]:
+            member_name = groups[base]["name_by_label"][lab]
+            j = name_to_idx[member_name]
+            raw = 1.0 if lab == label else 0.0
+            vec_std[j] = _orig_to_std(j, raw, transforms, mu_f, sd_f)
+
+    penalty_lambda = 1.0
+    penalty_beta   = 10.0
+
+    def obj_grad(x_std_full: np.ndarray) -> tuple[float, np.ndarray]:
+        # mean + grad for loss head (centered); add back cond_mean
+        mu_l, g_l = gp_l.mean_and_grad(x_std_full)
+        mu = mu_l + cond_mean
+        # success head (smooth, not clipped)
+        mu_p, g_p = gp_s.mean_and_grad(x_std_full)
+        # softplus penalty for p<thr
+        z   = success_threshold - mu_p
+        sig = 1.0 / (1.0 + np.exp(-penalty_beta * z))
+        penalty = penalty_lambda * (np.log1p(np.exp(penalty_beta * z)) / penalty_beta)
+        grad_pen = - penalty_lambda * sig * g_p
+        J  = float(flip * mu + penalty)
+        gJ = (flip * g_l + grad_pen).astype(float)
+        return J, gJ
+
+    # exclude one-hot members from numeric optimization
+    onehot_members = {m for g in groups.values() for m in g["members"]}
+    numeric_idx = [j for j, nm in enumerate(feature_names) if nm not in onehot_members]
+    num_bounds = [bounds[j] for j in numeric_idx]
+
+    # uniform starts inside numeric bounds (std space)
+    rng = np.random.default_rng(seed)
+    def sample_start() -> np.ndarray:
+        x = np.zeros(p, float)
+        for j in numeric_idx:
+            lo, hi = num_bounds[numeric_idx.index(j)]
+            x[j] = lo if lo == hi else rng.uniform(lo, hi)
+        for j, choices in choice_num.items():
+            x[j] = choices[np.argmin(np.abs(choices - x[j]))]
+        for j, v in fixed_num_std.items():
+            x[j] = v
+        return x
+
+    # enumerate categorical combos (fixed → single)
+    cat_bases = list(groups.keys())
+    combo_space = []
+    for b in cat_bases:
+        combo_space.append([cat_fixed[b]] if b in cat_fixed else cat_allowed[b])
+    all_label_combos = list(itertools.product(*combo_space)) if combo_space else [()]
+
+    # --- optimize (multi-start) and keep the single best over all combos
+    from scipy.optimize import fmin_l_bfgs_b
+    n_starts   = 32
+    max_iters  = 200
+
+    best_global_val: float | None = None
+    best_global_x:   np.ndarray | None = None
+    best_global_labels: tuple[str, ...] | tuple = tuple()
+
+    for labels in all_label_combos:
+        template = np.zeros(p, float)
+        for b, lab in zip(cat_bases, labels):
+            apply_onehot(template, b, lab)
+
+        # numeric-only wrapper
+        def f_g_only_num(x_num: np.ndarray):
+            x_full = template.copy()
+            x_full[numeric_idx] = x_num
+            J, g = obj_grad(x_full)
+            return J, g[numeric_idx]
+
+        # multi-starts
+        starts = []
+        for _ in range(n_starts):
+            s = sample_start()
+            for b, lab in zip(cat_bases, labels):
+                apply_onehot(s, b, lab)
+            starts.append(s[numeric_idx])
+
+        # pick best for this combo
+        best_val = None
+        best_xnum = None
+        for x0 in starts:
+            xopt, fval, _ = fmin_l_bfgs_b(
+                func=lambda x: f_g_only_num(x),
+                x0=x0,
+                fprime=None,
+                bounds=num_bounds,
+                maxiter=max_iters,
+            )
+            fval = float(fval)
+            if (best_val is None) or (fval < best_val):
+                best_val = fval
+                best_xnum = xopt
+
+        if best_xnum is None:
+            continue
+
+        # assemble full point, project choices, clip to bounds
+        x_full = template.copy()
+        x_full[numeric_idx] = best_xnum
+        for j, choices in choice_num.items():
+            x_full[j] = float(choices[np.argmin(np.abs(choices - x_full[j]))])
+        for idx in numeric_idx:
+            lo, hi = num_bounds[numeric_idx.index(idx)]
+            x_full[idx] = float(np.clip(x_full[idx], lo, hi))
+
+        if (best_global_val is None) or (best_val < best_global_val):
+            best_global_val = float(best_val)
+            best_global_x = x_full.copy()
+            best_global_labels = tuple(labels) if labels else tuple()
+
+    if best_global_x is None:
+        raise ValueError("No feasible optimum produced; check/relax constraints.")
+
+    # --- build single-row DataFrame in ORIGINAL units
+    x_opt = best_global_x
+    mu_l_opt, _ = gp_l.mean_and_grad(x_opt)
+    mu_opt = float(mu_l_opt + cond_mean)
+    p_opt, _  = gp_s.mean_and_grad(x_opt)
+    p_opt = float(np.clip(p_opt, 0.0, 1.0))
+
+    sd_opt = gp_l.sd_at(x_opt, include_observation_noise=True)
+
+    onehot_members = {m for g in groups.values() for m in g["members"]}
+
+    row: dict[str, object] = {
+        "pred_p_success": p_opt,
+        "pred_target_mean": mu_opt,
+        "pred_target_sd": float(sd_opt),
+        "rank": 1,
+    }
+    # numerics in original units (drop one-hot members)
+    for j, nm in enumerate(feature_names):
+        if nm in onehot_members:
+            continue
+        row[nm] = float(_std_to_orig(j, x_opt[j], transforms, mu_f, sd_f))
+    # categorical base columns
+    for b, lab in zip(cat_bases, best_global_labels):
+        row[b] = lab
+
+    df = pd.DataFrame([row])
+
+    if output:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output, index=False)
+
+    try:
+        console.print(f"\n[bold]Optimal candidate (mean posterior):[/]")
+        console.print(df_to_table(df))  # type: ignore[arg-type]
+    except Exception:
+        pass
+    return df
+
+
+def optimal_old(
     model: xr.Dataset | Path | str,
     output: Path | None = None,
     count: int = 10,

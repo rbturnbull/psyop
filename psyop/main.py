@@ -401,10 +401,10 @@ def optimal(
     opt.optimal(
         model=model,
         output=output,
-        count=count,
-        n_draws=draws,
-        min_success_probability=min_success_probability,
-        random_seed=seed,
+        # count=count,
+        # n_draws=draws,
+        # min_success_probability=min_success_probability,
+        seed=seed,
         **constraints,
     )
     if output:
