@@ -1056,11 +1056,21 @@ def plot1d(
             Xn_grid = np.repeat(base_std[None, :], len(grid), axis=0)
             Xn_grid[:, j] = grid
 
+            # # --- DEBUG: confirm the feature is actually changing in standardized space ---
+            # print(f"[{feature_names[j]}] std grid head: {grid[:6]}")
+            # print(f"[{feature_names[j]}] std grid ptp (range): {np.ptp(grid)}")
+            # print(f"[{feature_names[j]}] Xn_grid[:2, j]: {Xn_grid[:2, j]}")
+            # print(f"[{feature_names[j]}] Xn 1–99%: {p01p99[j]}")
+
             p_grid = pred_success(Xn_grid)
             mu_grid, sd_grid = pred_loss(Xn_grid, include_observation_noise=True)
+            # print(feature_names[j], "mu range:", float(np.ptp(mu_grid)))
 
             x_internal = grid * X_std[j] + X_mean[j]
             x_display  = _inverse_transform(transforms[j], x_internal)
+
+            # print(f"[{feature_names[j]}] orig head: {x_display[:6]}")
+            # print(f"[{feature_names[j]}] orig ptp (range): {np.ptp(x_display)}")
 
             if use_log_scale_for_target_y:
                 mu_plot = np.maximum(mu_grid, log_y_epsilon)
@@ -1227,7 +1237,8 @@ def plot1d(
 
             p_vec = pred_success(Xn_grid)
             mu_vec, sd_vec = pred_loss(Xn_grid, include_observation_noise=True)
-
+            print(feature_names[j], "mu range:", float(np.ptp(mu_grid)))
+            
             # y transform
             if use_log_scale_for_target_y:
                 mu_plot = np.maximum(mu_vec, log_y_epsilon)
@@ -1439,15 +1450,20 @@ def plot1d(
 # =============================================================================
 # Helpers: dataset → predictors & featurization
 # =============================================================================
-
 def _build_predictors(ds: xr.Dataset):
-    """Reconstruct fast GP predictors from the artifact (no PyMC required)."""
+    """Reconstruct fast GP predictors from the artifact using shared helpers."""
     # Training matrices / targets
     Xn_all = ds["Xn_train"].values.astype(float)               # (N, p)
     y_success = ds["y_success"].values.astype(float)           # (N,)
-    Xn_ok = ds["Xn_success_only"].values.astype(float)         # (N_ok, p)
+    Xn_ok = ds["Xn_success_only"].values.astype(float)         # (Ns, p)
     y_loss_centered = ds["y_loss_centered"].values.astype(float)
-    cond_mean = float(ds["conditional_loss_mean"].values)
+
+    # Compatibility: conditional_loss_mean may be a var or an attr
+    cond_mean = (
+        float(ds["conditional_loss_mean"].values)
+        if "conditional_loss_mean" in ds
+        else float(ds.attrs.get("conditional_loss_mean", 0.0))
+    )
 
     # Success head MAP params
     ell_s = ds["map_success_ell"].values.astype(float)         # (p,)
@@ -1461,11 +1477,12 @@ def _build_predictors(ds: xr.Dataset):
     sigma_l = float(ds["map_loss_sigma"].values)
     mean_c = float(ds["map_loss_mean_const"].values)
 
-    # Cholesky precomputations
+    # --- Cholesky precomputations (success) ---
     K_s = kernel_m52_ard(Xn_all, Xn_all, ell_s, eta_s) + (sigma_s**2) * np.eye(Xn_all.shape[0])
     L_s = np.linalg.cholesky(add_jitter(K_s))
     alpha_s = solve_chol(L_s, (y_success - beta0_s))
 
+    # --- Cholesky precomputations (loss | success) ---
     K_l = kernel_m52_ard(Xn_ok, Xn_ok, ell_l, eta_l) + (sigma_l**2) * np.eye(Xn_ok.shape[0])
     L_l = np.linalg.cholesky(add_jitter(K_l))
     alpha_l = solve_chol(L_l, (y_loss_centered - mean_c))
@@ -1475,11 +1492,16 @@ def _build_predictors(ds: xr.Dataset):
         mu = beta0_s + Ks @ alpha_s
         return np.clip(mu, 0.0, 1.0)
 
-    def predict_conditional_target(Xn: np.ndarray, include_observation_noise: bool = True):
+    def predict_conditional_target(
+        Xn: np.ndarray,
+        include_observation_noise: bool = True
+    ):
         Kl = kernel_m52_ard(Xn, Xn_ok, ell_l, eta_l)
         mu_centered = mean_c + Kl @ alpha_l
         mu = mu_centered + cond_mean
-        v = solve_lower(L_l, Kl.T)
+
+        # diag predictive variance
+        v = solve_lower(L_l, Kl.T)  # (Ns, Nt)
         var = kernel_diag_m52(Xn, ell_l, eta_l) - np.sum(v * v, axis=0)
         var = np.maximum(var, 1e-12)
         if include_observation_noise:

@@ -10,7 +10,7 @@ import pandas as pd
 import xarray as xr
 from scipy.special import ndtr  # Φ(z), vectorized
 
-from .util import get_rng
+from .util import get_rng, df_to_table
 from .model import (
     kernel_diag_m52, 
     kernel_m52_ard,
@@ -182,61 +182,6 @@ def _split_constraints_for_numeric_and_categorical(
         user_choices_num.pop(k, None)
 
     return groups, user_fixed, user_ranges, user_choices_num, cat_fixed_label, cat_allowed
-
-
-def df_to_table(
-    pandas_dataframe: pd.DataFrame,
-    rich_table: Table | None = None,
-    show_index: bool = True,
-    index_name: str | None = None,
-    transpose: bool = True,
-    sig_figs: int = 3,
-    heading_style: str = "magenta",
-) -> Table:
-    """Convert a pandas.DataFrame to a rich.Table with optional transpose and sig-fig formatting."""
-
-    def _fmt_cell(x) -> str:
-        try:
-            import numpy as _np
-            if isinstance(x, (float, _np.floating)):
-                if _np.isnan(x) or _np.isinf(x):
-                    return str(x)
-                return f"{float(x):.{sig_figs}g}"
-            if isinstance(x, (int, _np.integer)) and not isinstance(x, bool):
-                return str(int(x))
-        except Exception:
-            pass
-        return str(x)
-
-    rich_table = rich_table or Table(show_header=False, header_style="bold magenta")
-
-    df = pandas_dataframe
-
-    if not transpose:
-        # Original orientation
-        if show_index:
-            rich_table.add_column(str(index_name) if index_name else "", style=heading_style)
-        for col in df.columns:
-            rich_table.add_column(str(col))
-        for idx, row in df.iterrows():
-            cells = ([str(idx)] if show_index else []) + [_fmt_cell(v) for v in row.tolist()]
-            rich_table.add_row(*cells)
-        return rich_table
-
-    # Transposed-like view (columns as rows)
-    left_header = str(index_name) if index_name is not None else ""
-    rich_table.add_column(left_header, style=heading_style)  # magenta left column
-
-    # Column headers across (not displayed when show_header=False, but keeps widths aligned)
-    across_headers = [str(i) for i in df.index] if show_index else ["" for _ in range(len(df.index))]
-    for h in across_headers:
-        rich_table.add_column(h)
-
-    for col in df.columns:
-        row_vals = [_fmt_cell(v) for v in df[col].tolist()]
-        rich_table.add_row(str(col), *row_vals)
-
-    return rich_table
 
 
 def _detect_categorical_groups(feature_names: list[str]) -> dict[str, list[tuple[str, str]]]:
@@ -682,7 +627,7 @@ def optimal(
     model: xr.Dataset | Path | str,
     output: Path | None = None,
     count: int = 10,
-    n_draws: int = 2000,
+    n_draws: int = 0,
     success_threshold: float = 0.8,
     seed: int | np.random.Generator | None = 42,
     **kwargs,
@@ -785,6 +730,45 @@ def optimal(
     N = len(cand_df)
     if N == 0:
         raise ValueError("All sampled candidates were filtered out by success_threshold.")
+
+    # --- mean-only mode when n_draws == 0
+    if int(n_draws) <= 0:
+        result = cand_df.copy()
+        result["pred_p_success"]   = p
+        result["pred_target_mean"] = mu
+        result["pred_target_sd"]   = sd
+        # keep columns for API parity
+        result["wins"] = 0
+        result["n_draws_effective"] = 0
+        result["prob_best_feasible"] = 0.0
+        result["conditioned_on"] = _pretty_conditioned_on(
+            fixed_norm_numeric=fixed_norm_num,
+            cat_fixed_label=cat_fixed_label,
+        )
+
+        # Direction-aware sort by μ, then lower σ, then higher p
+        if str(ds.attrs.get("direction", "min")) == "max":
+            sort_cols = ["pred_target_mean", "pred_target_sd", "pred_p_success"]
+            ascending = [False, True, False]
+        else:  # "min"
+            sort_cols = ["pred_target_mean", "pred_target_sd", "pred_p_success"]
+            ascending = [True,  True, False]
+
+        result_sorted = result.sort_values(
+            sort_cols, ascending=ascending, kind="mergesort"
+        ).reset_index(drop=True)
+        result_sorted["rank_prob_best"] = np.arange(1, len(result_sorted) + 1)
+
+        top = result_sorted.head(count).reset_index(drop=True)
+        # collapse one-hot → single categorical columns (e.g., 'language')
+        top_view = _collapse_onehot_to_categorical(top, groups)
+
+        if output:
+            top_view.to_csv(output, index=False)
+
+        console.print(f"\n[bold]Top {len(top_view)} optimal solutions (mean-only, n_draws=0):[/]")
+        console.print(df_to_table(top_view))
+        return top_view
 
     # --- Monte Carlo winner-take-all over feasible draws
     Z = mu[:, None] + sd[:, None] * rng.standard_normal((N, n_draws))
