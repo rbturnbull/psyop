@@ -982,10 +982,13 @@ def suggest(
             mu_l, _ = gp_l.mean_and_grad(x_full); mu = float(mu_l + cond_mean)
             ps, _  = gp_s.mean_and_grad(x_full);  ps = float(np.clip(ps, 0.0, 1.0))
 
+            sd_opt = gp_l.sd_at(x_full, include_observation_noise=True)
+
             # build output row in ORIGINAL units (numerics) + categorical base columns
             row = {
                 "pred_p_success": ps,
                 "pred_target_mean": mu,
+                "pred_target_sd" : float(sd_opt),
             }
             for j, nm in enumerate(feature_names):
                 if nm in onehot_members:
