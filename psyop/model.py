@@ -13,6 +13,8 @@ for _env_var in (
     os.environ.setdefault(_env_var, "1")
 
 from pathlib import Path
+import base64
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -129,6 +131,9 @@ def build_model(
     # Fit Head A: success LS-GP
     # -----------------------
     rng = get_rng(seed)
+    state_bytes = pickle.dumps(rng.bit_generator.state)
+    rng_state_b64 = base64.b64encode(state_bytes).decode("ascii")
+
     base_success_rate = float(y_success.mean())
 
     with pm.Model() as model_s:
@@ -247,7 +252,9 @@ def build_model(
             "artifact_version": "0.1.1",  # bumped after removing __success__
             "target": target,
             "direction": direction,
-            "seed": int(seed),
+            "rng_state": rng_state_b64,          # <-- serialized state
+            "rng_bitgen": rng.bit_generator.__class__.__name__,  # e.g. "PCG64"
+            "numpy_version": np.__version__,
             "n_rows": int(n),
             "n_features": int(p),
         },
