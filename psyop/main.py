@@ -429,6 +429,7 @@ def plot2d(
     suggest: int = typer.Option(0, help="Number of suggested points."),
     width: int|None = typer.Option(None, help="Width of each panel in pixels (default auto)."),
     height: int|None = typer.Option(None, help="Height of each panel in pixels (default auto)."),
+    seed: int = typer.Option(42, help="Random seed for suggested points."),
 ):
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
@@ -451,6 +452,7 @@ def plot2d(
         suggest=suggest,
         width=width,
         height=height,
+        seed=seed,
         **constraints,
     )
     if output:
@@ -477,6 +479,7 @@ def plot1d(
     suggest: int = typer.Option(0, help="Number of suggested points."),
     width: int|None = typer.Option(None, help="Width of each panel in pixels (default auto)."),
     height: int|None = typer.Option(None, help="Height of each panel in pixels (default auto)."),
+    seed: int = typer.Option(42, help="Random seed for suggested points."),
 ):
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
@@ -501,6 +504,7 @@ def plot1d(
         suggest=suggest,
         width=width,
         height=height,
+        seed=seed,
         **constraints,
     )
     if output:

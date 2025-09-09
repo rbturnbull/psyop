@@ -89,6 +89,7 @@ def plot2d(
     n_contours: int = 12,
     optimal: bool = True,
     suggest: int = 0,
+    seed: int|None = 42,
     width:int|None = None,
     height:int|None = None,
     **kwargs,
@@ -316,8 +317,8 @@ def plot2d(
 
 
     # overlays prepared under the SAME constraints (pass original kwargs straight through)
-    optimal_df = opt.optimal(ds, count=1, **kwargs) if optimal else None
-    suggest_df = opt.suggest(ds, count=suggest, **kwargs) if (suggest and suggest > 0) else None
+    optimal_df = opt.optimal(ds, count=1, seed=seed, **kwargs) if optimal else None
+    suggest_df = opt.suggest(ds, count=suggest, seed=seed, **kwargs) if (suggest and suggest > 0) else None
 
     # masks for data overlays (already filtered if cat_fixed)
     tgt_col = str(ds.attrs["target"])
@@ -851,6 +852,7 @@ def plot1d(
     suggest: int = 0,
     width:int|None = None,
     height:int|None = None,
+    seed: int|None = 42,
     **kwargs,
 ) -> go.Figure:
     """
@@ -962,8 +964,8 @@ def plot1d(
             fixed_scalars[j] = float(_orig_to_std(j, raw_val, transforms, X_mean, X_std))
 
     # --- overlays conditioned on the same kwargs (numeric + categorical) ---
-    optimal_df  = opt.optimal(model, count=1, **kwargs) if optimal else None
-    suggest_df  = opt.suggest(model, count=suggest, **kwargs) if (suggest and suggest > 0) else None
+    optimal_df  = opt.optimal(model, count=1, seed=seed, **kwargs) if optimal else None
+    suggest_df  = opt.suggest(model, count=suggest, seed=seed, **kwargs) if (suggest and suggest > 0) else None
 
     # --- base standardized point (median over filtered rows), then apply scalar fixes ---
     base_std = np.median(Xn_train_f, axis=0)
@@ -1160,11 +1162,12 @@ def plot1d(
             if suggest_df is not None and feature_names[j] in suggest_df.columns:
                 x_sug = suggest_df[feature_names[j]].values
                 y_sug = suggest_df["pred_target_mean"].values
+                y_sd  = suggest_df["pred_target_sd"].values
                 fig.add_trace(go.Scattergl(
                     x=x_sug, y=y_sug, mode="markers",
                     marker=dict(size=9, color="cyan", line=dict(color="black", width=1.2), symbol="star"),
                     name="suggested", legendgroup="suggested", showlegend=show_legend,
-                    hovertemplate=(f"predicted: %{{y:.3g}}<br>"
+                    hovertemplate=(f"predicted: %{{y:.3g}} ± {{y_sd:.3g}}<br>"
                                    f"{feature_names[j]}: %{{x:.6g}}<extra></extra>")
                 ), row=row_pos, col=1)
 
