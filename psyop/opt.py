@@ -329,8 +329,21 @@ def _assert_valid_onehot(df: pd.DataFrame, groups: dict[str, dict], where: str =
             print(df.iloc[bad[:5]][member_cols])  # show a few bad rows
             raise RuntimeError(f"Invalid one-hot block for base={base} at {where}")
 
+def _get_float_attr(obj, names, default=0.0):
+    for n in names:
+        if hasattr(obj, n):
+            v = getattr(obj, n)
+            # skip boolean flags like mean_only
+            if isinstance(v, (bool, np.bool_)):
+                continue
+            try:
+                return float(v)
+            except Exception:
+                pass
+    return float(default)
 
-def suggest(
+
+def suggest_old(
     model: xr.Dataset | Path | str,
     output: Path | str | None = None,
     count: int = 10,
@@ -501,6 +514,503 @@ def suggest(
         pass
 
     return out
+
+import itertools
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+# ---------- small utils (reuse in this file) ----------
+def _orig_to_std(j: int, x, transforms, mu, sd):
+    arr = np.asarray(x, dtype=float)
+    if transforms[j] == "log10":
+        arr = np.where(arr <= 0, np.nan, arr)
+        arr = np.log10(arr)
+    return (arr - mu[j]) / sd[j]
+
+def _std_to_orig(j: int, arr, transforms, mu, sd):
+    x = np.asarray(arr, float) * sd[j] + mu[j]
+    if transforms[j] == "log10":
+        x = np.power(10.0, x)
+    return x
+
+def _groups_from_feature_names(feature_names: list[str]) -> dict:
+    # same grouping logic you already use elsewhere
+    groups = {}
+    for nm in feature_names:
+        if "=" in nm:
+            base, lab = nm.split("=", 1)
+            g = groups.setdefault(base, {"labels": [], "name_by_label": {}, "members": []})
+            g["labels"].append(lab)
+            g["name_by_label"][lab] = nm
+            g["members"].append(nm)
+    # Stable order
+    for b in groups:
+        labs = list(dict.fromkeys(groups[b]["labels"]))
+        groups[b]["labels"] = labs
+        groups[b]["members"] = [groups[b]["name_by_label"][lab] for lab in labs]
+    return groups
+
+def _pick_attr(obj, names, allow_none=False):
+    """Return the first present attribute in names without truth-testing arrays."""
+    for n in names:
+        if hasattr(obj, n):
+            v = getattr(obj, n)
+            if (v is not None) or allow_none:
+                return v
+    return None
+
+# ---------- analytic GP (mean + grad) ----------
+class _GPMarginal:
+    def __init__(self, Xtr, ytr, ell, eta, sigma, mean_const):
+        self.X = np.asarray(Xtr, float)              # (N,p)
+        self.y = np.asarray(ytr, float)              # (N,)
+        self.ell = np.asarray(ell, float)            # (p,)
+        self.eta = float(eta)
+        self.sigma = float(sigma)
+        self.m = float(mean_const)
+        K = kernel_m52_ard(self.X, self.X, self.ell, self.eta)
+        K[np.diag_indices_from(K)] += self.sigma**2
+        L = np.linalg.cholesky(add_jitter(K))
+        self.L = L
+        self.alpha = solve_chol(L, (self.y - self.m))
+        self.X_train = getattr(self, "X_train", getattr(self, "Xtr", getattr(self, "X", None)))
+        self.ell     = getattr(self, "ell", getattr(self, "ls", None))
+        # Back-compat aliases:
+        self.Xtr = self.X_train
+        self.ls  = self.ell
+        self.Xtr = self.X_train
+        self.ell = ell; self.ls = self.ell
+        self.m0 = float(mean_const); self.mean_const = self.m0
+
+    def _k_and_grad(self, x):
+        """k(x, X), ∂k/∂x (p-dimensional gradient aggregated over train points)."""
+        x = np.asarray(x, float).reshape(1, -1)                     # (1,p)
+        X = self.X
+        ell = self.ell
+        eta = self.eta
+
+        # distances in lengthscale space
+        D = (x[:, None, :] - X[None, :, :]) / ell[None, None, :]    # (1,N,p)
+        r2 = np.sum(D*D, axis=2)                                    # (1,N)
+        r  = np.sqrt(np.maximum(r2, 0.0))                           # (1,N)
+        sqrt5_r = np.sqrt(5.0) * r
+        # kernel
+        k = (eta**2) * (1.0 + sqrt5_r + (5.0/3.0)*r2) * np.exp(-sqrt5_r)  # (1,N)
+
+        # grad wrt x:  -(5η^2/3) e^{-√5 r} (1 + √5 r) * (x - xi)/ell^2
+        # handle r=0 safely -> derivative is 0
+        coef = -(5.0 * (eta**2) / 3.0) * np.exp(-sqrt5_r) * (1.0 + sqrt5_r)  # (1,N)
+        S = (x[:, None, :] - X[None, :, :]) / (ell[None, None, :]**2)        # (1,N,p)
+        grad = np.sum(coef[:, :, None] * S, axis=1)                          # (1,p)
+
+        return k.ravel(), grad.ravel()
+
+    def mean_and_grad(self, x: np.ndarray):
+        # --- resolve training matrix
+        Xtr = _pick_attr(self, ["X_train", "Xtr", "X"])
+        if Xtr is None:
+            raise AttributeError("GPMarginal: training inputs not found (tried X_train, Xtr, X).")
+        Xtr = np.asarray(Xtr, float)
+
+        # --- resolve hyperparams / vectors
+        ell = _pick_attr(self, ["ell", "ls"])
+        if ell is None:
+            raise AttributeError("GPMarginal: lengthscales not found (tried ell, ls).")
+        ell = np.asarray(ell, float)
+
+        eta = _get_float_attr(self, ["eta"])
+        alpha = _pick_attr(self, ["alpha", "alpha_vec"])
+        if alpha is None:
+            raise AttributeError("GPMarginal: alpha not found (tried alpha, alpha_vec).")
+        alpha = np.asarray(alpha, float).ravel()
+
+        # mean constant (name differs across versions)
+        m0 = _get_float_attr(self, ["mean_const", "m0", "beta0", "mean_c", "mean"], default=0.0)
+
+        # --- mean
+        Ks = kernel_m52_ard(x[None, :], Xtr, ell, eta).ravel()   # (N_train,)
+        mu = float(m0 + Ks @ alpha)
+
+        # --- gradient wrt x (shape (p,))
+        grad_k  = _grad_k_m52_ard_wrt_x(x, Xtr, ell, eta)        # (N_train, p)
+        grad_mu = grad_k.T @ alpha                               # (p,)
+
+        return mu, grad_mu
+
+
+    def mean_only(self, X):
+        Ks = kernel_m52_ard(X, self.X, self.ell, self.eta)
+        return self.m + Ks @ self.alpha
+
+
+def _grad_k_m52_ard_wrt_x(x: np.ndarray, Xtr: np.ndarray, ls: np.ndarray, eta: float) -> np.ndarray:
+    """
+    ∂k(x, Xtr_i)/∂x for Matérn 5/2 ARD.
+    Returns (N_train, p) — one row per training point.
+    """
+    x   = np.asarray(x, float).reshape(1, -1)     # (1, p)
+    Xtr = np.asarray(Xtr, float)                  # (N, p)
+    ls  = np.asarray(ls, float).reshape(1, -1)    # (1, p)
+
+    diff = x - Xtr                                # (N, p)
+    z    = diff / ls                              # (N, p)
+    r    = np.sqrt(np.sum(z*z, axis=1))           # (N,)
+
+    sr5  = np.sqrt(5.0)
+    coef = -(5.0 * (eta**2) / 3.0) * np.exp(-sr5 * r) * (1.0 + sr5 * r)  # (N,)
+    grad = coef[:, None] * (diff / (ls*ls))       # (N, p)
+    return grad
+
+
+# ---------- main: direct constrained + gradient refinement ----------
+def suggest(
+    model: xr.Dataset | Path | str,
+    count: int = 10,
+    output:Path|None = None,
+    explore:float = 0.34,
+    success_threshold: float = 0.8,
+    n_starts: int = 32,
+    max_iters: int = 200,
+    penalty_lambda: float = 1.0,
+    penalty_beta: float = 10.0,
+    direction: str | None = None,   # defaults to model's
+    seed: int | np.random.Generator | None = 42,
+    **kwargs,                       # constraints in ORIGINAL units
+) -> pd.DataFrame:
+    """
+    Optimize *inside the user constraints* (including outside the training ranges),
+    using L-BFGS-B on the GP posterior mean with a smooth feasibility penalty:
+      objective(x) = flip * μ_loss(x) + λ * softplus( threshold - p_success(x) )
+    Categorical bases are handled by enumeration over allowed labels.
+    """
+
+    ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
+
+    # metadata
+    feature_names = [str(n) for n in ds["feature"].values.tolist()]
+    transforms    = [str(t) for t in ds["feature_transform"].values.tolist()]
+    mu_f = ds["feature_mean"].values.astype(float)
+    sd_f = ds["feature_std"].values.astype(float)
+    p = len(feature_names)
+    name_to_idx = {nm: j for j, nm in enumerate(feature_names)}
+    groups = _groups_from_feature_names(feature_names)
+
+    # heads
+    # success
+    gp_s = _GPMarginal(
+        Xtr=ds["Xn_train"].values.astype(float),
+        ytr=ds["y_success"].values.astype(float),
+        ell=ds["map_success_ell"].values.astype(float),
+        eta=float(ds["map_success_eta"].values),
+        sigma=float(ds["map_success_sigma"].values),
+        mean_const=float(ds["map_success_beta0"].values),
+    )
+    # loss|success (centered)
+    cond_mean = float(ds["conditional_loss_mean"].values) if "conditional_loss_mean" in ds else 0.0
+    gp_l = _GPMarginal(
+        Xtr=ds["Xn_success_only"].values.astype(float),
+        ytr=ds["y_loss_centered"].values.astype(float),
+        ell=ds["map_loss_ell"].values.astype(float),
+        eta=float(ds["map_loss_eta"].values),
+        sigma=float(ds["map_loss_sigma"].values),
+        mean_const=float(ds["map_loss_mean_const"].values),
+    )
+
+    # direction
+    if direction is None:
+        direction = str(ds.attrs.get("direction", "min"))
+    flip = -1.0 if direction == "max" else 1.0  # we MINIMIZE objective
+
+    # split constraints: numeric vs categorical bases
+    cat_allowed: dict[str, list[str]] = {}
+    cat_fixed: dict[str, str] = {}
+    fixed_num_std: dict[int, float] = {}
+    range_num_std: dict[int, tuple[float, float]] = {}
+    choice_num: dict[int, np.ndarray] = {}
+
+    # default allowed for categorical bases = all labels
+    for b, g in groups.items():
+        cat_allowed[b] = list(g["labels"])
+
+    # canonicalize and fill structures
+    import re
+    def canon_key(k: str) -> str:
+        raw = str(k)
+        stripped = re.sub(r"[^a-z0-9]+", "", raw.lower())
+        # match against bases or exact feature names (numeric only)
+        if raw in name_to_idx: return raw
+        for base in groups.keys():
+            if stripped == re.sub(r"[^a-z0-9]+", "", base.lower()):
+                return base
+        # fall back to exact key if present
+        return raw
+
+    for k, v in (kwargs or {}).items():
+        ck = canon_key(k)
+        if ck in groups:  # categorical base
+            labels = groups[ck]["labels"]
+            if isinstance(v, str):
+                if v not in labels:
+                    raise ValueError(f"Unknown category for {ck}: {v}. Choices: {labels}")
+                cat_fixed[ck] = v
+            else:
+                L = [x for x in (list(v) if isinstance(v, (list, tuple, set)) else [v]) if isinstance(x, str) and x in labels]
+                if not L:
+                    raise ValueError(f"No valid categories for {ck} in {v}. Choices: {labels}")
+                if len(L) == 1:
+                    cat_fixed[ck] = L[0]
+                else:
+                    cat_allowed[ck] = L
+        elif ck in name_to_idx:  # numeric
+            j = name_to_idx[ck]
+            if isinstance(v, slice):
+                lo = _orig_to_std(j, v.start, transforms, mu_f, sd_f)
+                hi = _orig_to_std(j, v.stop,  transforms, mu_f, sd_f)
+                lo, hi = float(np.nanmin([lo, hi])), float(np.nanmax([lo, hi]))
+                range_num_std[j] = (lo, hi)
+            elif isinstance(v, (list, tuple, np.ndarray)):
+                arr = _orig_to_std(j, np.asarray(v, float), transforms, mu_f, sd_f)
+                choice_num[j] = np.asarray(arr, float)
+            else:
+                fixed_num_std[j] = float(_orig_to_std(j, float(v), transforms, mu_f, sd_f))
+        else:
+            raise ValueError(f"Unknown constraint key: {k!r}")
+
+    # numeric bounds in standardized space (fall back to wide prior if unconstrained)
+    Xn = ds["Xn_train"].values.astype(float)
+    p01 = np.percentile(Xn, 1, axis=0)
+    p99 = np.percentile(Xn, 99, axis=0)
+    wide_lo = np.minimum(p01 - 1.0, -3.0)   # allow outside training range
+    wide_hi = np.maximum(p99 + 1.0,  3.0)
+
+    bounds: list[tuple[float, float] | None] = [None]*p
+    for j in range(p):
+        if j in fixed_num_std:
+            val = fixed_num_std[j]
+            bounds[j] = (val, val)
+        elif j in range_num_std:
+            bounds[j] = range_num_std[j]
+        elif j in choice_num:
+            # treat choices as discrete during start selection; keep a wide box for refinement
+            lo = float(np.nanmin(choice_num[j])); hi = float(np.nanmax(choice_num[j]))
+            bounds[j] = (lo, hi)
+        else:
+            # unconstrained numeric → broad box in standardized space
+            bounds[j] = (float(wide_lo[j]), float(wide_hi[j]))
+
+    # set categorical one-hots helper
+    def apply_onehot(vec_std: np.ndarray, base: str, label: str):
+        for lab in groups[base]["labels"]:
+            member_name = groups[base]["name_by_label"][lab]
+            j = name_to_idx[member_name]
+            raw = 1.0 if lab == label else 0.0
+            vec_std[j] = _orig_to_std(j, raw, transforms, mu_f, sd_f)
+
+    # objective with gradient
+    def obj_grad(x_std, fixed_template):
+        x = fixed_template.copy()
+        x[:len(x_std)] = x_std  # numeric slice is already arranged below
+        # mean + grad for loss head
+        mu_l, g_l = gp_l.mean_and_grad(x)
+        mu = mu_l + cond_mean
+        # success probability head
+        mu_p, g_p = gp_s.mean_and_grad(x)  # not clipped; smooth
+        # soft penalty for p<thr
+        z = success_threshold - mu_p
+        # softplus(z) = log(1+exp(beta z))/beta; d/dx softplus = sigmoid(beta z) * beta / beta = sigmoid(beta z)
+        sig = 1.0 / (1.0 + np.exp(-penalty_beta * z))
+        penalty = penalty_lambda * (np.log1p(np.exp(penalty_beta * z)) / penalty_beta)
+        grad_pen = - penalty_lambda * sig * g_p
+        # final objective and gradient (we minimize)
+        J = flip * mu + penalty
+        gJ = flip * g_l + grad_pen
+        return float(J), gJ.astype(float)
+
+    # build numeric index list (exclude one-hot members from optimization; they are fixed via template)
+    onehot_members = {m for g in groups.values() for m in g["members"]}
+    numeric_idx = [j for j, nm in enumerate(feature_names) if nm not in onehot_members]
+
+    # bounds vectorized for numeric_idx
+    num_bounds = [bounds[j] for j in numeric_idx]
+
+    # starting points sampler (inside constraints directly)
+    rng = np.random.default_rng(seed)
+    def sample_start():
+        x = np.zeros(p, float)
+        # fill numeric with uniform inside bounds
+        for j in numeric_idx:
+            lo, hi = num_bounds[numeric_idx.index(j)]
+            if lo == hi:
+                x[j] = lo
+            else:
+                x[j] = rng.uniform(lo, hi)
+        # project discrete choices to nearest allowed value for starts
+        for j, choices in choice_num.items():
+            x[j] = choices[np.argmin(np.abs(choices - x[j]))]
+        # apply numeric fixed exactly
+        for j, v in fixed_num_std.items():
+            x[j] = v
+        return x
+
+    # enumerate categorical combinations (fixed → single)
+    cat_bases = list(groups.keys())
+    combo_space = []
+    for b in cat_bases:
+        if b in cat_fixed:
+            combo_space.append([cat_fixed[b]])
+        else:
+            combo_space.append(cat_allowed[b])
+    all_label_combos = list(itertools.product(*combo_space)) if combo_space else [()]
+
+    # optimize for each categorical combo with multi-start L-BFGS-B
+    from scipy.optimize import fmin_l_bfgs_b
+    import math
+
+    rows: list[dict] = []
+    accepted_global: list[tuple[tuple[str, ...], np.ndarray]] = []  # [(labels_tuple, x_num_std)]
+
+    # how many per combo (at least 1)
+    n_combos = max(1, len(all_label_combos))
+    k_each = max(1, math.ceil(count / n_combos))
+
+    # repulsion radius (in standardized coords) and weight (uses `explore`)
+    rep_sigma2 = float(explore) ** 2  # radius^2
+    rep_weight = float(explore)       # strength
+
+    for labels in all_label_combos:
+        labels_t = tuple(labels) if labels else tuple()
+
+        # template holds the one-hot blocks for this combo
+        template = np.zeros(p, float)
+        for b, lab in zip(cat_bases, labels):
+            apply_onehot(template, b, lab)
+
+        # local accepted num solutions for this combo (std coords of numeric dims)
+        accepted_combo: list[np.ndarray] = []
+
+        # sample starts inside constraints for this combo
+        starts = []
+        for _ in range(n_starts):
+            s = sample_start()
+            for b, lab in zip(cat_bases, labels):
+                apply_onehot(s, b, lab)
+            starts.append(s[numeric_idx])
+
+        # we’ll iteratively find up to k_each diverse optima using a repulsion term
+        for _take in range(k_each):
+            # objective restricted to numeric subspace with repulsion to previous accepts
+            def f_g_only_num(x_num: np.ndarray):
+                x_full = template.copy()
+                x_full[numeric_idx] = x_num
+                J, g = obj_grad(x_full, np.zeros_like(x_full))
+                g_num = g[numeric_idx]
+
+                # add combo-level repulsion from already accepted points in this combo
+                if accepted_combo and rep_sigma2 > 0.0 and rep_weight > 0.0:
+                    for xk in accepted_combo:
+                        d = x_num - xk
+                        r2 = float(d @ d)
+                        w = math.exp(-0.5 * r2 / rep_sigma2)  # exp(-||d||^2 / (2σ^2))
+                        J += rep_weight * w
+                        g_num += rep_weight * w * (-d / rep_sigma2)
+
+                return float(J), g_num
+
+            # pick best over multi-starts (with repulsion active)
+            best_val = None
+            best_xnum = None
+            for x0 in starts:
+                xopt, fval, _ = fmin_l_bfgs_b(
+                    func=lambda x: f_g_only_num(x),
+                    x0=x0,
+                    fprime=None,
+                    bounds=num_bounds,
+                    maxiter=max_iters,
+                )
+                fval = float(fval)
+                if (best_val is None) or (fval < best_val):
+                    best_val = fval
+                    best_xnum = xopt
+
+            if best_xnum is None:
+                continue
+
+            # enforce discrete numeric choices by projection to nearest allowed
+            x_full = template.copy()
+            x_full[numeric_idx] = best_xnum
+            for j, choices in choice_num.items():
+                # project to nearest choice in std space
+                x_full[j] = float(choices[np.argmin(np.abs(choices - x_full[j]))])
+
+            # clip to numeric bounds just in case
+            for idx in numeric_idx:
+                lo, hi = num_bounds[numeric_idx.index(idx)]
+                x_full[idx] = float(np.clip(x_full[idx], lo, hi))
+
+            # dedupe against previously accepted solutions (global & combo) in std numeric space
+            x_num_std = x_full[numeric_idx].copy()
+            def _is_dup(xa: np.ndarray, xb: np.ndarray, tol=1e-3) -> bool:
+                return bool(np.linalg.norm(xa - xb) < tol)
+
+            # same combo?
+            if any(_is_dup(x_num_std, prev) for prev in accepted_combo):
+                continue
+            # same labels globally?
+            if any((labels_t == labt) and _is_dup(x_num_std, prev) for labt, prev in accepted_global):
+                continue
+
+            # accept
+            accepted_combo.append(x_num_std)
+            accepted_global.append((labels_t, x_num_std))
+
+            # evaluate heads for reporting
+            mu_l, _ = gp_l.mean_and_grad(x_full); mu = float(mu_l + cond_mean)
+            ps, _  = gp_s.mean_and_grad(x_full);  ps = float(np.clip(ps, 0.0, 1.0))
+
+            # build output row in ORIGINAL units (numerics) + categorical base columns
+            row = {
+                "pred_p_success": ps,
+                "pred_target_mean": mu,
+            }
+            for j, nm in enumerate(feature_names):
+                if nm in onehot_members:
+                    continue
+                row[nm] = float(_std_to_orig(j, x_full[j], transforms, mu_f, sd_f))
+            for b, lab in zip(cat_bases, labels):
+                row[b] = lab
+
+            rows.append(row)
+            if len(rows) >= count:
+                break
+
+        if len(rows) >= count:
+            break
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise ValueError("No solutions produced; check constraints.")
+
+    # rank
+    asc_mu = (direction != "max")
+    df = df.sort_values(["pred_p_success", "pred_target_mean"],
+                        ascending=[False, asc_mu],
+                        kind="mergesort").reset_index(drop=True)
+    df["rank"] = np.arange(1, len(df)+1)
+
+    df = df.head(count)
+
+    if output:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output, index=False)
+
+    try:
+        console.print(f"\n[bold]Top {len(df)} suggested candidates:[/]")
+        console.print(df_to_table(df))  # type: ignore[arg-type]
+    except Exception:
+        pass
+    return df
 
 
 def _collapse_onehot_to_categorical(df: pd.DataFrame, groups: dict[str, dict]) -> pd.DataFrame:

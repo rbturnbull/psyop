@@ -354,9 +354,9 @@ def suggest(
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Where to save candidates CSV (defaults relative to model)."),
     count: int = typer.Option(10, "--count", "-k", help="Number of candidates to propose."),
-    p_success_threshold: float = typer.Option(0.8, help="Feasibility threshold for constrained EI."),
+    success_threshold: float = typer.Option(0.8, help="Feasibility threshold for constrained EI."),
     explore: float = typer.Option(0.34, help="Fraction of suggestions reserved for exploration."),
-    candidates: int = typer.Option(5000, help="Random candidate pool size to score."),
+    # candidates: int = typer.Option(5000, help="Random candidate pool size to score."),
     seed: int = typer.Option(0, "--seed", help="Random seed for proposals."),
 ):
     if not model.exists():
@@ -369,10 +369,10 @@ def suggest(
         model=model,
         output=output,
         count=count,
-        p_success_threshold=p_success_threshold,
+        success_threshold=success_threshold,
         explore=explore,
-        candidates=candidates,
-        random_seed=seed,
+        # candidates=candidates,
+        seed=seed,
         **constraints,
     )
     if output:
