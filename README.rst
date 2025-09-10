@@ -139,71 +139,88 @@ Commands
       --target loss --exclude run_id --exclude notes --direction auto --seed 42
 
 
-2) Suggest candidates (constrained EI + exploration)
-----------------------------------------------------
+2) Suggest candidates (gradient + exploration)
+----------------------------------------------
 
 .. code-block:: bash
 
     psyop suggest MODEL.nc [OPTIONS] [EXTRA_CONSTRAINTS...]
 
+**What it does**
+
+- Optimizes *inside your constraints* using L-BFGS-B directly on the GP heads.
+- Each suggestion is either **exploit** (minimize mean target with a smooth success penalty) or **explore**
+  (maximize Expected Improvement gated by success probability). The choice per-take is random with
+  probability ``--explore``.
+- Diversity among suggestions is encouraged via a **repulsion** term in standardized space.
+
 **Options**
 
 - ``--output, -o PATH`` — write suggestions CSV (if omitted, prints the table).
-- ``--count, -k INTEGER`` — number of suggestions (default: 10).
-- ``--p-success-threshold FLOAT`` — feasibility threshold in cEI (default: 0.8).
-- ``--explore FLOAT`` — fraction of suggestions reserved for exploration (default: 0.34).
-- ``--candidates-pool INTEGER`` — random candidate pool size to score (default: 5000).
-- ``--seed INTEGER`` — RNG seed (default: 0).
-
-**Constraints** — see *Constraint syntax* above.
+- ``--count, -k INTEGER`` — number of suggestions to return (default: 10).
+- ``--success-threshold FLOAT`` — feasibility threshold used in success penalty/gate (default: 0.8).
+- ``--explore FLOAT`` — probability of using exploration (EI) for each take (default: 0.5).
+- ``--repulsion FLOAT`` — diversity radius/weight in std space (default: 0.34).
+- ``--softmax-temp FLOAT`` — temperature τ for softmax sampling among local EI optima; 0/None = greedy (default: 0.2).
+- ``--n-starts INTEGER`` — multistart count per categorical combo (default: 32).
+- ``--max-iters INTEGER`` — L-BFGS-B max iterations (default: 200).
+- ``--penalty-lambda FLOAT`` — weight of the smooth success penalty (default: 1.0).
+- ``--penalty-beta FLOAT`` — sharpness of the success penalty/gate logistic (default: 10.0).
+- ``--seed INTEGER`` — RNG seed (dataset-aware; see *Determinism* below) (default: 0).
 
 **Output CSV columns**
 
-``rank``, feature columns, ``pred_p_success``, ``pred_target_mean``, ``pred_target_sd``,
-``acq_cEI``, ``acq_explore``, ``novelty_norm``, ``direction``, ``conditioned_on``.
+``rank``, feature columns, ``pred_p_success``, ``pred_target_mean``, ``pred_target_sd``.
 
 **Examples**
 
 .. code-block:: bash
 
-    # Fix epochs; bound dropout
+    # Fix epochs; bound dropout; ask for 12 diverse suggestions
     psyop suggest output/trials.nc --epochs 20 --dropout 0.0:0.2 -k 12 -o output/suggest.csv
 
-    # Discrete choices and integer grid:
+    # Discrete numeric and categorical choices:
     psyop suggest output/trials.nc \
       --batch-size "(16, 32, 64)" \
-      --layers "range(2,8,2)" \
-      --optimizer "[adam, sgd]"
+      --optimizer "[adam, sgd, adamw]" \
+      --explore 0.6 --repulsion 0.25
 
 
-3) Rank probable optima (winner-take-all MC)
---------------------------------------------
+3) Mean-optimal solution (constrained, gradient)
+------------------------------------------------
 
 .. code-block:: bash
 
     psyop optimal MODEL.nc [OPTIONS] [EXTRA_CONSTRAINTS...]
 
+**What it does**
+
+Finds the constraint-feasible point that **optimizes the posterior mean target**
+(min for losses; max if ``direction=max``), with a smooth penalty that discourages
+low success probability. Uses L-BFGS-B and returns the **single best** solution
+(or the top-k if your implementation supports it).
+
 **Options**
 
-- ``--output PATH`` — write top rows CSV (prints table if omitted).
-- ``--count, -k INTEGER`` — how many top rows to keep (default: 10).
-- ``--draws INTEGER`` — Monte-Carlo draws (default: 2000).
-- ``--min-p-success FLOAT`` — hard feasibility cutoff; set to 0.0 to disable (default: 0.0).
-- ``--seed INTEGER`` — RNG seed (default: 0).
-
-**Constraints** — see *Constraint syntax* above.
+- ``--output PATH`` — write the row to CSV (prints table if omitted).
+- ``--count, -k INTEGER`` — keep top-k by mean (default: 1).   # if your function supports k>1
+- ``--success-threshold FLOAT`` — threshold used in the smooth success penalty (default: 0.8).
+- ``--n-starts INTEGER`` — multistart count (default: 32).
+- ``--max-iters INTEGER`` — L-BFGS-B max iterations (default: 200).
+- ``--penalty-lambda FLOAT`` — weight of the success penalty (default: 1.0).
+- ``--penalty-beta FLOAT`` — sharpness of the success penalty (default: 10.0).
+- ``--seed INTEGER`` — RNG seed (dataset-aware) (default: 0).
 
 **Output CSV columns**
 
-``rank_prob_best``, feature columns, ``pred_p_success``, ``pred_target_mean``,
-``pred_target_sd``, ``prob_best_feasible``, ``wins``, ``n_draws_effective``, ``conditioned_on``.
+feature columns, ``pred_p_success``, ``pred_target_mean``, ``pred_target_sd``.
 
 **Example**
 
 .. code-block:: bash
 
-    psyop optimal output/trials.nc \
-      --epochs 12 --dropout 0.0:0.2 --min-p-success 0.5 -k 5 -o output/optimal.csv
+    psyop optimal output/trials.nc --epochs 12 --dropout 0.0:0.2 -o output/optimal.csv
+
 
 
 4) 2D Partial Dependence (pairwise features)
@@ -352,21 +369,22 @@ Suggest candidates
 
 .. code-block:: python
 
-    # Constraints are passed as kwargs in ORIGINAL units:
-    # - fixed: number
-    # - range: slice(lo, hi)          (inclusive semantics for the endpoints)
-    # - choices: list/tuple (finite)  (e.g. tuple(range(...)))
+.. code-block:: python
+
     suggestions = suggest(
-        model=ds,                    # or "output/trials.nc"
-        output=None,                 # optional CSV path; None to return only the DataFrame
+        model=ds,
+        output=None,
         count=12,
-        p_success_threshold=0.8,
-        explore_fraction=0.34,
-        candidates=5000,
-        random_seed=0,
-        epochs=20,                   # fixed
-        dropout=slice(0.0, 0.2),     # range
-        batch_size=(16, 32, 64),     # choices
+        success_threshold=0.8,
+        explore=0.5,          # probability of EI per take
+        repulsion=0.34,       # diversity radius/weight in std space
+        softmax_temp=0.2,     # softmax among local EI optima; 0/None => greedy
+        n_starts=32,
+        max_iters=200,
+        seed=0,
+        epochs=20,                          # fixed
+        dropout=slice(0.0, 0.2),            # range
+        batch_size=(16, 32, 64),            # choices
     )
     print(suggestions.head())
 
@@ -375,17 +393,19 @@ Rank probable optima
 
 .. code-block:: python
 
-    top = optimal(
-        model=ds,                    # or "output/trials.nc"
-        output=None,                 # optional CSV path
-        count=10,
-        n_draws=2000,
-        min_success_probability=0.5, # 0.0 disables the hard cutoff
-        random_seed=0,
+    best = optimal(
+        model=ds,
+        output=None,
+        success_threshold=0.8,
+        n_starts=32,
+        max_iters=200,
+        penalty_lambda=1.0,
+        penalty_beta=10.0,
+        seed=0,
         epochs=12,
         dropout=slice(0.0, 0.2),
     )
-    print(top[["prob_best_feasible", "pred_target_mean"]].head())
+    print(best)
 
 2D Partial Dependence (HTML)
 ----------------------------
@@ -453,6 +473,15 @@ Constraint objects in Python
 
 All constraints are interpreted in **original units** of your data. Bounds are enforced
 for candidate sampling and sweep ranges; fixed values remove the feature from PD axes.
+
+Determinism
+-----------
+
+Randomness is **dataset-aware**. When you pass ``--seed S``, Psyop mixes
+that seed with a checksum of the model artifact so that:
+
+- Same dataset + same seed → same suggestions.
+- Different dataset + same seed → different, but reproducible suggestions.
 
 
 .. end-quickstart
