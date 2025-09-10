@@ -613,6 +613,9 @@ def suggest(
                     cat_allowed[ck] = L
         elif ck in name_to_idx:  # numeric
             j = name_to_idx[ck]
+            if isinstance(v, range):
+                v = tuple(v)
+                
             if isinstance(v, slice):
                 lo = _orig_to_std(j, v.start, transforms, mu_f, sd_f)
                 hi = _orig_to_std(j, v.stop,  transforms, mu_f, sd_f)

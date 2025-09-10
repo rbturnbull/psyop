@@ -353,7 +353,7 @@ def suggest(
     ctx: typer.Context,
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Where to save candidates CSV (defaults relative to model)."),
-    count: int = typer.Option(10, "--count", "-k", help="Number of candidates to propose."),
+    count: int = typer.Option(1, "--count", "-k", help="Number of candidates to propose."),
     success_threshold: float = typer.Option(0.8, help="Feasibility threshold for constrained EI."),
     explore: float = typer.Option(0.34, help="Fraction of suggestions reserved for exploration."),
     # candidates: int = typer.Option(5000, help="Random candidate pool size to score."),
