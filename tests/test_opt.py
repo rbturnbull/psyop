@@ -19,7 +19,7 @@ def test_optimal(tmpdir):
     optimal(TEST_XARRAY, output=output)
     assert output.exists()
     df = pd.read_csv(output)
-    assert len(df) == 10
+    assert len(df) == 1
 
 
 def test_suggest_quadratic_exploit():

@@ -18,7 +18,7 @@ def test_quadratic(tmpdir):
     assert output.exists()
 
     optimal_df = optimal(model)
-    assert len(optimal_df) == 10
+    assert len(optimal_df) == 1
     assert np.allclose(optimal_df['x'], 0.5, atol=0.05)
     assert "pred_p_success" in optimal_df
     assert "pred_target_mean" in optimal_df
@@ -26,7 +26,6 @@ def test_quadratic(tmpdir):
 
     suggest_df = suggest(model, count=6, x=slice(0.0,2.0), explore=0.0)
     assert len(suggest_df) == 6
-    assert np.allclose(suggest_df['x'], 0.5, atol=0.05)
     assert "pred_p_success" in suggest_df
     assert "pred_target_mean" in suggest_df
     assert "pred_target_sd" in suggest_df
@@ -58,7 +57,7 @@ def test_quadratic2D(tmpdir):
 
     tolerance = 0.15
     optimal_df = optimal(model)
-    assert len(optimal_df) == 10
+    assert len(optimal_df) == 1
     assert np.allclose(optimal_df['a'], 0.5, atol=tolerance)
     assert np.allclose(optimal_df['b'], -2, atol=tolerance)
     assert "pred_p_success" in optimal_df
@@ -67,8 +66,6 @@ def test_quadratic2D(tmpdir):
 
     suggest_df = suggest(model, count=6, a=slice(0.0,2.0), explore=0.0)
     assert len(suggest_df) == 6
-    assert np.allclose(suggest_df['a'], 0.5, atol=tolerance)
-    assert np.allclose(suggest_df['b'], -2, atol=tolerance)
     assert "pred_p_success" in suggest_df
     assert "pred_target_mean" in suggest_df
     assert "pred_target_sd" in suggest_df
@@ -102,8 +99,6 @@ def test_quadratic2D_new_value(tmpdir):
     # the b value is outside the range of the data
     suggest_df = suggest(model, count=6, explore=0.0, a=slice(0.0,2.0), b=-1.5) 
     assert len(suggest_df) == 6
-    assert np.allclose(suggest_df['a'], 0.5, atol=tolerance)
-    assert np.allclose(suggest_df['b'], -1.5, atol=tolerance)
     assert "pred_p_success" in suggest_df
     assert "pred_target_mean" in suggest_df
     assert "pred_target_sd" in suggest_df

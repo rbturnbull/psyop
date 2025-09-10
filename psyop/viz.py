@@ -1625,3 +1625,526 @@ def _set_yaxis_range(fig, *, row: int, col: int, y0: float, y1: float, log: bool
         fig.update_yaxes(type="log", range=[np.log10(y0), np.log10(y1)], row=row, col=col)
     else:
         fig.update_yaxes(type="-", range=[y0, y1], row=row, col=col)
+
+
+def plot1d_at_optimum(
+    model: xr.Dataset | Path | str,
+    output: Path | None = None,
+    csv_out: Path | None = None,
+    grid_size: int = 300,
+    line_color: str = "rgb(31,119,180)",
+    band_alpha: float = 0.25,
+    figure_height_per_row_px: int = 320,
+    show: bool = False,
+    use_log_scale_for_target_y: bool = True,
+    log_y_epsilon: float = 1e-9,
+    suggest: int = 0,                 # optional overlay
+    width: int | None = None,
+    height: int | None = None,
+    seed: int | None = 42,
+    optimal:bool=False,
+    **kwargs,                         # constraints in ORIGINAL units (as in your plot1d)
+) -> go.Figure:
+    """
+    1D partial-dependence panels anchored at the *optimal* hyperparameter setting:
+    - Compute x* = argmin/argmax mean posterior from opt.optimal(...)
+    - For each feature, sweep that feature; keep all *other* features fixed at x*.
+    Supports numeric constraints (scalars/slices/choices) and categorical bases.
+    """
+    ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
+    pred_success, pred_loss = _build_predictors(ds)
+
+    # --- metadata ---
+    feature_names = [str(n) for n in ds["feature"].values.tolist()]
+    transforms    = [str(t) for t in ds["feature_transform"].values.tolist()]
+    X_mean        = ds["feature_mean"].values.astype(float)
+    X_std         = ds["feature_std"].values.astype(float)
+
+    df_raw   = _raw_dataframe_from_dataset(ds)
+    Xn_train = ds["Xn_train"].values.astype(float)
+    n_rows, p = Xn_train.shape
+
+    # --- one-hot categorical groups ---
+    groups = opt._onehot_groups(feature_names)
+    bases  = set(groups.keys())
+    name_to_idx = {name: j for j, name in enumerate(feature_names)}
+
+    # --- canonicalize kwargs: numeric vs categorical (base) ---
+    idx_map = _canon_key_set(ds)  # your helper: maps normalized names -> exact feature column
+    kw_num_raw: dict[str, object] = {}
+    kw_cat_raw: dict[str, object] = {}
+    for k, v in kwargs.items():
+        if k in bases:
+            kw_cat_raw[k] = v
+        elif k in idx_map:
+            kw_num_raw[idx_map[k]] = v
+        else:
+            import re as _re
+            nk = _re.sub(r"[^a-z0-9]+", "", str(k).lower())
+            if nk in idx_map:
+                kw_num_raw[idx_map[nk]] = v
+
+    # --- resolve categorical constraints: fixed vs allowed subset ---
+    cat_fixed: dict[str, str] = {}
+    cat_allowed: dict[str, list[str]] = {}
+    for base, val in kw_cat_raw.items():
+        labels = groups[base]["labels"]
+        if isinstance(val, str):
+            if val not in labels:
+                raise ValueError(f"Unknown category for {base!r}: {val!r}. Choices: {labels}")
+            cat_fixed[base] = val
+        elif isinstance(val, (list, tuple, set)):
+            chosen = [x for x in val if isinstance(x, str) and x in labels]
+            if not chosen:
+                raise ValueError(f"No valid categories for {base!r} in {val!r}. Choices: {labels}")
+            cat_allowed[base] = list(dict.fromkeys(chosen))
+        else:
+            raise ValueError(f"Categorical constraint for {base!r} must be a string or list/tuple of strings.")
+
+    # ---------- 1) Find the *optimal* base point (original units) ----------
+    opt_df = opt.optimal(model, count=1, seed=seed, **kwargs)  # uses your gradient-based optimal()
+    # We’ll use this row both for overlays and as the anchor point.
+    # Expect numeric feature columns and categorical base columns present.
+    x_opt_std = np.zeros(p, dtype=float)
+
+    # Fill numerics from optimal row (orig -> internal -> std)
+    def _to_std_single(j: int, x_orig: float) -> float:
+        xi = x_orig
+        if transforms[j] == "log10":
+            xi = np.log10(np.maximum(x_orig, 1e-300))
+        return float((xi - X_mean[j]) / X_std[j])
+
+    # Mark one-hot member names
+    onehot_members: set[str] = set()
+    for base, g in groups.items():
+        onehot_members.update(g["members"])
+
+    # numeric features (skip one-hot members)
+    for j, nm in enumerate(feature_names):
+        if nm in onehot_members:
+            continue
+        if nm in opt_df.columns:
+            x_opt_std[j] = _to_std_single(j, float(opt_df.iloc[0][nm]))
+        else:
+            # Fall back to dataset median if not present (rare)
+            x_opt_std[j] = float(np.median(Xn_train[:, j]))
+
+    # Categorical bases: set one-hot block to the optimal label (or fixed)
+    for base, g in groups.items():
+        # priority: fixed in kwargs → else from optimal row → else keep current (median/std)
+        if base in cat_fixed:
+            label = cat_fixed[base]
+        elif base in opt_df.columns:
+            label = str(opt_df.iloc[0][base])
+        else:
+            # fallback: most frequent label in data
+            if base in df_raw.columns:
+                label = str(df_raw[base].astype("string").mode(dropna=True).iloc[0])
+            else:
+                label = g["labels"][0]
+
+        for lab in g["labels"]:
+            member_name = g["name_by_label"][lab]
+            j2 = name_to_idx[member_name]
+            raw = 1.0 if lab == label else 0.0
+            # raw (0/1) → standardized using the artifact stats
+            x_opt_std[j2] = (raw - X_mean[j2]) / X_std[j2]
+
+    # ---------- 2) Numeric constraints in STANDARDIZED space ----------
+    def _orig_to_std(j: int, x, transforms, mu, sd):
+        x = np.asarray(x, dtype=float)
+        if transforms[j] == "log10":
+            x = np.where(x <= 0, np.nan, x)
+            x = np.log10(x)
+        return (x - mu[j]) / sd[j]
+
+    fixed_scalars: dict[int, float] = {}
+    range_windows: dict[int, tuple[float, float]] = {}
+    choice_values: dict[int, np.ndarray] = {}
+
+    for name, val in kw_num_raw.items():
+        if name not in name_to_idx:
+            continue
+        j = name_to_idx[name]
+        if isinstance(val, slice):
+            lo = _orig_to_std(j, float(val.start), transforms, X_mean, X_std)
+            hi = _orig_to_std(j, float(val.stop),  transforms, X_mean, X_std)
+            lo, hi = float(min(lo, hi)), float(max(lo, hi))
+            range_windows[j] = (lo, hi)
+        elif isinstance(val, (list, tuple, np.ndarray)):
+            arr = _orig_to_std(j, np.asarray(val, dtype=float), transforms, X_mean, X_std)
+            choice_values[j] = np.asarray(arr, dtype=float)
+        else:
+            fixed_scalars[j] = float(_orig_to_std(j, float(val), transforms, X_mean, X_std))
+
+    # apply numeric fixed overrides on the base point
+    for j, vstd in fixed_scalars.items():
+        x_opt_std[j] = vstd
+
+    # ---------- 3) Panels: sweep ONE var at a time around x* ----------
+    # numeric free = not one-hot member and not fixed via kwargs
+    free_numeric_idx = [
+        j for j, nm in enumerate(feature_names)
+        if (nm not in onehot_members) and (j not in fixed_scalars)
+    ]
+    # categorical bases: sweep if not fixed; otherwise not shown
+    free_cat_bases = [b for b in bases if b not in cat_fixed]
+
+    panels: list[tuple[str, object]] = [("num", j) for j in free_numeric_idx] + [("cat", b) for b in free_cat_bases]
+    if not panels:
+        raise ValueError("All features are fixed at the optimum (or categoricals fixed); nothing to plot.")
+
+    # empirical 1–99% per feature (for default sweep range)
+    Xn_p01 = np.percentile(Xn_train, 1, axis=0)
+    Xn_p99 = np.percentile(Xn_train, 99, axis=0)
+
+    def _grid_1d(j: int, n: int) -> np.ndarray:
+        # default range in std space
+        lo, hi = float(Xn_p01[j]), float(Xn_p99[j])
+        if j in range_windows:
+            lo = max(lo, range_windows[j][0])
+            hi = min(hi, range_windows[j][1])
+        if j in choice_values:
+            vals = np.asarray(choice_values[j], dtype=float)
+            vals = vals[(vals >= lo) & (vals <= hi)]
+            return np.unique(np.sort(vals)) if vals.size else np.array([x_opt_std[j]], dtype=float)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = x_opt_std[j] - 1.0, x_opt_std[j] + 1.0
+        return np.linspace(lo, hi, n)
+
+    # figure scaffold
+    subplot_titles = [feature_names[int(k)] if t == "num" else str(k) for t, k in panels]
+    fig = make_subplots(rows=len(panels), cols=1, shared_xaxes=False, subplot_titles=subplot_titles)
+
+    tgt_col = str(ds.attrs["target"])
+    success_mask = ~pd.isna(df_raw[tgt_col]).to_numpy()
+    fail_mask    = ~success_mask
+    losses_success = df_raw.loc[success_mask, tgt_col].to_numpy().astype(float)
+    trial_ids_success = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask]
+    trial_ids_fail    = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
+    band_fill_rgba = _rgb_to_rgba(line_color, band_alpha)
+
+    # optional overlay
+    suggest_df = opt.suggest(model, count=suggest, seed=seed, **kwargs) if (suggest and suggest > 0) else None
+
+    tidy_rows: list[dict] = []
+    row_pos = 0
+    for kind, key in panels:
+        row_pos += 1
+
+        if kind == "num":
+            j = int(key)
+            grid = _grid_1d(j, grid_size)
+            Xn_grid = np.repeat(x_opt_std[None, :], len(grid), axis=0)
+            Xn_grid[:, j] = grid
+
+            p_grid = pred_success(Xn_grid)
+            mu_grid, sd_grid = pred_loss(Xn_grid, include_observation_noise=True)
+
+            x_internal = grid * X_std[j] + X_mean[j]
+            x_display  = _inverse_transform(transforms[j], x_internal)
+
+            # y transform
+            if use_log_scale_for_target_y:
+                mu_plot = np.maximum(mu_grid, log_y_epsilon)
+                lo_plot = np.maximum(mu_grid - 2.0 * sd_grid, log_y_epsilon)
+                hi_plot = np.maximum(mu_grid + 2.0 * sd_grid, log_y_epsilon)
+                losses_s_plot = np.maximum(losses_success, log_y_epsilon) if losses_success.size else losses_success
+            else:
+                mu_plot = mu_grid
+                lo_plot = mu_grid - 2.0 * sd_grid
+                hi_plot = mu_grid + 2.0 * sd_grid
+                losses_s_plot = losses_success
+
+            y_arrays = [lo_plot, hi_plot] + ([losses_s_plot] if losses_s_plot.size else [])
+            y_low  = float(np.nanmin([np.nanmin(a) for a in y_arrays]))
+            y_high = float(np.nanmax([np.nanmax(a) for a in y_arrays]))
+            pad = 0.05 * (y_high - y_low + 1e-12)
+            y0_plot = (y_low - pad) if not use_log_scale_for_target_y else max(y_low / 1.5, log_y_epsilon)
+            y1_tmp  = (y_high + pad) if not use_log_scale_for_target_y else y_high * 1.2
+            y_failed_band = y1_tmp + (y_high - y_low + 1e-12) * (0.08 if not use_log_scale_for_target_y else 0.3)
+            if use_log_scale_for_target_y and y_failed_band <= log_y_epsilon:
+                y_failed_band = max(10.0 * log_y_epsilon, y_high * 2.0)
+            y1_plot = y_failed_band + (0.02 if not use_log_scale_for_target_y else 0.05) * (y_high - y_low + 1e-12)
+
+            _add_low_success_shading_1d(fig, row_pos, x_display, p_grid, y0_plot, y1_plot)
+
+            show_legend = (row_pos == 1)
+            # ±2σ band
+            fig.add_trace(go.Scatter(x=x_display, y=lo_plot, mode="lines",
+                                     line=dict(width=0, color=line_color),
+                                     name="±2σ", legendgroup="band", showlegend=False, hoverinfo="skip"),
+                          row=row_pos, col=1)
+            fig.add_trace(go.Scatter(x=x_display, y=hi_plot, mode="lines", fill="tonexty",
+                                     line=dict(width=0, color=line_color), fillcolor=band_fill_rgba,
+                                     name="±2σ", legendgroup="band", showlegend=show_legend,
+                                     hovertemplate="E[target|success]: %{y:.3f}<extra>±2σ</extra>"),
+                          row=row_pos, col=1)
+            # mean
+            fig.add_trace(go.Scatter(x=x_display, y=mu_plot, mode="lines",
+                                     line=dict(width=2, color=line_color),
+                                     name="E[target|success]", legendgroup="mean", showlegend=show_legend,
+                                     hovertemplate=f"{feature_names[j]}: %{{x:.6g}}<br>E[target|success]: %{{y:.3f}}<extra></extra>"),
+                          row=row_pos, col=1)
+
+            # experimental points at y
+            if feature_names[j] in df_raw.columns:
+                x_data_all = df_raw[feature_names[j]].to_numpy().astype(float)
+            else:
+                full_vals = feature_raw_from_artifact_or_reconstruct(ds, j, feature_names[j], transforms[j]).astype(float)
+                x_data_all = full_vals
+
+            x_succ = x_data_all[success_mask]
+            if x_succ.size:
+                fig.add_trace(go.Scattergl(
+                    x=x_succ, y=losses_s_plot, mode="markers",
+                    marker=dict(size=5, color="black", line=dict(width=0)),
+                    name="data (success)", legendgroup="data_s", showlegend=show_legend,
+                    hovertemplate=("trial_id: %{customdata}<br>"
+                                   f"{feature_names[j]}: %{{x:.6g}}<br>"
+                                   f"{tgt_col}: %{{y:.4f}}<extra></extra>"),
+                    customdata=trial_ids_success
+                ), row=row_pos, col=1)
+
+            x_fail = x_data_all[fail_mask]
+            if x_fail.size:
+                y_fail_plot = np.full_like(x_fail, y_failed_band, dtype=float)
+                fig.add_trace(go.Scattergl(
+                    x=x_fail, y=y_fail_plot, mode="markers",
+                    marker=dict(size=6, color="red", line=dict(color="black", width=0.8)),
+                    name="data (failed)", legendgroup="data_f", showlegend=show_legend,
+                    hovertemplate=("trial_id: %{customdata}<br>"
+                                   f"{feature_names[j]}: %{{x:.6g}}<br>"
+                                   "status: failed (NaN target)<extra></extra>"),
+                    customdata=trial_ids_fail
+                ), row=row_pos, col=1)
+
+            # overlays: optimal (single point) and suggested (optional many)
+            x_opt_disp = None
+            if feature_names[j] in opt_df.columns:
+                x_opt_disp = float(opt_df.iloc[0][feature_names[j]])
+                y_opt      = float(opt_df.iloc[0]["pred_target_mean"])
+                y_opt_sd   = float(opt_df.iloc[0].get("pred_target_sd", np.nan))
+                fig.add_trace(go.Scattergl(
+                    x=[x_opt_disp], y=[y_opt], mode="markers",
+                    marker=dict(size=10, color="yellow", line=dict(color="black", width=1.5), symbol="x"),
+                    name="optimal", legendgroup="optimal", showlegend=show_legend,
+                    hovertemplate=(f"predicted: %{{y:.3g}}"
+                                   + ("" if np.isnan(y_opt_sd) else f" ± {y_opt_sd:.3g}")
+                                   + f"<br>{feature_names[j]}: %{{x:.6g}}<extra></extra>")
+                ), row=row_pos, col=1)
+
+            if suggest and (suggest_df is not None) and (feature_names[j] in suggest_df.columns):
+                xs = suggest_df[feature_names[j]].values.astype(float)
+                ys = suggest_df["pred_target_mean"].values.astype(float)
+                ysd = suggest_df.get("pred_target_sd", pd.Series([np.nan]*len(suggest_df))).values
+                fig.add_trace(go.Scattergl(
+                    x=xs, y=ys, mode="markers",
+                    marker=dict(size=9, color="cyan", line=dict(color="black", width=1.2), symbol="star"),
+                    name="suggested", legendgroup="suggested", showlegend=show_legend,
+                    hovertemplate=("predicted: %{y:.3g}"
+                                   + (" ± %{customdata:.3g}" if not np.isnan(ysd).all() else "")
+                                   + f"<br>{feature_names[j]}: %{{x:.6g}}<extra>suggested</extra>"),
+                    customdata=ysd
+                ), row=row_pos, col=1)
+
+            # axes + ranges
+            _maybe_log_axis(fig, row_pos, 1, feature_names[j], axis="x", transforms=transforms, j=j)
+            fig.update_yaxes(title_text=f"{tgt_col}", row=row_pos, col=1)
+            _set_yaxis_range(fig, row=row_pos, col=1,
+                             y0=y0_plot, y1=y1_plot,
+                             log=use_log_scale_for_target_y, eps=log_y_epsilon)
+            fig.update_xaxes(title_text=feature_names[j], row=row_pos, col=1)
+
+            # If a constraint limited the sweep, respect it on the displayed axis
+            def _std_to_orig(val_std: float) -> float:
+                vi = val_std * X_std[j] + X_mean[j]
+                return float(_inverse_transform(transforms[j], np.array([vi]))[0])
+
+            if j in range_windows:
+                lo_std, hi_std = range_windows[j]
+                x_min_override = min(_std_to_orig(lo_std), _std_to_orig(hi_std))
+                x_max_override = max(_std_to_orig(lo_std), _std_to_orig(hi_std))
+                span = (x_max_override - x_min_override) or 1.0
+                pad = 0.02 * span
+                fig.update_xaxes(range=[x_min_override - pad, x_max_override + pad], row=row_pos, col=1)
+            elif j in choice_values and choice_values[j].size:
+                ints  = choice_values[j] * X_std[j] + X_mean[j]
+                origs = _inverse_transform(transforms[j], ints)
+                span = float(np.max(origs) - np.min(origs)) or 1.0
+                pad = 0.05 * span
+                fig.update_xaxes(range=[float(np.min(origs) - pad), float(np.max(origs) + pad)], row=row_pos, col=1)
+
+            # tidy rows
+            for xd, xi, mu_i, sd_i, p_i in zip(x_display, x_internal, mu_grid, sd_grid, p_grid):
+                tidy_rows.append({
+                    "feature": feature_names[j],
+                    "x_display": float(xd),
+                    "x_internal": float(xi),
+                    "target_conditional_mean": float(mu_i),
+                    "target_conditional_sd": float(sd_i),
+                    "success_probability": float(p_i),
+                })
+
+        else:
+            base = str(key)
+            labels_all = groups[base]["labels"]
+            labels = cat_allowed.get(base, labels_all)
+
+            # Evaluate each label with numerics and other bases fixed at x_opt_std
+            Xn_grid = np.repeat(x_opt_std[None, :], len(labels), axis=0)
+            for r, lab in enumerate(labels):
+                for lab2 in labels_all:
+                    member_name = groups[base]["name_by_label"][lab2]
+                    j2 = name_to_idx[member_name]
+                    raw_val = 1.0 if (lab2 == lab) else 0.0
+                    Xn_grid[r, j2] = (raw_val - X_mean[j2]) / X_std[j2]
+
+            p_vec = pred_success(Xn_grid)
+            mu_vec, sd_vec = pred_loss(Xn_grid, include_observation_noise=True)
+
+            # y transform
+            if use_log_scale_for_target_y:
+                mu_plot = np.maximum(mu_vec, log_y_epsilon)
+                lo_plot = np.maximum(mu_vec - 2.0 * sd_vec, log_y_epsilon)
+                hi_plot = np.maximum(mu_vec + 2.0 * sd_vec, log_y_epsilon)
+                losses_s_plot = np.maximum(df_raw.loc[success_mask, tgt_col].to_numpy().astype(float), log_y_epsilon) if success_mask.any() else np.array([])
+            else:
+                mu_plot = mu_vec
+                lo_plot = mu_vec - 2.0 * sd_vec
+                hi_plot = mu_vec + 2.0 * sd_vec
+                losses_s_plot = df_raw.loc[success_mask, tgt_col].to_numpy().astype(float) if success_mask.any() else np.array([])
+
+            y_arrays = [lo_plot, hi_plot] + ([losses_s_plot] if losses_s_plot.size else [])
+            y_low  = float(np.nanmin([np.nanmin(a) for a in y_arrays])) if y_arrays else 0.0
+            y_high = float(np.nanmax([np.nanmax(a) for a in y_arrays])) if y_arrays else 1.0
+            pad = 0.05 * (y_high - y_low + 1e-12)
+            y0_plot = (y_low - pad) if not use_log_scale_for_target_y else max(y_low / 1.5, log_y_epsilon)
+            y1_tmp  = (y_high + pad) if not use_log_scale_for_target_y else y_high * 1.2
+            y_failed_band = y1_tmp + (y_high - y_low + 1e-12) * (0.08 if not use_log_scale_for_target_y else 0.3)
+            if use_log_scale_for_target_y and y_failed_band <= log_y_epsilon:
+                y_failed_band = max(10.0 * log_y_epsilon, y_high * 2.0)
+            y1_plot = y_failed_band + (0.02 if not use_log_scale_for_target_y else 0.05) * (y_high - y_low + 1e-12)
+
+            # x = 0..K-1 with tick labels
+            x_pos = np.arange(len(labels), dtype=float)
+
+            # grey out infeasible (p<thr)
+            def _shade_for_thresh(thr: float, alpha: float):
+                for k_i, p_i in enumerate(p_vec):
+                    if p_i < thr:
+                        fig.add_shape(
+                            type="rect",
+                            xref=f"x{'' if row_pos==1 else row_pos}",
+                            yref=f"y{'' if row_pos==1 else row_pos}",
+                            x0=k_i - 0.5, x1=k_i + 0.5,
+                            y0=y0_plot, y1=y1_plot,
+                            line=dict(width=0),
+                            fillcolor=f"rgba(128,128,128,{alpha})",
+                            layer="below",
+                            row=row_pos, col=1
+                        )
+            _shade_for_thresh(0.8, 0.40)
+            _shade_for_thresh(0.5, 0.25)
+
+            show_legend = (row_pos == 1)
+            fig.add_trace(go.Scatter(
+                x=x_pos, y=mu_plot, mode="lines+markers",
+                line=dict(width=2, color=line_color),
+                marker=dict(size=7, color=line_color),
+                error_y=dict(type="data", array=(hi_plot - mu_plot), arrayminus=(mu_plot - lo_plot), visible=True),
+                name="E[target|success]", legendgroup="mean", showlegend=show_legend,
+                hovertemplate=(f"{base}: %{{text}}<br>E[target|success]: %{{y:.3f}}<extra></extra>"),
+                text=labels
+            ), row=row_pos, col=1)
+
+            # overlay optimal point for this base (single label at x*=opt)
+            if base in opt_df.columns:
+                lab_opt = str(opt_df.iloc[0][base])
+                if lab_opt in labels:
+                    xi = float(labels.index(lab_opt))
+                    y_opt = float(opt_df.iloc[0]["pred_target_mean"])
+                    y_opt_sd = float(opt_df.iloc[0].get("pred_target_sd", np.nan))
+                    fig.add_trace(go.Scattergl(
+                        x=[xi], y=[y_opt], mode="markers",
+                        marker=dict(size=10, color="yellow", line=dict(color="black", width=1.5), symbol="x"),
+                        name="optimal", legendgroup="optimal", showlegend=show_legend,
+                        hovertemplate=(f"predicted: %{{y:.3g}}"
+                                       + ("" if np.isnan(y_opt_sd) else f" ± {y_opt_sd:.3g}")
+                                       + f"<br>{base}: {lab_opt}<extra></extra>")
+                    ), row=row_pos, col=1)
+
+            # overlay suggestions (optional)
+            if suggest and (suggest_df is not None) and (base in suggest_df.columns):
+                labs_sug = suggest_df[base].astype(str).tolist()
+                xs = [labels.index(l) for l in labs_sug if l in labels]
+                if xs:
+                    keep_mask = [l in labels for l in labs_sug]
+                    y_sug = suggest_df.loc[keep_mask, "pred_target_mean"].values
+                    fig.add_trace(go.Scattergl(
+                        x=np.array(xs, dtype=float), y=y_sug, mode="markers",
+                        marker=dict(size=9, color="cyan", line=dict(color="black", width=1.2), symbol="star"),
+                        name="suggested", legendgroup="suggested", showlegend=show_legend,
+                        hovertemplate=(f"{base}: %{{text}}<br>"
+                                       "predicted: %{{y:.3g}}<extra>suggested</extra>"),
+                        text=[labels[int(i)] for i in xs]
+                    ), row=row_pos, col=1)
+
+            fig.update_xaxes(
+                tickmode="array",
+                tickvals=x_pos.tolist(),
+                ticktext=labels,
+                title_text=base,
+                row=row_pos, col=1
+            )
+            fig.update_yaxes(title_text=f"{tgt_col}", row=row_pos, col=1)
+            _set_yaxis_range(fig, row=row_pos, col=1,
+                             y0=y0_plot, y1=y1_plot,
+                             log=use_log_scale_for_target_y, eps=log_y_epsilon)
+
+            # tidy rows
+            for lab, mu_i, sd_i, p_i in zip(labels, mu_vec, sd_vec, p_vec):
+                tidy_rows.append({
+                    "feature": base,
+                    "x_display": str(lab),
+                    "x_internal": float("nan"),
+                    "target_conditional_mean": float(mu_i),
+                    "target_conditional_sd": float(sd_i),
+                    "success_probability": float(p_i),
+                })
+
+    # ---- layout & IO ----
+    parts = [f"1D PD at optimal setting of all other hyperparameters ({ds.attrs.get('target', 'target')})"]
+    if kw_num_raw:
+        def _fmt_c(v):
+            if isinstance(v, slice):
+                a = "" if v.start is None else f"{v.start:g}"
+                b = "" if v.stop  is None else f"{v.stop:g}"
+                return f"[{a},{b}]"
+            if isinstance(v, (list, tuple, np.ndarray)):
+                try:
+                    return "[" + ",".join(f"{float(x):g}" for x in np.asarray(v).tolist()) + "]"
+                except Exception:
+                    return "[" + ",".join(map(str, v)) + "]"
+            try:
+                return f"{float(v):g}"
+            except Exception:
+                return str(v)
+        parts.append(", ".join(f"{k}={_fmt_c(v)}" for k, v in kw_num_raw.items()))
+    if cat_fixed:
+        parts.append(", ".join(f"{b}={lab}" for b, lab in cat_fixed.items()))
+    title = " — ".join(parts)
+
+    width = width if (width and width > 0) else 1200
+    height = height if (height and height > 0) else figure_height_per_row_px * len(panels)
+    fig.update_layout(height=height, width=width, template="simple_white", title=title, legend_title_text="")
+
+    if output:
+        output = Path(output); output.parent.mkdir(parents=True, exist_ok=True)
+        fig.write_html(str(output), include_plotlyjs="cdn")
+    if csv_out:
+        csv_out = Path(csv_out); csv_out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(tidy_rows).to_csv(str(csv_out), index=False)
+    if show:
+        fig.show("browser")
+    return fig
