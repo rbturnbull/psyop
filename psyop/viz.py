@@ -474,11 +474,13 @@ def plot2d(
             zmin_r, zmax_r = float(np.nanmin(Zmu_raw)), float(np.nanmax(Zmu_raw))
             levels = np.linspace(zmin_r, zmax_r, max(n_contours, 2))
             for lev in levels:
+                color = _contour_line_color(lev)
                 fig.add_trace(go.Contour(
                     x=x_vals, y=y_vals, z=Zmu_raw,
                     autocontour=False,
                     contours=dict(coloring="lines", showlabels=False, start=lev, end=lev, size=1e-9),
-                    line=dict(width=1, color=_contour_line_color(lev)),
+                    line=dict(width=1),
+                    colorscale=[[0, color], [1, color]],
                     showscale=False, hoverinfo="skip"
                 ), row=r+1, col=c+1)
 
