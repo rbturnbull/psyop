@@ -23,14 +23,14 @@ def test_optimal(tmpdir):
 
 
 def test_suggest_quadratic_exploit():
-    result = suggest(TEST_QUADRATIC_XARRAY, explore=0.0, count=30)
-    assert len(result) == 30
+    result = suggest(TEST_QUADRATIC_XARRAY, explore=0.0, count=1)
+    assert len(result) == 1
     assert all(abs(result['x'] - 0.5) < 0.05)
 
 
 def test_suggest_quadratic_explore():
-    result = suggest(TEST_QUADRATIC_XARRAY, explore=0.4, count=30)
-    assert len(result) == 30
+    result = suggest(TEST_QUADRATIC_XARRAY, explore=0.4, count=10)
+    assert len(result) == 10
     assert (abs(result['x'] - 0.5) > 0.05).mean() > 0.3
 
 

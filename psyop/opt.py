@@ -522,15 +522,14 @@ def rng_for_dataset(ds, seed=None):
 
     return np.random.default_rng(int(mixed))
 
-
 def suggest(
     model: xr.Dataset | Path | str,
     count: int = 10,
     output: Path | None = None,
-    repulsion: float = 0.34, 
-    explore: float = 0.5,    
+    repulsion: float = 0.34,              # repulsion radius & weight
+    explore: float = 0.5,                 # probability to optimize EI (explore)
     success_threshold: float = 0.8,
-    softmax_temp: float | None = 0.2,     # <--- τ; if None or 0 => greedy EI
+    softmax_temp: float | None = 0.2,     # τ for EI softmax; None/0 => greedy EI
     n_starts: int = 32,
     max_iters: int = 200,
     penalty_lambda: float = 1.0,
@@ -540,9 +539,10 @@ def suggest(
     **kwargs,                              # constraints in ORIGINAL units
 ) -> pd.DataFrame:
     import itertools, math
+    import numpy as np, pandas as pd
 
     ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
-    rng = rng_for_dataset(ds, seed)
+    rng = rng_for_dataset(ds, seed)  # dataset-aware determinism
 
     # --- metadata
     feature_names = [str(n) for n in ds["feature"].values.tolist()]
@@ -585,13 +585,13 @@ def suggest(
     range_num_std: dict[int, tuple[float, float]] = {}
     choice_num: dict[int, np.ndarray] = {}
 
-    import re, numpy as np, pandas as pd
     def canon_key(k: str) -> str:
+        import re as _re
         raw = str(k)
-        stripped = re.sub(r"[^a-z0-9]+", "", raw.lower())
+        stripped = _re.sub(r"[^a-z0-9]+", "", raw.lower())
         if raw in name_to_idx: return raw
         for base in groups.keys():
-            if stripped == re.sub(r"[^a-z0-9]+", "", base.lower()):
+            if stripped == _re.sub(r"[^a-z0-9]+", "", base.lower()):
                 return base
         return raw
 
@@ -615,7 +615,6 @@ def suggest(
             j = name_to_idx[ck]
             if isinstance(v, range):
                 v = tuple(v)
-                
             if isinstance(v, slice):
                 lo = _orig_to_std(j, v.start, transforms, mu_f, sd_f)
                 hi = _orig_to_std(j, v.stop,  transforms, mu_f, sd_f)
@@ -632,13 +631,14 @@ def suggest(
     Xn = ds["Xn_train"].values.astype(float)
     p01 = np.percentile(Xn, 1, axis=0)
     p99 = np.percentile(Xn, 99, axis=0)
-    wide_lo = np.minimum(p01 - 1.0, -3.0)
+    wide_lo = np.minimum(p01 - 1.0, -3.0)   # allow outside training range
     wide_hi = np.maximum(p99 + 1.0,  3.0)
 
     bounds: list[tuple[float, float] | None] = [None]*p
     for j in range(p):
         if j in fixed_num_std:
-            val = fixed_num_std[j]; bounds[j] = (val, val)
+            val = fixed_num_std[j]
+            bounds[j] = (val, val)
         elif j in range_num_std:
             bounds[j] = range_num_std[j]
         elif j in choice_num:
@@ -672,20 +672,18 @@ def suggest(
         gJ = flip * g_l + grad_pen
         return float(J), gJ.astype(float)
 
-    # exploration objective: -EI with a smooth feasibility gate; no analytic grad (use finite diff)
+    # exploration objective: -EI with feasibility gate (no analytic grad)
     def obj_scalar_explore(x_full: np.ndarray) -> float:
         mu_l = gp_l.mean_only(x_full[None, :])[0]
         mu   = float(mu_l + cond_mean)
         sd   = float(gp_l.sd_at(x_full, include_observation_noise=True))
         ps   = float(gp_s.mean_only(x_full[None, :])[0])
-        # flip for "minimize" EI baseline
         mu_signed, best_signed = _maybe_flip_for_direction(np.array([mu]), float(best_feasible), direction)
-        # smooth feasibility gate ~ sigmoid(ps - thr)
         gate = 1.0 / (1.0 + np.exp(-penalty_beta * (ps - success_threshold)))
         ei = float(_expected_improvement_minimize(mu_signed, np.array([sd]), best_signed)[0]) * gate
         return -ei  # minimize
 
-    # num grad via central differences
+    # numeric grad by central differences
     def _numeric_grad(fun_scalar, x_num: np.ndarray, eps: float = 1e-4) -> np.ndarray:
         g = np.zeros_like(x_num, dtype=float)
         for i in range(x_num.size):
@@ -693,8 +691,6 @@ def suggest(
             g[i] = (fun_scalar(x_num + e) - fun_scalar(x_num - e)) / (2.0 * eps)
         return g
 
-    # starting points
-    
     def sample_start():
         x = np.zeros(p, float)
         for j in numeric_idx:
@@ -713,181 +709,249 @@ def suggest(
         combo_space.append([cat_fixed[b]] if b in cat_fixed else cat_allowed[b])
     all_label_combos = list(itertools.product(*combo_space)) if combo_space else [()]
 
-    # optimize per combo
-    from scipy.optimize import fmin_l_bfgs_b
-    rows: list[dict] = []
-    accepted_global: list[tuple[tuple[str, ...], np.ndarray]] = []
-
-    n_combos = max(1, len(all_label_combos))
-    k_each = max(1, math.ceil(count / n_combos))
-
+    # repulsion
     rep_sigma2 = float(repulsion) ** 2
     rep_weight = float(repulsion)
 
-    for labels in all_label_combos:
+    def _is_dup(xa: np.ndarray, xb: np.ndarray, tol=1e-3) -> bool:
+        # allow >1 per combo when there are no numeric free dims
+        if xa.size == 0 and xb.size == 0:
+            return False
+        return bool(np.linalg.norm(xa - xb) < tol)
+
+    def _accept_row(template, best_xnum, labels, labels_t, accepted_combo, accepted_global, rows):
+        # compose full point
+        x_full = template.copy()
+        x_full[numeric_idx] = best_xnum
+        for j, choices in choice_num.items():
+            x_full[j] = float(choices[np.argmin(np.abs(choices - x_full[j]))])
+        for idx in numeric_idx:
+            lo, hi = num_bounds[numeric_idx.index(idx)]
+            x_full[idx] = float(np.clip(x_full[idx], lo, hi))
+
+        x_num_std = x_full[numeric_idx].copy()
+        # dedupe (combo + global)
+        if any(_is_dup(x_num_std, prev) for prev in accepted_combo):
+            return False
+        if any((labels_t == labt) and _is_dup(x_num_std, prev) for labt, prev in accepted_global):
+            return False
+
+        # accept
+        accepted_combo.append(x_num_std)
+        accepted_global.append((labels_t, x_num_std))
+
+        mu_l, _ = gp_l.mean_and_grad(x_full); mu = float(mu_l + cond_mean)
+        ps, _  = gp_s.mean_and_grad(x_full);  ps = float(np.clip(ps, 0.0, 1.0))
+        sd_opt = float(gp_l.sd_at(x_full, include_observation_noise=True))
+
+        row = {
+            "pred_p_success": ps,
+            "pred_target_mean": mu,
+            "pred_target_sd": sd_opt,
+        }
+        onehot_members_local = {m for g in groups.values() for m in g["members"]}
+        for j, nm in enumerate(feature_names):
+            if nm in onehot_members_local:
+                continue
+            row[nm] = float(_std_to_orig(j, x_full[j], transforms, mu_f, sd_f))
+        for b, lab in zip(cat_bases, labels):
+            row[b] = lab
+
+        rows.append(row)
+        return True
+
+    def _optimize_take(template, accepted_combo, use_explore):
+        # inner objective in numeric subspace
+        def f_g_only_num(x_num: np.ndarray):
+            x_full = template.copy()
+            x_full[numeric_idx] = x_num
+
+            def add_repulsion(J: float, g_num: np.ndarray | None):
+                nonlocal accepted_combo
+                if accepted_combo and rep_sigma2 > 0.0 and rep_weight > 0.0:
+                    for xk in accepted_combo:
+                        d = x_num - xk
+                        r2 = float(d @ d)
+                        w = math.exp(-0.5 * r2 / rep_sigma2)
+                        J += rep_weight * w
+                        if g_num is not None:
+                            g_num += rep_weight * w * (-d / rep_sigma2)
+                return J, g_num
+
+            if not use_explore:
+                J, g = obj_grad_exploit(x_full)
+                J, g_num = add_repulsion(J, g[numeric_idx])
+                return float(J), g_num
+
+            # exploration branch: -EI, numerical grad
+            def scalar_for_grad(xn: np.ndarray) -> float:
+                x_tmp = template.copy()
+                x_tmp[numeric_idx] = xn
+                J = obj_scalar_explore(x_tmp)
+                # include repulsion inside scalar for finite-diff consistency
+                if accepted_combo and rep_sigma2 > 0.0 and rep_weight > 0.0:
+                    for xk in accepted_combo:
+                        d = xn - xk
+                        r2 = float(d @ d)
+                        w = math.exp(-0.5 * r2 / rep_sigma2)
+                        J += rep_weight * w
+                return float(J)
+
+            J = scalar_for_grad(x_num)
+            g_num = _numeric_grad(scalar_for_grad, x_num, eps=1e-4)
+            return float(J), g_num
+
+        # collect best from multistarts
+        from scipy.optimize import fmin_l_bfgs_b
+        starts = [sample_start()[numeric_idx] for _ in range(n_starts)]
+        if starts and starts[0].size == 0:
+            # no numeric dims free → just return a zero-length vector
+            return np.zeros((0,), float)
+
+        best_val = None
+        best_xnum = None
+        explore_candidates: list[tuple[np.ndarray, float]] = []
+        for x0 in starts:
+            xopt, fval, _ = fmin_l_bfgs_b(
+                func=lambda x: f_g_only_num(x),
+                x0=x0,
+                fprime=None,
+                bounds=num_bounds,
+                maxiter=max_iters,
+            )
+            fval = float(fval)
+            if not use_explore:
+                if (best_val is None) or (fval < best_val):
+                    best_val = fval
+                    best_xnum = xopt
+            else:
+                # candidate scored by gated EI (no repulsion in score)
+                x_tmp = template.copy()
+                x_tmp[numeric_idx] = xopt
+                gated_ei = -obj_scalar_explore(x_tmp)
+                if not any(np.linalg.norm(xopt - c[0]) < 1e-3 for c in explore_candidates):
+                    explore_candidates.append((xopt, float(gated_ei)))
+
+        if use_explore:
+            if not explore_candidates:
+                return None
+            if softmax_temp and softmax_temp > 0.0:
+                eis = np.array([ei for _, ei in explore_candidates], dtype=float)
+                z = eis - np.max(eis)
+                probs = np.exp(z / float(softmax_temp))
+                probs = probs / probs.sum()
+                idx = rng.choice(len(explore_candidates), p=probs)
+                return explore_candidates[idx][0]
+            # greedy EI
+            idx = int(np.argmax([ei for _, ei in explore_candidates]))
+            return explore_candidates[idx][0]
+        return best_xnum
+
+    # ---------------- Core loop with dynamic allocation ----------------
+    rows: list[dict] = []
+    accepted_global: list[tuple[tuple[str, ...], np.ndarray]] = []
+    all_label_combos = all_label_combos or [()]
+
+    n_combos = max(1, len(all_label_combos))
+    for combo_idx, labels in enumerate(all_label_combos):
+        if len(rows) >= count:
+            break
         labels_t = tuple(labels) if labels else tuple()
+
         template = np.zeros(p, float)
         for b, lab in zip(cat_bases, labels):
             apply_onehot(template, b, lab)
 
         accepted_combo: list[np.ndarray] = []
 
-        starts = []
-        for _ in range(n_starts):
-            s = sample_start()
-            for b, lab in zip(cat_bases, labels):
-                apply_onehot(s, b, lab)
-            starts.append(s[numeric_idx])
+        remain_total = count - len(rows)
+        remain_combos = max(1, n_combos - combo_idx)
+        k_each = max(1, math.ceil(remain_total / remain_combos))
 
-        for _take in range(k_each):
-            # flip a coin for explore vs exploit
+        takes = 0
+        while (takes < k_each) and (len(rows) < count):
             use_explore = (rng.random() < float(explore))
-
-            def f_g_only_num(x_num: np.ndarray):
-                x_full = template.copy()
-                x_full[numeric_idx] = x_num
-
-                # add repulsion (shared)
-                def add_repulsion(J: float, g_num: np.ndarray | None):
-                    if accepted_combo and rep_sigma2 > 0.0 and rep_weight > 0.0:
-                        for xk in accepted_combo:
-                            d = x_num - xk
-                            r2 = float(d @ d)
-                            w = math.exp(-0.5 * r2 / rep_sigma2)
-                            J += rep_weight * w
-                            if g_num is not None:
-                                g_num += rep_weight * w * (-d / rep_sigma2)
-                    return J, g_num
-
-                if not use_explore:
-                    J, g = obj_grad_exploit(x_full)
-                    J, g_num = add_repulsion(J, g[numeric_idx])
-                    return float(J), g_num
-
-                # exploration branch: -EI, numerical grad
-                def scalar_for_grad(xn: np.ndarray) -> float:
-                    x_tmp = template.copy()
-                    x_tmp[numeric_idx] = xn
-                    J = obj_scalar_explore(x_tmp)
-                    # include repulsion inside scalar for consistent finite-diff gradient
-                    if accepted_combo and rep_sigma2 > 0.0 and rep_weight > 0.0:
-                        for xk in accepted_combo:
-                            d = xn - xk
-                            r2 = float(d @ d)
-                            w = math.exp(-0.5 * r2 / rep_sigma2)
-                            J += rep_weight * w
-                    return float(J)
-
-                J = scalar_for_grad(x_num)
-                g_num = _numeric_grad(scalar_for_grad, x_num, eps=1e-4)
-                return float(J), g_num
-
-            best_val = None
-            best_xnum = None
-
-            # We'll keep candidates for the explore branch
-            explore_candidates: list[tuple[np.ndarray, float]] = []  # (x_num, gated_EI)
-
-            for x0 in starts:
-                xopt, fval, _ = fmin_l_bfgs_b(
-                    func=lambda x: f_g_only_num(x),  # returns (f, g)
-                    x0=x0,
-                    fprime=None,
-                    bounds=num_bounds,
-                    maxiter=max_iters,
-                )
-                fval = float(fval)
-
-                if not use_explore:
-                    # Exploit branch stays deterministic: pick smallest objective
-                    if (best_val is None) or (fval < best_val):
-                        best_val = fval
-                        best_xnum = xopt
-                else:
-                    # For explore branch, score by *gated EI* (no repulsion in the score)
-                    x_full_tmp = template.copy()
-                    x_full_tmp[numeric_idx] = xopt
-                    gated_ei = -obj_scalar_explore(x_full_tmp)  # since obj_scalar_explore returns -EI
-                    # dedupe by numeric subspace to avoid duplicates among candidates
-                    if not any(np.linalg.norm(xopt - c[0]) < 1e-3 for c in explore_candidates):
-                        explore_candidates.append((xopt, float(gated_ei)))
-
-            # Decide the winner for this "take"
-            if use_explore:
-                if explore_candidates:
-                    if softmax_temp and softmax_temp > 0.0:
-                        # Softmax sample among local EI peaks
-                        eis = np.array([ei for _, ei in explore_candidates], dtype=float)
-                        z = eis - np.max(eis)                   # stabilize
-                        probs = np.exp(z / float(softmax_temp))
-                        probs = probs / probs.sum()
-                        idx = rng.choice(len(explore_candidates), p=probs)
-                        best_xnum = explore_candidates[idx][0]
-                    else:
-                        # Greedy EI (deterministic)
-                        idx = int(np.argmax([ei for _, ei in explore_candidates]))
-                        best_xnum = explore_candidates[idx][0]
-                else:
-                    # Fallback: if nothing converged, skip this take
-                    continue
-            else:
+            best_xnum = _optimize_take(template, accepted_combo, use_explore)
+            if best_xnum is None:
+                # try the opposite mode once
+                best_xnum = _optimize_take(template, accepted_combo, not use_explore)
                 if best_xnum is None:
-                    # No successful exploit starts: skip this take
-                    continue
+                    break  # give up this take for this combo
+            ok = _accept_row(template, best_xnum, labels, labels_t, accepted_combo, accepted_global, rows)
+            if ok:
+                takes += 1
 
-            x_full = template.copy()
-            x_full[numeric_idx] = best_xnum
-            for j, choices in choice_num.items():
-                x_full[j] = float(choices[np.argmin(np.abs(choices - x_full[j]))])
-            for idx in numeric_idx:
-                lo, hi = num_bounds[numeric_idx.index(idx)]
-                x_full[idx] = float(np.clip(x_full[idx], lo, hi))
-
-            x_num_std = x_full[numeric_idx].copy()
-            def _is_dup(xa: np.ndarray, xb: np.ndarray, tol=1e-3) -> bool:
-                return bool(np.linalg.norm(xa - xb) < tol)
-
-            if any(_is_dup(x_num_std, prev) for prev in accepted_combo):
-                continue
-            if any((labels_t == labt) and _is_dup(x_num_std, prev) for labt, prev in accepted_global):
-                continue
-
-            accepted_combo.append(x_num_std)
-            accepted_global.append((labels_t, x_num_std))
-
-            mu_l, _ = gp_l.mean_and_grad(x_full); mu = float(mu_l + cond_mean)
-            ps, _  = gp_s.mean_and_grad(x_full);  ps = float(np.clip(ps, 0.0, 1.0))
-            sd_opt = gp_l.sd_at(x_full, include_observation_noise=True)
-
-            row = {
-                "pred_p_success": ps,
-                "pred_target_mean": mu,
-                "pred_target_sd": float(sd_opt),
-            }
-            for j, nm in enumerate(feature_names):
-                if nm in onehot_members:
-                    continue
-                row[nm] = float(_std_to_orig(j, x_full[j], transforms, mu_f, sd_f))
-            for b, lab in zip(cat_bases, labels):
-                row[b] = lab
-
-            rows.append(row)
+    # ---------------- Refill loop if still short ----------------
+    if len(rows) < count:
+        # relax repulsion and try a few refill rounds with fresh starts
+        for _refill in range(3):
             if len(rows) >= count:
                 break
+            rep_sigma2 *= 0.7
+            rep_weight *= 0.7
+            for combo_idx, labels in enumerate(all_label_combos):
+                if len(rows) >= count:
+                    break
+                labels_t = tuple(labels) if labels else tuple()
+                template = np.zeros(p, float)
+                for b, lab in zip(cat_bases, labels):
+                    apply_onehot(template, b, lab)
+                # start with an empty combo-accepted set to avoid over-repelling
+                accepted_combo = []
+                remain_total = count - len(rows)
+                remain_combos = max(1, n_combos - combo_idx)
+                k_each = max(1, math.ceil(remain_total / remain_combos))
+                takes = 0
+                while (takes < k_each) and (len(rows) < count):
+                    use_explore = (rng.random() < float(explore))
+                    best_xnum = _optimize_take(template, accepted_combo, use_explore)
+                    if best_xnum is None:
+                        best_xnum = _optimize_take(template, accepted_combo, not use_explore)
+                        if best_xnum is None:
+                            break
+                    ok = _accept_row(template, best_xnum, labels, labels_t, accepted_combo, accepted_global, rows)
+                    if ok:
+                        takes += 1
 
-        if len(rows) >= count:
-            break
+    # ---------------- Last-resort fill with random projections ----------------
+    # Only used if optimization couldn't find enough unique points but space likely allows more.
+    if len(rows) < count:
+        tries = 0
+        max_tries = max(200, 20 * (count - len(rows)))
+        while (len(rows) < count) and (tries < max_tries):
+            tries += 1
+            # random labels
+            labels = []
+            for b in cat_bases:
+                pool = [cat_fixed[b]] if b in cat_fixed else cat_allowed[b]
+                labels.append(pool[int(rng.integers(0, len(pool)))])
+            labels_t = tuple(labels) if labels else tuple()
+            # template
+            template = np.zeros(p, float)
+            for b, lab in zip(cat_bases, labels):
+                apply_onehot(template, b, lab)
+            # random numeric in bounds
+            x_num = np.zeros(len(numeric_idx), float)
+            for ii, j in enumerate(numeric_idx):
+                lo, hi = num_bounds[ii]
+                x_num[ii] = lo if lo == hi else rng.uniform(lo, hi)
+            # accept (weak dedupe by numeric subspace)
+            accepted_combo = []  # local (empty) so only global dedupe applies
+            _accept_row(template, x_num, labels, labels_t, accepted_combo, accepted_global, rows)
 
-    df = pd.DataFrame(rows)
-    if df.empty:
+    # ---------------- Assemble & rank ----------------
+    if not rows:
         raise ValueError("No solutions produced; check constraints.")
 
+    df = pd.DataFrame(rows)
     asc_mu = (direction != "max")
     df = df.sort_values(["pred_p_success", "pred_target_mean"],
                         ascending=[False, asc_mu],
                         kind="mergesort").reset_index(drop=True)
+    # trim or pad (should be exact now, but keep the guard)
+    if len(df) > count:
+        df = df.head(count)
     df["rank"] = np.arange(1, len(df) + 1)
-    df = df.head(count)
 
     if output:
         output = Path(output)
@@ -900,6 +964,7 @@ def suggest(
     except Exception:
         pass
     return df
+
 
 def _collapse_onehot_to_categorical(df: pd.DataFrame, groups: dict[str, dict]) -> pd.DataFrame:
     """

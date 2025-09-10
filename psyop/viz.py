@@ -1642,7 +1642,6 @@ def plot1d_at_optimum(
     width: int | None = None,
     height: int | None = None,
     seed: int | None = 42,
-    optimal:bool=False,
     **kwargs,                         # constraints in ORIGINAL units (as in your plot1d)
 ) -> go.Figure:
     """
