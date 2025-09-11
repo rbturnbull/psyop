@@ -99,9 +99,9 @@ Pass any mix of:
 
 Rules:
 
-- Unknown keys are ignored with a warning (feature names are matched case-insensitively; hyphens/underscores are normalized).
+- **Unknown keys raise an error.** Keys must match a feature name (case/spacing normalized) or a categorical **base** name (e.g., ``language``).
 - If you pass both a fixed value and a range/choices for the same feature, the **fixed value wins**.
-- For **suggest**/**optimal**, bounds/choices are enforced strictly when sampling candidates.
+- For **suggest**/**optimal**, bounds/choices are enforced strictly during optimization.
 - For **plot2d**/**plot1d**, fixed features are **clamped** and **not shown** on axes; range constraints **restrict the sweep domain** even if historical points exist outside the range.
 
 Tip (shells): quote lists/tuples and anything that contains commas or parentheses to avoid shell expansion.
@@ -126,8 +126,7 @@ Commands
 
 - ``--target, -t TEXT`` — target column name (default: ``loss``).
 - ``--exclude TEXT`` — repeatable; columns to exclude from features.
-- ``--direction, -d [min|max|auto]`` — optimization direction for the target (default: ``auto``).
-- ``--success-column TEXT`` — optional boolean/int column; if omitted, success is inferred as ``~isna(target)``.
+- ``--direction, -d [min|max]`` — optimization direction for the target (default: ``min``).
 - ``--seed INTEGER`` — RNG seed (default: 0).
 - ``--compress / --no-compress`` — compress numeric arrays inside the artifact (default: on).
 
@@ -136,7 +135,7 @@ Commands
 .. code-block:: bash
 
     psyop model runs.csv output/trials.nc \
-      --target loss --exclude run_id --exclude notes --direction auto --seed 42
+      --target loss --exclude run_id --exclude notes --direction min --seed 42
 
 
 2) Suggest candidates (gradient + exploration)
@@ -152,21 +151,15 @@ Commands
 - Each suggestion is either **exploit** (minimize mean target with a smooth success penalty) or **explore**
   (maximize Expected Improvement gated by success probability). The choice per-take is random with
   probability ``--explore``.
-- Diversity among suggestions is encouraged via a **repulsion** term in standardized space.
+- Diversity among suggestions is handled internally (standardized space).
 
 **Options**
 
 - ``--output, -o PATH`` — write suggestions CSV (if omitted, prints the table).
-- ``--count, -k INTEGER`` — number of suggestions to return (default: 10).
+- ``--count, -k INTEGER`` — number of suggestions to return (default: 1).
 - ``--success-threshold FLOAT`` — feasibility threshold used in success penalty/gate (default: 0.8).
-- ``--explore FLOAT`` — probability of using exploration (EI) for each take (default: 0.5).
-- ``--repulsion FLOAT`` — diversity radius/weight in std space (default: 0.34).
-- ``--softmax-temp FLOAT`` — temperature τ for softmax sampling among local EI optima; 0/None = greedy (default: 0.2).
-- ``--n-starts INTEGER`` — multistart count per categorical combo (default: 32).
-- ``--max-iters INTEGER`` — L-BFGS-B max iterations (default: 200).
-- ``--penalty-lambda FLOAT`` — weight of the smooth success penalty (default: 1.0).
-- ``--penalty-beta FLOAT`` — sharpness of the success penalty/gate logistic (default: 10.0).
-- ``--seed INTEGER`` — RNG seed (dataset-aware; see *Determinism* below) (default: 0).
+- ``--explore FLOAT`` — probability of using exploration (EI) for each take (default: 0.34).
+- ``--seed INTEGER`` — RNG seed (default: 0).
 
 **Output CSV columns**
 
@@ -183,11 +176,11 @@ Commands
     psyop suggest output/trials.nc \
       --batch-size "(16, 32, 64)" \
       --optimizer "[adam, sgd, adamw]" \
-      --explore 0.6 --repulsion 0.25
+      -k 10
 
 
-3) Mean-optimal solution (constrained, gradient)
-------------------------------------------------
+3) Optimal solution (constrained, gradient)
+-------------------------------------------
 
 .. code-block:: bash
 
@@ -195,21 +188,14 @@ Commands
 
 **What it does**
 
-Finds the constraint-feasible point that **optimizes the posterior mean target**
-(min for losses; max if ``direction=max``), with a smooth penalty that discourages
-low success probability. Uses L-BFGS-B and returns the **single best** solution
-(or the top-k if your implementation supports it).
+Finds a constraint-feasible point that **optimizes the posterior mean target**
+(min for losses; max if the model’s ``direction`` is ``max``), with a smooth penalty that discourages
+low success probability. Uses L-BFGS-B and returns the **best** solution (one row).
 
 **Options**
 
 - ``--output PATH`` — write the row to CSV (prints table if omitted).
-- ``--count, -k INTEGER`` — keep top-k by mean (default: 1).   # if your function supports k>1
-- ``--success-threshold FLOAT`` — threshold used in the smooth success penalty (default: 0.8).
-- ``--n-starts INTEGER`` — multistart count (default: 32).
-- ``--max-iters INTEGER`` — L-BFGS-B max iterations (default: 200).
-- ``--penalty-lambda FLOAT`` — weight of the success penalty (default: 1.0).
-- ``--penalty-beta FLOAT`` — sharpness of the success penalty (default: 10.0).
-- ``--seed INTEGER`` — RNG seed (dataset-aware) (default: 0).
+- ``--seed INTEGER`` — RNG seed (default: 0).
 
 **Output CSV columns**
 
@@ -223,7 +209,7 @@ feature columns, ``pred_p_success``, ``pred_target_mean``, ``pred_target_sd``.
 
 
 
-4) 2D Partial Dependence (pairwise features)
+4) 2D Partial Dependence
 --------------------------------------------
 
 .. code-block:: bash
@@ -233,16 +219,16 @@ feature columns, ``pred_p_success``, ``pred_target_mean``, ``pred_target_sd``.
 **Options**
 
 - ``--output PATH`` — HTML file.
-- ``--n-points-1d INTEGER`` — diagonal sweep resolution (default: 300).
-- ``--n-points-2d INTEGER`` — grid size per axis for 2D panels (default: 70).
+- ``--grid-size INTEGER`` — grid size per axis for 2D panels (default: 70).
 - ``--use-log-scale-for-target`` — enable log10 colors for the target (toggle flag; default: off).
 - ``--log-shift-epsilon FLOAT`` — epsilon shift for log colors (default: 1e-9).
 - ``--colorscale TEXT`` — Plotly colorscale (default: ``RdBu``).
-- ``--show`` — open in a browser.
+- ``--show`` — open in a browser (defaults to True if no ``--output`` is provided).
 - ``--n-contours INTEGER`` — contour levels (default: 12).
-- ``--optimal / --no-optimal`` — overlay the current best-probable optimum (default: on).
+- ``--optimal / --no-optimal`` — overlay the current optimal solution (default: on).
 - ``--suggest INTEGER`` — overlay up to N suggested points (default: 0).
-- ``--width INTEGER`` / ``--height INTEGER`` — panel dimensions (pixels).
+- ``--width INTEGER`` / ``--height INTEGER`` — panel dimensions in pixels (default: 1000x1000).
+- ``--seed INTEGER`` — RNG seed for overlays (default: 42).
 
 **Constraints**
 
@@ -271,16 +257,16 @@ feature columns, ``pred_p_success``, ``pred_target_mean``, ``pred_target_sd``.
 
 - ``--output PATH`` — HTML file.
 - ``--csv-out PATH`` — tidy CSV export of PD values.
-- ``--n-points-1d INTEGER`` — sweep resolution (default: 300).
-- ``--line-color TEXT`` — Plotly color string for mean/band (default: ``rgb(31,119,180)``).
+- ``--grid-size INTEGER`` — sweep resolution per panel (default: 300).
+- ``--line-color TEXT`` — Plotly color string for mean/band (default: ``blue``).
 - ``--band-alpha FLOAT`` — fill alpha for ±2σ (default: 0.25).
-- ``--figure-height-per-row-px INTEGER`` — pixels per PD row (default: 320).
-- ``--show`` — open in a browser.
+- ``--show`` — open in a browser (defaults to True if no ``--output`` is provided).
 - ``--log-y / --no-log-y`` — log scale for target axis (default: log).
 - ``--log-y-eps FLOAT`` — clamp for log-Y (default: 1e-9).
-- ``--optimal / --no-optimal`` — overlay the current best-probable optimum (default: on).
+- ``--optimal / --no-optimal`` — overlay the current optimal solution (default: on).
 - ``--suggest INTEGER`` — overlay up to N suggested points (default: 0).
-- ``--width INTEGER`` / ``--height INTEGER`` — panel dimensions (pixels).
+- ``--width INTEGER`` / ``--height INTEGER`` — figure dimensions in pixels (default: 1000x1000).
+- ``--seed INTEGER`` — RNG seed for overlays (default: 42).
 
 **Constraints**
 
@@ -318,8 +304,8 @@ Examples at a glance
       --batch-size "(16,32,64)" \
       -k 12 -o output/suggest.csv
 
-    # Rank optima with a minimum feasibility threshold
-    psyop optimal output/trials.nc --min-p-success 0.6 -k 5
+    # Optimal (mean-based) with a minimum constraint set
+    psyop optimal output/trials.nc --epochs 12 --dropout 0.0:0.2 -o output/optimal.csv
 
     # Pairwise PD conditioned on epochs
     psyop plot2d output/trials.nc --epochs 20 --show
@@ -352,9 +338,9 @@ Build a model
         output=Path("output/trials.nc"),
         target="loss",
         exclude=["run_id", "notes"],
-        direction="auto",          # "min", "max", or "auto"
-        random_seed=42,
-        compress=True,             # compress numeric arrays within the .nc
+        direction="min",        # "min" or "max"
+        seed=42,
+        compress=True,          # compress numeric arrays within the .nc
     )
 
 Load a model
@@ -369,18 +355,12 @@ Suggest candidates
 
 .. code-block:: python
 
-.. code-block:: python
-
     suggestions = suggest(
         model=ds,
         output=None,
         count=12,
         success_threshold=0.8,
         explore=0.5,          # probability of EI per take
-        repulsion=0.34,       # diversity radius/weight in std space
-        softmax_temp=0.2,     # softmax among local EI optima; 0/None => greedy
-        n_starts=32,
-        max_iters=200,
         seed=0,
         epochs=20,                          # fixed
         dropout=slice(0.0, 0.2),            # range
@@ -388,26 +368,21 @@ Suggest candidates
     )
     print(suggestions.head())
 
-Rank probable optima
---------------------
+Optimal solution
+----------------
 
 .. code-block:: python
 
     best = optimal(
         model=ds,
         output=None,
-        success_threshold=0.8,
-        n_starts=32,
-        max_iters=200,
-        penalty_lambda=1.0,
-        penalty_beta=10.0,
         seed=0,
         epochs=12,
         dropout=slice(0.0, 0.2),
     )
     print(best)
 
-2D Partial Dependence (HTML)
+2D Partial Dependence
 ----------------------------
 
 .. code-block:: python
@@ -422,15 +397,15 @@ Rank probable optima
         colorscale="RdBu",
         show=False,
         n_contours=12,
-        optimal=True,                # overlay current best-probable optimum
+        optimal=True,                # overlay current optimal solution
         suggest=5,                   # overlay top-N suggestions
-        width=None,
-        height=None,
+        width=1000,
+        height=1000,
         epochs=20,
         dropout=slice(0.0, 0.2),
     )
 
-1D Partial Dependence (HTML + tidy CSV)
+1D Partial Dependence
 ---------------------------------------
 
 .. code-block:: python
@@ -440,16 +415,15 @@ Rank probable optima
         output=Path("pd.html"),
         csv_out=Path("pd.csv"),
         grid_size=300,
-        line_color="rgb(31,119,180)",
+        line_color="blue",
         band_alpha=0.25,
-        figure_height_per_row_px=320,
         show=False,
         use_log_scale_for_target_y=True,
         log_y_epsilon=1e-9,
         optimal=True,
         suggest=3,
-        width=None,
-        height=None,
+        width=1000,
+        height=1000,
         epochs=20,
         dropout=slice(0.0, 0.2),
     )
@@ -472,12 +446,12 @@ Constraint objects in Python
 - **Integer grids**: ``layers=tuple(range(2, 9, 2))``  → ``(2, 4, 6, 8)``.
 
 All constraints are interpreted in **original units** of your data. Bounds are enforced
-for candidate sampling and sweep ranges; fixed values remove the feature from PD axes.
+for optimization and sweep ranges; fixed values remove the feature from PD axes.
 
 Determinism
 -----------
 
-Randomness is **dataset-aware**. When you pass ``--seed S``, Psyop mixes
+Randomness is **dataset-aware**. When you pass ``--seed S``, Psyop may mix
 that seed with a checksum of the model artifact so that:
 
 - Same dataset + same seed → same suggestions.
@@ -496,4 +470,3 @@ Robert Turnbull
 For more information contact: <robert.turnbull@unimelb.edu.au>
 
 .. end-credits
-

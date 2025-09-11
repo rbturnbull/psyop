@@ -32,7 +32,6 @@ app = typer.Typer(no_args_is_help=True, add_completion=False, rich_markup_mode="
 class Direction(str, Enum):
     MINIMIZE = "min"
     MAXIMIZE = "max"
-    AUTO = "auto"
 
 
 def _strip_quotes(s: str) -> str:
@@ -320,9 +319,9 @@ def model(
     input: Path = typer.Argument(..., help="Input CSV file."),
     output: Path = typer.Argument(..., help="Path to save model artifact (.nc)."),
     target: str = typer.Option("loss", "--target", "-t", help="Target column name."),
-    exclude: list[str] = typer.Option([], "--exclude", help="Feature columns to exclude."),
+    exclude: list[str] = typer.Option([], help="Feature columns to exclude."),
     direction: Direction = typer.Option(
-        Direction.AUTO, "--direction", "-d",
+        Direction.MINIMIZE, "--direction", "-d",
         help="Optimization direction for the target."
     ),
     seed: int = typer.Option(0, "--seed", help="Random seed for fitting/sampling."),
@@ -356,8 +355,7 @@ def suggest(
     count: int = typer.Option(1, "--count", "-k", help="Number of candidates to propose."),
     success_threshold: float = typer.Option(0.8, help="Feasibility threshold for constrained EI."),
     explore: float = typer.Option(0.34, help="Fraction of suggestions reserved for exploration."),
-    # candidates: int = typer.Option(5000, help="Random candidate pool size to score."),
-    seed: int = typer.Option(0, "--seed", help="Random seed for proposals."),
+    seed: int = typer.Option(0, help="Random seed for proposals."),
 ):
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
@@ -371,7 +369,6 @@ def suggest(
         count=count,
         success_threshold=success_threshold,
         explore=explore,
-        # candidates=candidates,
         seed=seed,
         **constraints,
     )
@@ -387,10 +384,7 @@ def optimal(
     ctx: typer.Context,
     model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
     output: Path|None = typer.Option(None, help="Where to save top candidates CSV (defaults relative to model)."),
-    count: int = typer.Option(10, "--count", "-k", help="How many top rows to keep."),
-    draws: int = typer.Option(2000, "--draws", help="Monte Carlo draws."),
-    min_success_probability: float = typer.Option(0.0, "--min-p-success", help="Hard feasibility cutoff (0 disables)."),
-    seed: int = typer.Option(0, "--seed", help="Random seed for MC."),
+    seed: int = typer.Option(0,  help="Random seed for MC."),
 ):
     if not model.exists():
         raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
@@ -401,9 +395,6 @@ def optimal(
     opt.optimal(
         model=model,
         output=output,
-        # count=count,
-        # n_draws=draws,
-        # min_success_probability=min_success_probability,
         seed=seed,
         **constraints,
     )
@@ -427,8 +418,8 @@ def plot2d(
     n_contours: int = typer.Option(12, help="Number of contour levels."),
     optimal: bool = typer.Option(True, help="Include optimal points."),
     suggest: int = typer.Option(0, help="Number of suggested points."),
-    width: int|None = typer.Option(None, help="Width of each panel in pixels (default auto)."),
-    height: int|None = typer.Option(None, help="Height of each panel in pixels (default auto)."),
+    width: int = typer.Option(1000, help="Width of each panel in pixels."),
+    height: int = typer.Option(1000, help="Height of each panel in pixels."),
     seed: int = typer.Option(42, help="Random seed for suggested points."),
 ):
     if not model.exists():
@@ -469,16 +460,15 @@ def plot1d(
     output: Path|None = typer.Option(None, help="Output HTML (defaults relative to model)."),
     csv_out: Path|None = typer.Option(None, help="Optional CSV export of tidy PD data."),
     grid_size: int = typer.Option(300, help="Points along 1D sweep."),
-    line_color: str = typer.Option("rgb(31,119,180)", help="Line/band color (consistent across variables)."),
+    line_color: str = typer.Option("blue", help="Line/band color (consistent across variables)."),
     band_alpha: float = typer.Option(0.25, help="Fill alpha for ±2σ."),
-    figure_height_per_row_px: int = typer.Option(320, help="Pixels per PD row."),
     show: bool|None = typer.Option(None, help="Open the figure in a browser."),
     use_log_scale_for_target_y: bool = typer.Option(True, "--log-y/--no-log-y", help="Log scale for target (Y)."),
     log_y_epsilon: float = typer.Option(1e-9, "--log-y-eps", help="Clamp for log-Y."),
     optimal: bool = typer.Option(True, help="Include optimal points."),
     suggest: int = typer.Option(0, help="Number of suggested points."),
-    width: int|None = typer.Option(None, help="Width of each panel in pixels (default auto)."),
-    height: int|None = typer.Option(None, help="Height of each panel in pixels (default auto)."),
+    width: int = typer.Option(1000, help="Width of each panel in pixels."),
+    height: int = typer.Option(1000, help="Height of each panel in pixels."),
     seed: int = typer.Option(42, help="Random seed for suggested points."),
 ):
     if not model.exists():
@@ -496,7 +486,6 @@ def plot1d(
         grid_size=grid_size,
         line_color=line_color,
         band_alpha=band_alpha,
-        figure_height_per_row_px=figure_height_per_row_px,
         show=show,
         use_log_scale_for_target_y=use_log_scale_for_target_y,
         log_y_epsilon=log_y_epsilon,

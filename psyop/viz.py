@@ -846,7 +846,6 @@ def plot1d(
     grid_size: int = 300,
     line_color: str = "rgb(31,119,180)",
     band_alpha: float = 0.25,
-    figure_height_per_row_px: int = 320,
     show: bool = False,
     use_log_scale_for_target_y: bool = True,   # log-y for target
     log_y_epsilon: float = 1e-9,
@@ -1428,7 +1427,7 @@ def plot1d(
     title = " — ".join(parts) if len(parts) > 1 else parts[0]
 
     width = width if (width and width > 0) else 1200
-    height = height if (height and height > 0) else figure_height_per_row_px * len(panels)
+    height = height if (height and height > 0) else 1200
 
     fig.update_layout(
         height=height,
@@ -1634,7 +1633,6 @@ def plot1d_at_optimum(
     grid_size: int = 300,
     line_color: str = "rgb(31,119,180)",
     band_alpha: float = 0.25,
-    figure_height_per_row_px: int = 320,
     show: bool = False,
     use_log_scale_for_target_y: bool = True,
     log_y_epsilon: float = 1e-9,
@@ -2135,7 +2133,7 @@ def plot1d_at_optimum(
     title = " — ".join(parts)
 
     width = width if (width and width > 0) else 1200
-    height = height if (height and height > 0) else figure_height_per_row_px * len(panels)
+    height = height if (height and height > 0) else 1200
     fig.update_layout(height=height, width=width, template="simple_white", title=title, legend_title_text="")
 
     if output:
