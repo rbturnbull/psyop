@@ -326,11 +326,14 @@ def model(
     ),
     seed: int = typer.Option(0, "--seed", help="Random seed for fitting/sampling."),
     compress: bool = typer.Option(True, help="Apply compression inside the artifact."),
+    prior_model: Path | None = typer.Option(None, help="Existing model artifact used to warm-start parameter optimization."),
 ):
     if not input.exists():
         raise typer.BadParameter(f"Input CSV not found: {input.resolve()}")
     if input.suffix.lower() != ".csv":
         console.print(":warning: [yellow]Input does not end with .csv[/]")
+    if prior_model is not None and not prior_model.exists():
+        raise typer.BadParameter(f"Prior model artifact not found: {prior_model.resolve()}")
 
     build_model(
         input=input,
@@ -340,6 +343,7 @@ def model(
         direction=direction.value,
         seed=seed,
         compress=compress,
+        prior_model=prior_model,
     )
     console.print(f"[green]Wrote model artifact →[/] {output}")
 

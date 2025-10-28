@@ -147,6 +147,7 @@ def build_model(
     direction: str = "auto",
     seed: int | np.random.Generator | None = 42,
     compress: bool = True,
+    prior_model: Path | str | xr.Dataset | None = None,
 ) -> xr.Dataset:
     """
     Fit two-head GP (success prob + conditional loss) and save a single NetCDF artifact.
@@ -230,6 +231,50 @@ def build_model(
     X_raw = np.column_stack(X_raw_cols).astype(float)
     n, p = X_raw.shape
 
+    prior_start_success: dict[str, np.ndarray | float] | None = None
+    prior_start_loss: dict[str, np.ndarray | float] | None = None
+    if prior_model is not None:
+        if isinstance(prior_model, xr.Dataset):
+            prior_ds = prior_model
+        else:
+            prior_path = Path(prior_model)
+            if not prior_path.exists():
+                raise FileNotFoundError(f"Prior model artifact not found: {prior_path.resolve()}")
+            prior_ds = xr.load_dataset(prior_path)
+        try:
+            prior_feature_names = [str(v) for v in prior_ds["feature"].values.tolist()]
+        except Exception:
+            prior_ds = None
+        else:
+            if prior_feature_names != feature_names:
+                prior_ds = None
+        if prior_ds is not None:
+            try:
+                ell_s_prev = np.asarray(prior_ds["map_success_ell"].values, dtype=float)
+                eta_s_prev = float(np.asarray(prior_ds["map_success_eta"].values))
+                sigma_s_prev = float(np.asarray(prior_ds["map_success_sigma"].values))
+                beta0_s_prev = float(np.asarray(prior_ds["map_success_beta0"].values))
+                ell_l_prev = np.asarray(prior_ds["map_loss_ell"].values, dtype=float)
+                eta_l_prev = float(np.asarray(prior_ds["map_loss_eta"].values))
+                sigma_l_prev = float(np.asarray(prior_ds["map_loss_sigma"].values))
+                mean_c_prev = float(np.asarray(prior_ds["map_loss_mean_const"].values))
+                if ell_s_prev.shape == (p,) and ell_l_prev.shape == (p,):
+                    prior_start_success = {
+                        "ell": ell_s_prev,
+                        "eta": eta_s_prev,
+                        "sigma": sigma_s_prev,
+                        "beta0": beta0_s_prev,
+                    }
+                    prior_start_loss = {
+                        "ell": ell_l_prev,
+                        "eta": eta_l_prev,
+                        "sigma": sigma_l_prev,
+                        "mean_const": mean_c_prev,
+                    }
+            except Exception:
+                prior_start_success = None
+                prior_start_loss = None
+
     # ---------- Standardize ----------
     X_mean = X_raw.mean(axis=0)
     X_std  = X_raw.std(axis=0)
@@ -263,7 +308,7 @@ def build_model(
         gp_s = pm.gp.Marginal(mean_func=m_s, cov_func=K_s)
 
         _ = gp_s.marginal_likelihood("y_obs_s", X=Xn, y=y_success, sigma=sigma_s)
-        map_s = pm.find_MAP()
+        map_s = pm.find_MAP(start=prior_start_success) if prior_start_success is not None else pm.find_MAP()
 
     with model_s:
         mu_s, var_s = gp_s.predict(Xn, point=map_s, diag=True, pred_noise=True)
@@ -284,7 +329,7 @@ def build_model(
         gp_l = pm.gp.Marginal(mean_func=m_l, cov_func=K_l)
 
         _ = gp_l.marginal_likelihood("y_obs", X=Xn_success_only, y=y_loss_centered, sigma=sigma_l)
-        map_l = pm.find_MAP()
+        map_l = pm.find_MAP(start=prior_start_loss) if prior_start_loss is not None else pm.find_MAP()
 
     with model_l:
         mu_l_c, var_l = gp_l.predict(Xn_success_only, point=map_l, diag=True, pred_noise=True)
