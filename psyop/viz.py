@@ -1166,7 +1166,29 @@ def plot1d(
 
         if kind == "num":
             j = key
+            if feature_names[j] in df_raw.columns:
+                series_full = pd.to_numeric(df_raw[feature_names[j]], errors="coerce")
+                x_full_raw = series_full.to_numpy(dtype=float)
+            else:
+                x_full_raw = feature_raw_from_artifact_or_reconstruct(
+                    ds, j, feature_names[j], transforms[j]
+                ).astype(float)
+            x_data_all = x_full_raw[row_mask]
+
+            finite_raw = x_full_raw[np.isfinite(x_full_raw)]
+            if transforms[j] == "log10":
+                finite_raw = finite_raw[finite_raw > 0]
+
             grid = _grid_1d(j, grid_size)
+            if (j not in range_windows) and (j not in choice_values) and finite_raw.size:
+                finite_std = _orig_to_std(j, finite_raw, transforms, X_mean, X_std)
+                grid_min = float(np.nanmin(np.concatenate([grid, finite_std])))
+                grid_max = float(np.nanmax(np.concatenate([grid, finite_std])))
+                if grid_max > grid_min:
+                    grid = np.linspace(grid_min, grid_max, grid_size)
+                else:
+                    grid = np.array([grid_min], dtype=float)
+
             Xn_grid = np.repeat(base_std[None, :], len(grid), axis=0)
             Xn_grid[:, j] = grid
 
@@ -1227,12 +1249,6 @@ def plot1d(
                           row=row_pos, col=1)
 
             # experimental points
-            if feature_names[j] in df_raw_f.columns:
-                x_data_all = df_raw_f[feature_names[j]].to_numpy().astype(float)
-            else:
-                full_vals = feature_raw_from_artifact_or_reconstruct(ds, j, feature_names[j], transforms[j]).astype(float)
-                x_data_all = full_vals[row_mask]
-
             x_succ = x_data_all[success_mask]
             if x_succ.size:
                 fig.add_trace(go.Scattergl(
@@ -1306,6 +1322,11 @@ def plot1d(
                 origs = _inverse_transform(transforms[j], ints)
                 x_min_override = float(np.min(origs))
                 x_max_override = float(np.max(origs))
+            else:
+                finite = finite_raw
+                if finite.size:
+                    x_min_override = float(np.min(finite))
+                    x_max_override = float(np.max(finite))
 
             if (x_min_override is not None) and (x_max_override is not None):
                 if is_log_x:
