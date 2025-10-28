@@ -1030,12 +1030,10 @@ def plot1d(
     def _panel_title(kind: str, key: object) -> str:
         return feature_names[int(key)] if kind == "num" else str(key)
 
-    subplot_titles = [_panel_title(kind, key) for kind, key in panels]
     fig = make_subplots(
         rows=len(panels),
         cols=1,
         shared_xaxes=False,
-        subplot_titles=subplot_titles,
     )
 
     # --- masks/data from filtered rows ---
