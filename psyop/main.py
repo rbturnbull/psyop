@@ -559,6 +559,54 @@ def optimum_plot1d(
 
 
 @app.command(
+    help="Create 2D Partial Dependence panels anchored at the optimum.",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def optimum_plot2d(
+    ctx: typer.Context,
+    model: Path = typer.Argument(..., help="Path to the model artifact [.psyop]."),
+    output: Path | None = typer.Option(None, help="Output HTML (defaults relative to model)."),
+    grid_size: int = typer.Option(70, help="Grid size per axis for 2D panels."),
+    use_log_scale_for_target: bool = typer.Option(False, help="Log10 colors for target."),
+    log_shift_epsilon: float = typer.Option(1e-9, help="Epsilon shift for log colors."),
+    colorscale: str = typer.Option("RdBu", help="Colorscale name."),
+    show: bool | None = typer.Option(None, help="Open the figure in a browser."),
+    n_contours: int = typer.Option(12, help="Number of contour levels."),
+    optimal: bool = typer.Option(True, help="Show optimal point overlay."),
+    suggest: int = typer.Option(0, help="Number of suggested points."),
+    width: int = typer.Option(1000, help="Width of each panel in pixels."),
+    height: int = typer.Option(1000, help="Height of each panel in pixels."),
+    seed: int = typer.Option(42, help="Random seed for suggested points."),
+):
+    if not model.exists():
+        raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
+
+    show = show if show is not None else output is None
+
+    model_ds = xr.load_dataset(model)
+    constraints = parse_constraints_from_ctx(ctx, model_ds)
+
+    viz.optimum_plot2d(
+        model=model_ds,
+        output=output,
+        grid_size=grid_size,
+        use_log_scale_for_target=use_log_scale_for_target,
+        log_shift_epsilon=log_shift_epsilon,
+        colorscale=colorscale,
+        show=show,
+        n_contours=n_contours,
+        optimal=optimal,
+        suggest=suggest,
+        width=width,
+        height=height,
+        seed=seed,
+        **constraints,
+    )
+    if output:
+        console.print(f"[green]Wrote PD HTML →[/] {output}")
+
+
+@app.command(
     help="Export CSV of data used to create the model.",
 )
 def export(

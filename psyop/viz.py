@@ -2377,3 +2377,459 @@ def optimum_plot1d(
     if show:
         fig.show("browser")
     return fig
+
+
+def optimum_plot2d(
+    model: xr.Dataset | Path | str,
+    output: Path | None = None,
+    grid_size: int = 70,
+    use_log_scale_for_target: bool = False,
+    log_shift_epsilon: float = 1e-9,
+    colorscale: str = "RdBu",
+    show: bool = False,
+    n_contours: int = 12,
+    optimal: bool = True,
+    suggest: int = 0,
+    width: int | None = None,
+    height: int | None = None,
+    seed: int | None = 42,
+    **kwargs,
+) -> go.Figure:
+    """2D PD panels anchored at the optimal hyperparameter setting."""
+    ds = model if isinstance(model, xr.Dataset) else xr.load_dataset(model)
+    pred_success, pred_loss = _build_predictors(ds)
+
+    feature_names = [str(n) for n in ds["feature"].values.tolist()]
+    transforms    = [str(t) for t in ds["feature_transform"].values.tolist()]
+    X_mean = ds["feature_mean"].values.astype(float)
+    X_std  = ds["feature_std"].values.astype(float)
+    name_to_idx = {name: j for j, name in enumerate(feature_names)}
+
+    df_raw   = _raw_dataframe_from_dataset(ds)
+    Xn_train = ds["Xn_train"].values.astype(float)
+    n_rows   = Xn_train.shape[0]
+
+    groups = opt._onehot_groups(feature_names)
+    bases  = set(groups.keys())
+
+    idx_map = _canon_key_set(ds)
+    kw_num_raw: dict[str, object] = {}
+    kw_cat_raw: dict[str, object] = {}
+    for k, v in kwargs.items():
+        if k in bases:
+            kw_cat_raw[k] = v
+            continue
+        if k in idx_map:
+            kw_num_raw[idx_map[k]] = v
+            continue
+        import re as _re
+        nk = _re.sub(r"[^a-z0-9]+", "", str(k).lower())
+        if nk in idx_map:
+            kw_num_raw[idx_map[nk]] = v
+
+    cat_fixed: dict[str, str] = {}
+    for base, val in kw_cat_raw.items():
+        labels = groups[base]["labels"]
+        if isinstance(val, str):
+            if val not in labels:
+                raise ValueError(f"Unknown category for {base!r}: {val!r}. Choices: {labels}")
+            cat_fixed[base] = val
+        else:
+            chosen = [x for x in (list(val) if isinstance(val, (list, tuple, set)) else [val])
+                      if isinstance(x, str) and x in labels]
+            if not chosen:
+                raise ValueError(f"No valid categories for {base!r} in {val!r}. Choices: {labels}")
+            if len(chosen) == 1:
+                cat_fixed[base] = chosen[0]
+            else:
+                raise ValueError("optimum_plot2d currently requires categorical bases to be fixed.")
+
+    row_mask = np.ones(n_rows, dtype=bool)
+    for base, label in cat_fixed.items():
+        if base in df_raw.columns:
+            series = df_raw[base].astype("string")
+            row_mask &= series.eq(label).fillna(False).to_numpy()
+        else:
+            member_name = groups[base]["name_by_label"][label]
+            j = name_to_idx[member_name]
+            raw_j = feature_raw_from_artifact_or_reconstruct(ds, j, member_name, transforms[j]).astype(float)
+            row_mask &= (raw_j >= 0.5)
+
+    for name, val in kw_num_raw.items():
+        if name not in name_to_idx:
+            continue
+        j = name_to_idx[name]
+        if name in df_raw.columns:
+            raw_vals = pd.to_numeric(df_raw[name], errors="coerce").to_numpy(dtype=float)
+        else:
+            raw_vals = feature_raw_from_artifact_or_reconstruct(ds, j, feature_names[j], transforms[j]).astype(float)
+        mask = np.isfinite(raw_vals)
+        if isinstance(val, slice):
+            lo_raw = -np.inf if val.start is None else float(val.start)
+            hi_raw = np.inf if val.stop is None else float(val.stop)
+            if hi_raw < lo_raw:
+                lo_raw, hi_raw = hi_raw, lo_raw
+            mask &= (raw_vals >= lo_raw) & (raw_vals <= hi_raw)
+        elif isinstance(val, (list, tuple, set, np.ndarray)):
+            arr = np.asarray(list(val) if not isinstance(val, np.ndarray) else val, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
+                mask &= False
+            else:
+                mask &= np.any(np.isclose(raw_vals[:, None], arr[None, :], rtol=1e-6, atol=1e-9), axis=1)
+        else:
+            target = float(val)
+            mask &= np.isclose(raw_vals, target, rtol=1e-6, atol=1e-9)
+        row_mask &= mask
+
+    if not np.any(row_mask):
+        raise ValueError("No experiments match the provided constraints; nothing to plot.")
+
+    df_raw_f = df_raw.loc[row_mask].reset_index(drop=True)
+
+    opt_df = opt.optimal(model, count=1, seed=seed, **kwargs)
+    x_opt_std = np.zeros(len(feature_names), dtype=float)
+
+    def _to_std_single(j: int, x_orig: float) -> float:
+        xi = x_orig
+        if transforms[j] == "log10":
+            xi = np.log10(np.maximum(x_orig, 1e-300))
+        return float((xi - X_mean[j]) / X_std[j])
+
+    onehot_members: set[str] = set()
+    for base, g in groups.items():
+        onehot_members.update(g["members"])
+
+    for j, name in enumerate(feature_names):
+        if name in onehot_members:
+            continue
+        if name in opt_df.columns:
+            x_opt_std[j] = _to_std_single(j, float(opt_df.iloc[0][name]))
+        else:
+            x_opt_std[j] = float(np.median(Xn_train[:, j]))
+
+    for base, g in groups.items():
+        if base in cat_fixed:
+            label = cat_fixed[base]
+        elif base in opt_df.columns:
+            label = str(opt_df.iloc[0][base])
+        else:
+            if base in df_raw.columns:
+                label = str(df_raw[base].astype("string").mode(dropna=True).iloc[0])
+            else:
+                label = g["labels"][0]
+        for lab in g["labels"]:
+            member_name = g["name_by_label"][lab]
+            j = name_to_idx[member_name]
+            raw = 1.0 if lab == label else 0.0
+            x_opt_std[j] = (raw - X_mean[j]) / X_std[j]
+
+    def _orig_to_std(j: int, x, transforms, mu, sd):
+        x = np.asarray(x, dtype=float)
+        if transforms[j] == "log10":
+            x = np.where(x <= 0, np.nan, x)
+            x = np.log10(x)
+        return (x - mu[j]) / sd[j]
+
+    fixed_scalars_std: dict[int, float] = {}
+    range_windows_std: dict[int, tuple[float, float]] = {}
+    choice_values_std: dict[int, np.ndarray] = {}
+
+    for name, val in kw_num_raw.items():
+        if name not in name_to_idx:
+            continue
+        j = name_to_idx[name]
+        if isinstance(val, slice):
+            lo = _orig_to_std(j, float(val.start), transforms, X_mean, X_std)
+            hi = _orig_to_std(j, float(val.stop),  transforms, X_mean, X_std)
+            lo, hi = float(min(lo, hi)), float(max(lo, hi))
+            range_windows_std[j] = (lo, hi)
+        elif isinstance(val, (list, tuple, np.ndarray)):
+            arr = _orig_to_std(j, np.asarray(val, dtype=float), transforms, X_mean, X_std)
+            choice_values_std[j] = np.asarray(arr, dtype=float)
+        else:
+            fixed_scalars_std[j] = float(_orig_to_std(j, float(val), transforms, X_mean, X_std))
+
+    for j, v in fixed_scalars_std.items():
+        x_opt_std[j] = v
+
+    free_numeric_idx = [
+        j for j, name in enumerate(feature_names)
+        if (j not in fixed_scalars_std) and (name not in onehot_members)
+    ]
+    if len(free_numeric_idx) == 0:
+        raise ValueError("All numeric features are fixed at the optimum; nothing to plot.")
+
+    grids_std_num: dict[int, np.ndarray] = {}
+    raw_full_cache: dict[int, np.ndarray] = {}
+    Xn_p01 = np.percentile(Xn_train, 1, axis=0)
+    Xn_p99 = np.percentile(Xn_train, 99, axis=0)
+
+    def _grid_std_num(j: int) -> np.ndarray:
+        lo, hi = float(Xn_p01[j]), float(Xn_p99[j])
+        if j in range_windows_std:
+            lo = max(lo, range_windows_std[j][0])
+            hi = min(hi, range_windows_std[j][1])
+        if j in choice_values_std:
+            vals = np.asarray(choice_values_std[j], dtype=float)
+            vals = vals[(vals >= lo) & (vals <= hi)]
+            return np.unique(np.sort(vals)) if vals.size else np.array([x_opt_std[j]], dtype=float)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = x_opt_std[j] - 1.0, x_opt_std[j] + 1.0
+        return np.linspace(lo, hi, grid_size)
+
+    for j in free_numeric_idx:
+        if feature_names[j] in df_raw.columns:
+            raw_vals = pd.to_numeric(df_raw[feature_names[j]], errors="coerce").to_numpy(dtype=float)
+        else:
+            raw_vals = feature_raw_from_artifact_or_reconstruct(ds, j, feature_names[j], transforms[j]).astype(float)
+        raw_full_cache[j] = raw_vals
+        grid = _grid_std_num(j)
+        if (j not in range_windows_std) and (j not in choice_values_std):
+            finite_raw = raw_vals[np.isfinite(raw_vals)]
+            if transforms[j] == "log10":
+                finite_raw = finite_raw[finite_raw > 0]
+            if finite_raw.size:
+                finite_std = _orig_to_std(j, finite_raw, transforms, X_mean, X_std)
+                grid_min = float(np.nanmin(np.concatenate([grid, finite_std])))
+                grid_max = float(np.nanmax(np.concatenate([grid, finite_std])))
+                if grid_max > grid_min:
+                    grid = np.linspace(grid_min, grid_max, grid_size)
+        grids_std_num[j] = grid
+
+    subplot_titles = [feature_names[j] for j in free_numeric_idx]
+    k = len(free_numeric_idx)
+    fig = make_subplots(
+        rows=k,
+        cols=k,
+        shared_xaxes=True,
+        shared_yaxes=True,
+        horizontal_spacing=0.01,
+        vertical_spacing=0.01,
+        subplot_titles=subplot_titles,
+    )
+
+    optimal_df = opt_df.copy() if optimal else None
+    suggest_df = opt.suggest(ds, count=suggest, seed=seed, **kwargs) if (suggest and suggest > 0) else None
+
+    tgt_col = str(ds.attrs.get("target", "target"))
+    success_mask = ~pd.isna(df_raw_f[tgt_col]).to_numpy()
+    fail_mask    = ~success_mask
+
+    all_blocks: list[np.ndarray] = []
+    cell_payload: dict[tuple[int, int], dict] = {}
+    base_std = x_opt_std.copy()
+
+    def _denorm_inv_opt(j: int, std_vals: np.ndarray) -> np.ndarray:
+        internal = std_vals * X_std[j] + X_mean[j]
+        return _inverse_transform(transforms[j], internal)
+
+    for row_idx, i in enumerate(free_numeric_idx):
+        for col_idx, j in enumerate(free_numeric_idx):
+            xg = grids_std_num[j]
+            yg = grids_std_num[i]
+            XX, YY = np.meshgrid(xg, yg)
+            Xn_grid = np.repeat(base_std[None, :], XX.size, axis=0)
+            Xn_grid[:, j] = XX.ravel()
+            Xn_grid[:, i] = YY.ravel()
+            mu_flat, _ = pred_loss(Xn_grid, include_observation_noise=True)
+            p_flat = pred_success(Xn_grid)
+            Zmu = mu_flat.reshape(YY.shape)
+            Zp = p_flat.reshape(YY.shape)
+            x_orig = _denorm_inv_opt(j, xg)
+            y_orig = _denorm_inv_opt(i, yg)
+            cell_payload[(row_idx, col_idx)] = dict(i=i, j=j, x=x_orig, y=y_orig, Zmu=Zmu, Zp=Zp)
+            all_blocks.append(Zmu.ravel())
+
+    def _color_xform(z_raw: np.ndarray) -> tuple[np.ndarray, float]:
+        if not use_log_scale_for_target:
+            return z_raw, 0.0
+        zmin = float(np.nanmin(z_raw))
+        shift = 0.0 if zmin > 0 else -zmin + float(log_shift_epsilon)
+        return np.log10(np.maximum(z_raw + shift, log_shift_epsilon)), shift
+
+    z_all = np.concatenate(all_blocks) if all_blocks else np.array([0.0, 1.0])
+    z_all_t, global_shift = _color_xform(z_all)
+    cmin_t = float(np.nanmin(z_all_t))
+    cmax_t = float(np.nanmax(z_all_t))
+    cs = get_colorscale(colorscale)
+
+    def _contour_line_color(level_raw: float) -> str:
+        zt = np.log10(max(level_raw + global_shift, log_shift_epsilon)) if use_log_scale_for_target else level_raw
+        t = 0.5 if cmax_t == cmin_t else (zt - cmin_t) / (cmax_t - cmin_t)
+        rgb = sample_colorscale(cs, [float(np.clip(t, 0.0, 1.0))])[0]
+        r, g, b = _rgb_string_to_tuple(rgb)
+        lum = (0.2126*r + 0.7152*g + 0.0722*b)/255.0
+        grey = int(round((1.0 - lum) * 255))
+        return f"rgba({grey},{grey},{grey},0.9)"
+
+    def _data_vals_for_feature(j_full: int) -> np.ndarray:
+        name = feature_names[j_full]
+        if name in df_raw_f.columns:
+            return df_raw_f[name].to_numpy(dtype=float)
+        vals = feature_raw_from_artifact_or_reconstruct(ds, j_full, name, transforms[j_full]).astype(float)
+        return vals[row_mask]
+
+    for (r, c), payload in cell_payload.items():
+        Zmu_raw = payload["Zmu"]
+        Zp = payload["Zp"]
+        Z_t, _ = _color_xform(Zmu_raw)
+        x_vals = payload["x"]
+        y_vals = payload["y"]
+        fig.add_trace(go.Heatmap(
+            x=x_vals, y=y_vals, z=Z_t,
+            coloraxis="coloraxis", zsmooth=False, showscale=False,
+            hovertemplate=(f"{feature_names[payload['j']]}: %{{x:.6g}}<br>"
+                           f"{feature_names[payload['i']]}: %{{y:.6g}}"
+                           "<br>E[target|success]: %{customdata:.3f}<extra></extra>"),
+            customdata=Zmu_raw
+        ), row=r+1, col=c+1)
+
+        for thr, alpha in ((0.5, 0.25), (0.8, 0.40)):
+            mask = np.where(Zp < thr, 1.0, np.nan)
+            fig.add_trace(go.Heatmap(
+                x=x_vals, y=y_vals, z=mask, zmin=0, zmax=1,
+                colorscale=[[0, "rgba(0,0,0,0)"], [1, f"rgba(128,128,128,{alpha})"]],
+                showscale=False, hoverinfo="skip"
+            ), row=r+1, col=c+1)
+
+        zmin_r, zmax_r = float(np.nanmin(Zmu_raw)), float(np.nanmax(Zmu_raw))
+        levels = np.linspace(zmin_r, zmax_r, max(n_contours, 2))
+        for lev in levels:
+            color = _contour_line_color(lev)
+            fig.add_trace(go.Contour(
+                x=x_vals, y=y_vals, z=Zmu_raw,
+                autocontour=False,
+                contours=dict(coloring="lines", showlabels=False, start=lev, end=lev, size=1e-9),
+                line=dict(width=1),
+                colorscale=[[0, color], [1, color]],
+                showscale=False, hoverinfo="skip"
+            ), row=r+1, col=c+1)
+
+        xd = _data_vals_for_feature(payload["j"])
+        yd = _data_vals_for_feature(payload["i"])
+        show_leg = (r == 0 and c == 0)
+        fig.add_trace(go.Scattergl(
+            x=xd[success_mask], y=yd[success_mask], mode="markers",
+            marker=dict(size=4, color="black", line=dict(width=0)),
+            name="data (success)", legendgroup="data_succ", showlegend=show_leg,
+            hovertemplate=("trial_id: %{customdata[0]}<br>"
+                           f"{feature_names[payload['j']]}: %{{x:.6g}}<br>"
+                           f"{feature_names[payload['i']]}: %{{y:.6g}}<br>"
+                           f"{tgt_col}: %{{customdata[1]:.4f}}<extra></extra>"),
+            customdata=np.column_stack([
+                df_raw_f.get("trial_id", pd.Series(np.arange(len(df_raw_f)))).to_numpy()[success_mask],
+                df_raw_f[tgt_col].to_numpy()[success_mask],
+            ])
+        ), row=r+1, col=c+1)
+        fig.add_trace(go.Scattergl(
+            x=xd[fail_mask], y=yd[fail_mask], mode="markers",
+            marker=dict(size=5, color="red", line=dict(color="black", width=0.8)),
+            name="data (failed)", legendgroup="data_fail", showlegend=show_leg,
+            hovertemplate=("trial_id: %{customdata}<br>"
+                           f"{feature_names[payload['j']]}: %{{x:.6g}}<br>"
+                           f"{feature_names[payload['i']]}: %{{y:.6g}}<br>"
+                           "status: failed (NaN target)<extra></extra>"),
+            customdata=df_raw_f.get("trial_id", pd.Series(np.arange(len(df_raw_f)))).to_numpy()[fail_mask]
+        ), row=r+1, col=c+1)
+
+        if (
+            optimal
+            and optimal_df is not None
+            and feature_names[payload["j"]] in optimal_df.columns
+            and feature_names[payload["i"]] in optimal_df.columns
+        ):
+            ox = np.asarray(optimal_df[feature_names[payload["j"]]].values, dtype=float)
+            oy = np.asarray(optimal_df[feature_names[payload["i"]]].values, dtype=float)
+            pmu = float(optimal_df["pred_target_mean"].values[0])
+            psd = float(optimal_df.get("pred_target_sd", pd.Series([np.nan])).values[0])
+            fig.add_trace(go.Scattergl(
+                x=ox, y=oy, mode="markers",
+                marker=dict(size=10, color="yellow", line=dict(color="black", width=1.5), symbol="x"),
+                name="optimal", legendgroup="optimal", showlegend=show_leg,
+                hovertemplate=(f"predicted: {pmu:.3g}"
+                               + ("" if np.isnan(psd) else f" ± {psd:.3g}")
+                               + f"<br>{feature_names[payload['j']]}: %{{x:.6g}}"
+                                 f"<br>{feature_names[payload['i']]}: %{{y:.6g}}<extra></extra>")
+            ), row=r+1, col=c+1)
+
+        if (
+            suggest
+            and suggest_df is not None
+            and feature_names[payload["j"]] in suggest_df.columns
+            and feature_names[payload["i"]] in suggest_df.columns
+        ):
+            xs = suggest_df[feature_names[payload["j"]]].values.astype(float)
+            ys = suggest_df[feature_names[payload["i"]]].values.astype(float)
+            ymu = suggest_df["pred_target_mean"].values.astype(float)
+            ysd = suggest_df.get("pred_target_sd", pd.Series([np.nan]*len(suggest_df))).values
+            fig.add_trace(go.Scattergl(
+                x=xs, y=ys, mode="markers",
+                marker=dict(size=9, color="cyan", line=dict(color="black", width=1.2), symbol="star"),
+                name="suggested", legendgroup="suggested", showlegend=show_leg,
+                hovertemplate=("predicted: %{customdata[0]:.3f}"
+                               + (" ± %{customdata[1]:.3f}" if not np.isnan(ysd).all() else "")
+                               + f"<br>{feature_names[payload['j']]}: %{{x:.6g}}"
+                                 f"<br>{feature_names[payload['i']]}: %{{y:.6g}}<extra>suggested</extra>"),
+                customdata=np.column_stack([ymu, ysd])
+            ), row=r+1, col=c+1)
+
+        _maybe_log_axis(fig, row=r+1, col=c+1, name=feature_names[payload["j"]], axis="x", transforms=transforms, j=payload["j"])
+        _maybe_log_axis(fig, row=r+1, col=c+1, name=feature_names[payload["i"]], axis="y", transforms=transforms, j=payload["i"])
+        if r == k - 1:
+            fig.update_xaxes(title_text=feature_names[payload["j"]], row=r+1, col=c+1)
+        else:
+            fig.update_xaxes(tickmode=None, row=r+1, col=c+1)
+        if c == 0:
+            fig.update_yaxes(title_text=feature_names[payload["i"]], row=r+1, col=c+1)
+        else:
+            fig.update_yaxes(tickmode=None, row=r+1, col=c+1)
+
+        if payload["j"] in raw_full_cache and payload["j"] not in range_windows_std and payload["j"] not in choice_values_std:
+            finite_raw = raw_full_cache[payload["j"]][np.isfinite(raw_full_cache[payload["j"]])]
+            if transforms[payload["j"]] == "log10":
+                finite_raw = finite_raw[finite_raw > 0]
+            if finite_raw.size:
+                x0 = float(np.min(finite_raw)); x1 = float(np.max(finite_raw))
+                if transforms[payload["j"]] == "log10":
+                    x0 = max(x0, 1e-12); x1 = max(x1, x0 * (1 + 1e-9))
+                    pad = (x1 / x0) ** 0.03
+                    fig.update_xaxes(range=[np.log10(x0 / pad), np.log10(x1 * pad)], row=r+1, col=c+1)
+                else:
+                    span = (x1 - x0) or 1.0
+                    pad = 0.02 * span
+                    fig.update_xaxes(range=[x0 - pad, x1 + pad], row=r+1, col=c+1)
+
+        if payload["i"] in raw_full_cache and payload["i"] not in range_windows_std and payload["i"] not in choice_values_std:
+            finite_raw = raw_full_cache[payload["i"]][np.isfinite(raw_full_cache[payload["i"]])]
+            if transforms[payload["i"]] == "log10":
+                finite_raw = finite_raw[finite_raw > 0]
+            if finite_raw.size:
+                y0 = float(np.min(finite_raw)); y1 = float(np.max(finite_raw))
+                if transforms[payload["i"]] == "log10":
+                    y0 = max(y0, 1e-12); y1 = max(y1, y0 * (1 + 1e-9))
+                    pad = (y1 / y0) ** 0.03
+                    fig.update_yaxes(range=[np.log10(y0 / pad), np.log10(y1 * pad)], row=r+1, col=c+1)
+                else:
+                    span = (y1 - y0) or 1.0
+                    pad = 0.02 * span
+                    fig.update_yaxes(range=[y0 - pad, y1 + pad], row=r+1, col=c+1)
+
+    width = width if (width and width > 0) else 1100
+    height = height if (height and height > 0) else 1100
+    fig.update_layout(
+        height=height,
+        width=width,
+        template="simple_white",
+        coloraxis=dict(colorscale=colorscale, cmin=cmin_t, cmax=cmax_t),
+        title=f"2D PD at optimal setting of all other hyperparameters ({tgt_col})",
+        legend_title_text=""
+    )
+
+    if output:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.write_html(str(output), include_plotlyjs="cdn")
+    if show:
+        fig.show("browser")
+    return fig
