@@ -925,9 +925,6 @@ def plot1d(
             raw_j = feature_raw_from_artifact_or_reconstruct(ds, j, member_name, transforms[j]).astype(float)
             row_mask &= (raw_j >= 0.5)
 
-    df_raw_f = df_raw.loc[row_mask].reset_index(drop=True)
-    Xn_train_f = Xn_train[row_mask, :]
-
     # --- helpers to transform original <-> standardized for feature j ---
     def _orig_to_std(j: int, x, transforms, mu, sd):
         x = np.asarray(x, dtype=float)
@@ -963,6 +960,63 @@ def plot1d(
             j = name_to_idx[member_name]
             raw_val = 1.0 if lab == label else 0.0
             fixed_scalars[j] = float(_orig_to_std(j, raw_val, transforms, X_mean, X_std))
+
+    # --- enforce row-level filters for categorical allowed sets and numeric constraints ---
+    for base, allowed in cat_allowed.items():
+        if base in df_raw.columns:
+            series = df_raw[base].astype("string").fillna("<NA>")
+            allowed_set = {str(x) for x in allowed}
+            allowed_mask = series.isin(allowed_set).fillna(False).to_numpy()
+            row_mask &= allowed_mask
+        else:
+            allowed_masks = []
+            for label in allowed:
+                member_name = groups[base]["name_by_label"].get(label)
+                if member_name is None:
+                    continue
+                j = name_to_idx[member_name]
+                raw_j = feature_raw_from_artifact_or_reconstruct(ds, j, member_name, transforms[j]).astype(float)
+                allowed_masks.append(raw_j >= 0.5)
+            if allowed_masks:
+                combined = np.logical_or.reduce(allowed_masks)
+                row_mask &= combined
+            else:
+                row_mask &= False
+
+    for name, val in kw_num_raw.items():
+        if name not in name_to_idx:
+            continue
+        j = name_to_idx[name]
+        if name in df_raw.columns:
+            raw_vals = pd.to_numeric(df_raw[name], errors="coerce").to_numpy(dtype=float)
+        else:
+            raw_vals = feature_raw_from_artifact_or_reconstruct(ds, j, feature_names[j], transforms[j]).astype(float)
+
+        mask = np.ones_like(row_mask, dtype=bool)
+        if isinstance(val, slice):
+            lo_raw = -np.inf if val.start is None else float(val.start)
+            hi_raw = np.inf if val.stop is None else float(val.stop)
+            if hi_raw < lo_raw:
+                lo_raw, hi_raw = hi_raw, lo_raw
+            mask &= (raw_vals >= lo_raw) & (raw_vals <= hi_raw)
+        elif isinstance(val, (list, tuple, set, np.ndarray)):
+            arr = np.asarray(list(val) if not isinstance(val, np.ndarray) else val, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
+                mask &= False
+            else:
+                mask &= np.any(np.isclose(raw_vals[:, None], arr[None, :], rtol=1e-6, atol=1e-9), axis=1)
+        else:
+            target = float(val)
+            mask &= np.isclose(raw_vals, target, rtol=1e-6, atol=1e-9)
+
+        row_mask &= mask
+
+    if not np.any(row_mask):
+        raise ValueError("No experiments match the provided constraints; cannot plot data points.")
+
+    df_raw_f = df_raw.loc[row_mask].reset_index(drop=True)
+    Xn_train_f = Xn_train[row_mask, :]
 
     # --- overlays conditioned on the same kwargs (numeric + categorical) ---
     optimal_df  = opt.optimal(model, count=1, seed=seed, **kwargs) if optimal else None
