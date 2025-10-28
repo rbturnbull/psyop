@@ -179,9 +179,6 @@ def plot2d(
             raw_j = feature_raw_from_artifact_or_reconstruct(ds, j, member, transforms[j]).astype(float)
             row_mask &= (raw_j >= 0.5)
 
-    df_raw_f = df_raw.loc[row_mask].reset_index(drop=True) if cat_fixed else df_raw
-    Xn_train_f = Xn_train[row_mask, :] if cat_fixed else Xn_train
-
     # --- numeric constraints (standardized)
     def _orig_to_std(j: int, x, transforms, mu, sd):
         x = np.asarray(x, dtype=float)
@@ -215,6 +212,69 @@ def plot2d(
             j = name_to_idx[member]
             raw_val = 1.0 if (lab == label) else 0.0
             fixed_scalars_std[j] = float(_orig_to_std(j, raw_val, transforms, X_mean, X_std))
+
+    # --- enforce row-level filters so overlays/points respect constraints ---
+    for base, allowed in cat_allowed.items():
+        if (base not in kw_cat) or (base in cat_fixed):
+            continue
+        allowed_labels = [str(x) for x in allowed]
+        if base in df_raw.columns:
+            series = df_raw[base].astype("string").fillna("<NA>")
+            if not allowed_labels:
+                row_mask &= False
+            else:
+                allowed_mask = series.isin(set(allowed_labels)).fillna(False).to_numpy()
+                row_mask &= allowed_mask
+        else:
+            allowed_masks: list[np.ndarray] = []
+            for label in allowed_labels:
+                member = groups[base]["name_by_label"].get(label)
+                if member is None:
+                    continue
+                j = name_to_idx[member]
+                raw_j = feature_raw_from_artifact_or_reconstruct(ds, j, member, transforms[j]).astype(float)
+                allowed_masks.append(raw_j >= 0.5)
+            if allowed_masks:
+                row_mask &= np.logical_or.reduce(allowed_masks)
+            else:
+                row_mask &= False
+
+    for name, val in kw_num.items():
+        if name not in name_to_idx:
+            continue
+        j = name_to_idx[name]
+        if name in df_raw.columns:
+            raw_vals = pd.to_numeric(df_raw[name], errors="coerce").to_numpy(dtype=float)
+        else:
+            raw_vals = feature_raw_from_artifact_or_reconstruct(ds, j, feature_names[j], transforms[j]).astype(float)
+
+        mask = np.isfinite(raw_vals)
+        if isinstance(val, slice):
+            lo_raw = -np.inf if val.start is None else float(val.start)
+            hi_raw = np.inf if val.stop is None else float(val.stop)
+            if hi_raw < lo_raw:
+                lo_raw, hi_raw = hi_raw, lo_raw
+            mask &= (raw_vals >= lo_raw) & (raw_vals <= hi_raw)
+        elif isinstance(val, (list, tuple, set, np.ndarray)):
+            arr = np.asarray(list(val) if not isinstance(val, np.ndarray) else val, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
+                mask &= False
+            else:
+                close_mask = np.any(np.isclose(raw_vals[:, None], arr[None, :], rtol=1e-6, atol=1e-9), axis=1)
+                mask &= close_mask
+        else:
+            target = float(val)
+            mask &= np.isclose(raw_vals, target, rtol=1e-6, atol=1e-9)
+
+        row_mask &= mask
+
+    if not np.any(row_mask):
+        raise ValueError("No experiments match the provided constraints; cannot plot data points.")
+
+    row_mask_active = not bool(np.all(row_mask))
+    df_raw_f = df_raw.loc[row_mask].reset_index(drop=True) if row_mask_active else df_raw
+    Xn_train_f = Xn_train[row_mask, :] if row_mask_active else Xn_train
 
     # --- free axes = numeric features not scalar-fixed & not one-hot members, plus categorical bases not fixed
     free_numeric_idx = [
@@ -488,10 +548,9 @@ def plot2d(
             def _data_vals_for_feature(j_full: int) -> np.ndarray:
                 nm = feature_names[j_full]
                 if nm in df_raw_f.columns:
-                    return df_raw_f[nm].to_numpy().astype(float)
-                return feature_raw_from_artifact_or_reconstruct(ds, j_full, nm, transforms[j_full]).astype(float)[row_mask] \
-                       if cat_fixed else \
-                       feature_raw_from_artifact_or_reconstruct(ds, j_full, nm, transforms[j_full]).astype(float)
+                    return df_raw_f[nm].to_numpy(dtype=float)
+                vals = feature_raw_from_artifact_or_reconstruct(ds, j_full, nm, transforms[j_full]).astype(float)
+                return vals[row_mask] if row_mask_active else vals
 
             xd = _data_vals_for_feature(PAY["j"])
             yd = _data_vals_for_feature(PAY["i"])
