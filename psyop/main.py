@@ -317,7 +317,7 @@ def main(
 @app.command(help="Fit the model on a CSV and save a single model artifact.")
 def model(
     input: Path = typer.Argument(..., help="Input CSV file."),
-    output: Path = typer.Argument(..., help="Path to save model artifact (.nc)."),
+    output: Path = typer.Argument(..., help="Path to save model artifact [.psyop]."),
     target: str = typer.Option("loss", "--target", "-t", help="Target column name."),
     exclude: list[str] = typer.Option([], help="Feature columns to exclude."),
     direction: Direction = typer.Option(
@@ -354,7 +354,7 @@ def model(
 )
 def suggest(
     ctx: typer.Context,
-    model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
+    model: Path = typer.Argument(..., help="Path to the model artifact [.psyop]."),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Where to save candidates CSV (defaults relative to model)."),
     count: int = typer.Option(1, "--count", "-k", help="Number of candidates to propose."),
     success_threshold: float = typer.Option(0.8, help="Feasibility threshold for constrained EI."),
@@ -386,7 +386,7 @@ def suggest(
 )
 def optimal(
     ctx: typer.Context,
-    model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
+    model: Path = typer.Argument(..., help="Path to the model artifact [.psyop]."),
     output: Path|None = typer.Option(None, help="Where to save top candidates CSV (defaults relative to model)."),
     seed: int = typer.Option(0,  help="Random seed for MC."),
 ):
@@ -412,7 +412,7 @@ def optimal(
 )
 def plot2d(
     ctx: typer.Context,
-    model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
+    model: Path = typer.Argument(..., help="Path to the model artifact [.psyop]."),
     output: Path|None = typer.Option(None, help="Output HTML (defaults relative to model)."),
     grid_size: int = typer.Option(70, help="Grid size per axis for 2D panels."),
     use_log_scale_for_target: bool = typer.Option(False, help="Log10 colors for target."),
@@ -460,7 +460,7 @@ def plot2d(
 )
 def plot1d(
     ctx: typer.Context,
-    model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
+    model: Path = typer.Argument(..., help="Path to the model artifact [.psyop]."),
     output: Path|None = typer.Option(None, help="Output HTML (defaults relative to model)."),
     csv_out: Path|None = typer.Option(None, help="Optional CSV export of tidy PD data."),
     grid_size: int = typer.Option(300, help="Points along 1D sweep."),
@@ -510,7 +510,7 @@ def plot1d(
     help="Export CSV of data used to create the model.",
 )
 def export(
-    model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
+    model: Path = typer.Argument(..., help="Path to the model artifact [.psyop]."),
     output: Path = typer.Argument(..., help="Output CSV of data used to create model."),
 ):
     if not model.exists():
