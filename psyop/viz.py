@@ -1758,7 +1758,7 @@ def _set_yaxis_range(fig, *, row: int, col: int, y0: float, y1: float, log: bool
         fig.update_yaxes(type="-", range=[y0, y1], row=row, col=col)
 
 
-def plot1d_at_optimum(
+def optimum_plot1d(
     model: xr.Dataset | Path | str,
     output: Path | None = None,
     csv_out: Path | None = None,
@@ -1768,6 +1768,7 @@ def plot1d_at_optimum(
     show: bool = False,
     use_log_scale_for_target_y: bool = True,
     log_y_epsilon: float = 1e-9,
+    optimal: bool = True,
     suggest: int = 0,                 # optional overlay
     width: int | None = None,
     height: int | None = None,
@@ -2049,8 +2050,7 @@ def plot1d_at_optimum(
                 ), row=row_pos, col=1)
 
             # overlays: optimal (single point) and suggested (optional many)
-            x_opt_disp = None
-            if feature_names[j] in opt_df.columns:
+            if optimal and feature_names[j] in opt_df.columns:
                 x_opt_disp = float(opt_df.iloc[0][feature_names[j]])
                 y_opt      = float(opt_df.iloc[0]["pred_target_mean"])
                 y_opt_sd   = float(opt_df.iloc[0].get("pred_target_sd", np.nan))
@@ -2188,7 +2188,7 @@ def plot1d_at_optimum(
             ), row=row_pos, col=1)
 
             # overlay optimal point for this base (single label at x*=opt)
-            if base in opt_df.columns:
+            if optimal and base in opt_df.columns:
                 lab_opt = str(opt_df.iloc[0][base])
                 if lab_opt in labels:
                     xi = float(labels.index(lab_opt))

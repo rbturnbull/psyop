@@ -507,6 +507,58 @@ def plot1d(
 
 
 @app.command(
+    help="Create 1D Partial Dependence panels.",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def optimum_plot1d(
+    ctx: typer.Context,
+    model: Path = typer.Argument(..., help="Path to the model artifact [.psyop]."),
+    output: Path|None = typer.Option(None, help="Output HTML (defaults relative to model)."),
+    csv_out: Path|None = typer.Option(None, help="Optional CSV export of tidy PD data."),
+    grid_size: int = typer.Option(300, help="Points along 1D sweep."),
+    line_color: str = typer.Option("blue", help="Line/band color (consistent across variables)."),
+    band_alpha: float = typer.Option(0.25, help="Fill alpha for ±2σ."),
+    show: bool|None = typer.Option(None, help="Open the figure in a browser."),
+    use_log_scale_for_target_y: bool = typer.Option(True, "--log-y/--no-log-y", help="Log scale for target (Y)."),
+    log_y_epsilon: float = typer.Option(1e-9, "--log-y-eps", help="Clamp for log-Y."),
+    optimal: bool = typer.Option(True, help="Include optimal points."),
+    suggest: int = typer.Option(0, help="Number of suggested points."),
+    width: int = typer.Option(1000, help="Width of each panel in pixels."),
+    height: int = typer.Option(1000, help="Height of each panel in pixels."),
+    seed: int = typer.Option(42, help="Random seed for suggested points."),
+):
+    if not model.exists():
+        raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
+
+    show = show if show is not None else output is None  # default to True if no output file
+
+    model = xr.load_dataset(model)
+    constraints = parse_constraints_from_ctx(ctx, model)
+
+    viz.optimum_plot1d(
+        model=model,
+        output=output,
+        csv_out=csv_out,
+        grid_size=grid_size,
+        line_color=line_color,
+        band_alpha=band_alpha,
+        show=show,
+        use_log_scale_for_target_y=use_log_scale_for_target_y,
+        log_y_epsilon=log_y_epsilon,
+        optimal=optimal,
+        suggest=suggest,
+        width=width,
+        height=height,
+        seed=seed,
+        **constraints,
+    )
+    if output:
+        console.print(f"[green]Wrote PD HTML →[/] {output}")
+    if csv_out:
+        console.print(f"[green]Wrote PD CSV  →[/] {csv_out}")
+
+
+@app.command(
     help="Export CSV of data used to create the model.",
 )
 def export(
