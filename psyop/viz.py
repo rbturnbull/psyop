@@ -2830,15 +2830,36 @@ def optimum_plot2d(
                     pad = 0.02 * span
                     fig.update_yaxes(range=[y0 - pad, y1 + pad], row=r+1, col=c+1)
 
+    z_title = "E[target|success]" + (" (log10)" if use_log_scale_for_target else "")
+    if use_log_scale_for_target and global_shift > 0:
+        z_title += f" (shift Δ={global_shift:.3g})"
+
     width = width if (width and width > 0) else 1100
     height = height if (height and height > 0) else 1100
     fig.update_layout(
         height=height,
         width=width,
         template="simple_white",
-        coloraxis=dict(colorscale=colorscale, cmin=cmin_t, cmax=cmax_t),
+        coloraxis=dict(
+            colorscale=colorscale,
+            cmin=cmin_t, cmax=cmax_t,
+            colorbar=dict(
+                title=z_title,
+                thickness=10,          # thinner bar
+                len=0.55,              # shorter bar (fraction of plot height)
+                lenmode="fraction",
+                x=1.02, y=0.5,         # just right of plot, vertically centered
+                xanchor="left", yanchor="middle",
+            ),
+        ),
+        legend=dict(
+            orientation="v",
+            x=1.02, xanchor="left",   # to the right of the colorbar
+            y=1.0,  yanchor="top",
+            bgcolor="rgba(255,255,255,0.85)"
+        ),
         title=f"2D PD at optimal setting of all other hyperparameters ({tgt_col})",
-        legend_title_text=""
+        legend_title_text="",
     )
 
     if output:
