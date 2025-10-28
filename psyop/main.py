@@ -506,6 +506,25 @@ def plot1d(
         console.print(f"[green]Wrote PD CSV  →[/] {csv_out}")
 
 
+@app.command(
+    help="Export CSV of data used to create the model.",
+)
+def export(
+    model: Path = typer.Argument(..., help="Path to the model artifact (.nc)."),
+    output: Path = typer.Argument(..., help="Output CSV of data used to create model."),
+):
+    if not model.exists():
+        raise typer.BadParameter(f"Model artifact not found: {model.resolve()}")
+    model = xr.load_dataset(model)
+    vars_row = [v for v, da in model.data_vars.items() if "row" in da.dims and "feature" not in da.dims]
+    df = model[vars_row].to_dataframe().reset_index()
+    df = df.drop(
+        columns=['row', 'y_success', 'success_mask','pred_success_mu_train', 'pred_success_var_train'],
+        errors='ignore',
+    )
+    df.to_csv(output, index=False)
+
+
 def _categorical_bases_from_features(features: list[str]) -> tuple[set[str], dict[str, str]]:
     """
     Given model feature names (which may include one-hot members like 'language=Linear A'),
