@@ -2628,16 +2628,27 @@ def optimum_plot2d(
         for col_idx, j in enumerate(free_numeric_idx):
             xg = grids_std_num[j]
             yg = grids_std_num[i]
-            XX, YY = np.meshgrid(xg, yg)
-            Xn_grid = np.repeat(base_std[None, :], XX.size, axis=0)
-            Xn_grid[:, j] = XX.ravel()
-            Xn_grid[:, i] = YY.ravel()
-            mu_flat, _ = pred_loss(Xn_grid, include_observation_noise=True)
-            p_flat = pred_success(Xn_grid)
-            Zmu = mu_flat.reshape(YY.shape)
-            Zp = p_flat.reshape(YY.shape)
-            x_orig = _denorm_inv_opt(j, xg)
-            y_orig = _denorm_inv_opt(i, yg)
+            if i == j:
+                grid = grids_std_num[j]
+                Xn_1d = np.repeat(base_std[None, :], len(grid), axis=0)
+                Xn_1d[:, j] = grid
+                mu_1d, _ = pred_loss(Xn_1d, include_observation_noise=True)
+                p_1d = pred_success(Xn_1d)
+                Zmu = 0.5 * (mu_1d[:, None] + mu_1d[None, :])
+                Zp = np.minimum(p_1d[:, None], p_1d[None, :])
+                x_orig = _denorm_inv_opt(j, grid)
+                y_orig = x_orig
+            else:
+                XX, YY = np.meshgrid(xg, yg)
+                Xn_grid = np.repeat(base_std[None, :], XX.size, axis=0)
+                Xn_grid[:, j] = XX.ravel()
+                Xn_grid[:, i] = YY.ravel()
+                mu_flat, _ = pred_loss(Xn_grid, include_observation_noise=True)
+                p_flat = pred_success(Xn_grid)
+                Zmu = mu_flat.reshape(YY.shape)
+                Zp = p_flat.reshape(YY.shape)
+                x_orig = _denorm_inv_opt(j, xg)
+                y_orig = _denorm_inv_opt(i, yg)
             cell_payload[(row_idx, col_idx)] = dict(i=i, j=j, x=x_orig, y=y_orig, Zmu=Zmu, Zp=Zp)
             all_blocks.append(Zmu.ravel())
 
@@ -2676,6 +2687,10 @@ def optimum_plot2d(
         Z_t, _ = _color_xform(Zmu_raw)
         x_vals = payload["x"]
         y_vals = payload["y"]
+        if payload["i"] == payload["j"]:
+            diag_vals = np.asarray(x_vals, dtype=float)
+            x_vals = diag_vals
+            y_vals = diag_vals
         fig.add_trace(go.Heatmap(
             x=x_vals, y=y_vals, z=Z_t,
             coloraxis="coloraxis", zsmooth=False, showscale=False,
