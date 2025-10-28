@@ -1831,6 +1831,74 @@ def optimum_plot1d(
         else:
             raise ValueError(f"Categorical constraint for {base!r} must be a string or list/tuple of strings.")
 
+    # --- row mask for experimental points (matches constraints) ---
+    row_mask = np.ones(n_rows, dtype=bool)
+    for base, label in cat_fixed.items():
+        if base in df_raw.columns:
+            series = df_raw[base].astype("string")
+            row_mask &= series.eq(label).fillna(False).to_numpy()
+        else:
+            member_name = groups[base]["name_by_label"][label]
+            j = name_to_idx[member_name]
+            raw_j = feature_raw_from_artifact_or_reconstruct(ds, j, member_name, transforms[j]).astype(float)
+            row_mask &= (raw_j >= 0.5)
+
+    for base, allowed in cat_allowed.items():
+        if base in cat_fixed:
+            continue  # already fixed
+        allowed_labels = [str(x) for x in allowed]
+        if base in df_raw.columns:
+            series = df_raw[base].astype("string").fillna("<NA>")
+            allowed_mask = series.isin(set(allowed_labels)).fillna(False).to_numpy()
+            row_mask &= allowed_mask
+        else:
+            allowed_masks: list[np.ndarray] = []
+            for label in allowed_labels:
+                member_name = groups[base]["name_by_label"].get(label)
+                if member_name is None:
+                    continue
+                j = name_to_idx[member_name]
+                raw_j = feature_raw_from_artifact_or_reconstruct(ds, j, member_name, transforms[j]).astype(float)
+                allowed_masks.append(raw_j >= 0.5)
+            if allowed_masks:
+                row_mask &= np.logical_or.reduce(allowed_masks)
+            else:
+                row_mask &= False
+
+    for name, val in kw_num_raw.items():
+        if name not in name_to_idx:
+            continue
+        j = name_to_idx[name]
+        if name in df_raw.columns:
+            raw_vals = pd.to_numeric(df_raw[name], errors="coerce").to_numpy(dtype=float)
+        else:
+            raw_vals = feature_raw_from_artifact_or_reconstruct(ds, j, feature_names[j], transforms[j]).astype(float)
+
+        mask = np.isfinite(raw_vals)
+        if isinstance(val, slice):
+            lo_raw = -np.inf if val.start is None else float(val.start)
+            hi_raw = np.inf if val.stop is None else float(val.stop)
+            if hi_raw < lo_raw:
+                lo_raw, hi_raw = hi_raw, lo_raw
+            mask &= (raw_vals >= lo_raw) & (raw_vals <= hi_raw)
+        elif isinstance(val, (list, tuple, set, np.ndarray)):
+            arr = np.asarray(list(val) if not isinstance(val, np.ndarray) else val, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
+                mask &= False
+            else:
+                mask &= np.any(np.isclose(raw_vals[:, None], arr[None, :], rtol=1e-6, atol=1e-9), axis=1)
+        else:
+            target = float(val)
+            mask &= np.isclose(raw_vals, target, rtol=1e-6, atol=1e-9)
+
+        row_mask &= mask
+
+    if not np.any(row_mask):
+        raise ValueError("No experiments match the provided constraints; cannot plot data points.")
+
+    df_raw_f = df_raw.loc[row_mask].reset_index(drop=True)
+
     # ---------- 1) Find the *optimal* base point (original units) ----------
     opt_df = opt.optimal(model, count=1, seed=seed, **kwargs)  # uses your gradient-based optimal()
     # We’ll use this row both for overlays and as the anchor point.
@@ -1947,11 +2015,11 @@ def optimum_plot1d(
     fig = make_subplots(rows=len(panels), cols=1, shared_xaxes=False, subplot_titles=subplot_titles)
 
     tgt_col = str(ds.attrs["target"])
-    success_mask = ~pd.isna(df_raw[tgt_col]).to_numpy()
+    success_mask = ~pd.isna(df_raw_f[tgt_col]).to_numpy()
     fail_mask    = ~success_mask
-    losses_success = df_raw.loc[success_mask, tgt_col].to_numpy().astype(float)
-    trial_ids_success = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[success_mask]
-    trial_ids_fail    = df_raw.get("trial_id", pd.Series(np.arange(len(df_raw)))).to_numpy()[fail_mask]
+    losses_success = df_raw_f.loc[success_mask, tgt_col].to_numpy().astype(float)
+    trial_ids_success = df_raw_f.get("trial_id", pd.Series(np.arange(len(df_raw_f)))).to_numpy()[success_mask]
+    trial_ids_fail    = df_raw_f.get("trial_id", pd.Series(np.arange(len(df_raw_f)))).to_numpy()[fail_mask]
     band_fill_rgba = _rgb_to_rgba(line_color, band_alpha)
 
     # optional overlay
@@ -1964,7 +2032,27 @@ def optimum_plot1d(
 
         if kind == "num":
             j = int(key)
+            if feature_names[j] in df_raw.columns:
+                series_full = pd.to_numeric(df_raw[feature_names[j]], errors="coerce")
+                x_full_raw = series_full.to_numpy(dtype=float)
+            else:
+                x_full_raw = feature_raw_from_artifact_or_reconstruct(
+                    ds, j, feature_names[j], transforms[j]
+                ).astype(float)
+            x_data_all = x_full_raw[row_mask]
+            finite_raw = x_full_raw[np.isfinite(x_full_raw)]
+            if transforms[j] == "log10":
+                finite_raw = finite_raw[finite_raw > 0]
+
             grid = _grid_1d(j, grid_size)
+            if (j not in range_windows) and (j not in choice_values) and finite_raw.size:
+                finite_std = _orig_to_std(j, finite_raw, transforms, X_mean, X_std)
+                grid_min = float(np.nanmin(np.concatenate([grid, finite_std])))
+                grid_max = float(np.nanmax(np.concatenate([grid, finite_std])))
+                if grid_max > grid_min:
+                    grid = np.linspace(grid_min, grid_max, grid_size)
+                else:
+                    grid = np.array([grid_min], dtype=float)
             Xn_grid = np.repeat(x_opt_std[None, :], len(grid), axis=0)
             Xn_grid[:, j] = grid
 
@@ -2017,13 +2105,7 @@ def optimum_plot1d(
                                      hovertemplate=f"{feature_names[j]}: %{{x:.6g}}<br>E[target|success]: %{{y:.3f}}<extra></extra>"),
                           row=row_pos, col=1)
 
-            # experimental points at y
-            if feature_names[j] in df_raw.columns:
-                x_data_all = df_raw[feature_names[j]].to_numpy().astype(float)
-            else:
-                full_vals = feature_raw_from_artifact_or_reconstruct(ds, j, feature_names[j], transforms[j]).astype(float)
-                x_data_all = full_vals
-
+            # experimental points at y (filtered to constraint-satisfied rows)
             x_succ = x_data_all[success_mask]
             if x_succ.size:
                 fig.add_trace(go.Scattergl(
@@ -2084,6 +2166,7 @@ def optimum_plot1d(
                              y0=y0_plot, y1=y1_plot,
                              log=use_log_scale_for_target_y, eps=log_y_epsilon)
             fig.update_xaxes(title_text=feature_names[j], row=row_pos, col=1)
+            is_log_x = (transforms[j] == "log10")
 
             # If a constraint limited the sweep, respect it on the displayed axis
             def _std_to_orig(val_std: float) -> float:
@@ -2103,6 +2186,23 @@ def optimum_plot1d(
                 span = float(np.max(origs) - np.min(origs)) or 1.0
                 pad = 0.05 * span
                 fig.update_xaxes(range=[float(np.min(origs) - pad), float(np.max(origs) + pad)], row=row_pos, col=1)
+            else:
+                if finite_raw.size:
+                    if is_log_x:
+                        x0 = max(float(np.min(finite_raw)), 1e-12)
+                        x1 = max(float(np.max(finite_raw)), x0 * (1 + 1e-9))
+                        pad = (x1 / x0) ** 0.03
+                        fig.update_xaxes(
+                            range=[np.log10(x0 / pad), np.log10(x1 * pad)],
+                            row=row_pos,
+                            col=1,
+                        )
+                    else:
+                        x0 = float(np.min(finite_raw))
+                        x1 = float(np.max(finite_raw))
+                        span = (x1 - x0) or 1.0
+                        pad = 0.02 * span
+                        fig.update_xaxes(range=[x0 - pad, x1 + pad], row=row_pos, col=1)
 
             # tidy rows
             for xd, xi, mu_i, sd_i, p_i in zip(x_display, x_internal, mu_grid, sd_grid, p_grid):
@@ -2137,12 +2237,12 @@ def optimum_plot1d(
                 mu_plot = np.maximum(mu_vec, log_y_epsilon)
                 lo_plot = np.maximum(mu_vec - 2.0 * sd_vec, log_y_epsilon)
                 hi_plot = np.maximum(mu_vec + 2.0 * sd_vec, log_y_epsilon)
-                losses_s_plot = np.maximum(df_raw.loc[success_mask, tgt_col].to_numpy().astype(float), log_y_epsilon) if success_mask.any() else np.array([])
+                losses_s_plot = np.maximum(df_raw_f.loc[success_mask, tgt_col].to_numpy().astype(float), log_y_epsilon) if success_mask.any() else np.array([])
             else:
                 mu_plot = mu_vec
                 lo_plot = mu_vec - 2.0 * sd_vec
                 hi_plot = mu_vec + 2.0 * sd_vec
-                losses_s_plot = df_raw.loc[success_mask, tgt_col].to_numpy().astype(float) if success_mask.any() else np.array([])
+                losses_s_plot = df_raw_f.loc[success_mask, tgt_col].to_numpy().astype(float) if success_mask.any() else np.array([])
 
             y_arrays = [lo_plot, hi_plot] + ([losses_s_plot] if losses_s_plot.size else [])
             y_low  = float(np.nanmin([np.nanmin(a) for a in y_arrays])) if y_arrays else 0.0
