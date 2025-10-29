@@ -890,9 +890,7 @@ def plot2d(
     )
 
     if output:
-        output = Path(output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        fig.write_html(str(output), include_plotlyjs="cdn")
+        write_image(fig, output)
     if show:
         fig.show("browser")
     return fig
@@ -1570,9 +1568,7 @@ def plot1d(
     )
 
     if output:
-        output = Path(output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        fig.write_html(str(output), include_plotlyjs="cdn")
+        write_image(fig, output)
     if csv_out:
         csv_out = Path(csv_out)
         csv_out.parent.mkdir(parents=True, exist_ok=True)
@@ -2369,8 +2365,7 @@ def optimum_plot1d(
     fig.update_layout(height=height, width=width, template="simple_white", title=title, legend_title_text="")
 
     if output:
-        output = Path(output); output.parent.mkdir(parents=True, exist_ok=True)
-        fig.write_html(str(output), include_plotlyjs="cdn")
+        write_image(fig, output)
     if csv_out:
         csv_out = Path(csv_out); csv_out.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(tidy_rows).to_csv(str(csv_out), index=False)
@@ -2863,9 +2858,17 @@ def optimum_plot2d(
     )
 
     if output:
-        output = Path(output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        fig.write_html(str(output), include_plotlyjs="cdn")
+        write_image(fig, output)
     if show:
         fig.show("browser")
     return fig
+
+
+def write_image(fig, output:Path|str):
+    """Write a Plotly figure to an image file (PNG, JPEG, etc). Requires kaleido."""
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.suffix.lower() == ".html":
+        fig.write_html(str(output))
+    else:
+        fig.write_image(str(output))
